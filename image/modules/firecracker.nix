@@ -61,7 +61,8 @@
     {
       name = "firecracker-builtin-rootfs-drivers";
       patch = null;
-      extraStructuredConfig = with lib.kernel; {
+      # nixpkgs renamed this from `extraStructuredConfig` (unstable 2025+).
+      structuredExtraConfig = with lib.kernel; {
         # ---- Root-path + net drivers built in (no initrd) ----
         VIRTIO = yes;
         VIRTIO_MENU = yes;
