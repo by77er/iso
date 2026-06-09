@@ -1,0 +1,12 @@
+[package]
+name = "iso-storage-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+iso-common = { path = "../iso-common" }
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+libc = "0.2.186"

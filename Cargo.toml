@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/iso-common",
+    "crates/iso-storage-manager",
+    "crates/iso-network-manager",
+    "crates/iso-dns-server",
+    "crates/iso-proxy",
+    "crates/iso-control-plane",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
