@@ -32,14 +32,18 @@ HOST_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+')"
 ADMIN="http://${HOST_IP}:7070"
 
 # --- register the prewarmed 'agent' template (idempotent) ---
-if [ -f "$STATE/templates/agent/vmstate" ]; then
+# Which baked rootfs/snapshot the 'agent' template resolves to. Bump when you
+# bake a new image (agent_v3 = NixOS 25.05 + monorepo tooling); the LV is
+# tpl_<AGENT_ROOTFS>, the snapshot is state/templates/<AGENT_ROOTFS>.
+AGENT_ROOTFS="${AGENT_ROOTFS:-agent_v3}"
+if [ -f "$STATE/templates/$AGENT_ROOTFS/vmstate" ]; then
   KERNEL="$(nix build "path:$REPO/image#kernel" --no-link --print-out-paths 2>/dev/null)/vmlinux"
   BOOTARGS="console=ttyS0 reboot=k panic=1 acpi=off quiet loglevel=3 root=/dev/vda rootfstype=ext4 rw ip=172.20.0.1::172.20.0.0:255.255.255.254::eth0:off init=/nix/var/nix/profiles/system/init"
   code=$(curl -s -o /dev/null -w '%{http_code}' \
     -H 'content-type: application/json' \
-    -d "{\"name\":\"agent\",\"rootfs_template\":\"agent\",\"snapshot_mem\":\"$STATE/templates/agent/mem\",\"snapshot_vmstate\":\"$STATE/templates/agent/vmstate\",\"vcpus\":1,\"mem_mib\":512,\"kernel\":\"$KERNEL\",\"boot_args\":\"$BOOTARGS\"}" \
+    -d "{\"name\":\"agent\",\"rootfs_template\":\"$AGENT_ROOTFS\",\"snapshot_mem\":\"$STATE/templates/$AGENT_ROOTFS/mem\",\"snapshot_vmstate\":\"$STATE/templates/$AGENT_ROOTFS/vmstate\",\"vcpus\":1,\"mem_mib\":512,\"kernel\":\"$KERNEL\",\"boot_args\":\"$BOOTARGS\"}" \
     "$ADMIN/templates")
-  echo "[iso-up] template 'agent' registered ($code) via $ADMIN"
+  echo "[iso-up] template 'agent' -> rootfs '$AGENT_ROOTFS' registered ($code) via $ADMIN"
 fi
 
 # --- egress proxy stack (root): CA minter, secret provider, MITM proxy.
