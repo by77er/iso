@@ -272,6 +272,16 @@ name = "iso-dns-server"
 version = "0.1.0"
 
 [[package]]
+name = "iso-firecracker"
+version = "0.1.0"
+dependencies = [
+ "iso-common",
+ "libc",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "iso-network-manager"
 version = "0.1.0"
 dependencies = [
