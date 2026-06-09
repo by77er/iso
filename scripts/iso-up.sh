@@ -86,11 +86,16 @@ if [ -f "$STATE/agentd.env" ] && [ -d "$AGENTD" ]; then
   # liveness by its HTTP API, not pgrep (stale `mix` launchers gave false hits).
   if ! curl -s -m1 -o /dev/null "http://127.0.0.1:7700/" 2>/dev/null; then
     echo "[iso-up] starting agentd (control plane $CONTROL_PLANE_URL)"
+    # Run under agentd's nix flake (Elixir 1.20 + Erlang/OTP 27). nix develop
+    # inherits the exported env (token, CONTROL_PLANE_URL, ...).
     (
       cd "$AGENTD" || exit
-      mix ecto.create --quiet 2>/dev/null
-      mix ecto.migrate --quiet 2>/dev/null
-      setsid mix run --no-halt >"$STATE/agentd.log" 2>&1 </dev/null &
+      setsid nix develop --command bash -c '
+        mix deps.get >/dev/null 2>&1
+        mix ecto.create --quiet 2>/dev/null
+        mix ecto.migrate --quiet 2>/dev/null
+        exec mix run --no-halt
+      ' >"$STATE/agentd.log" 2>&1 </dev/null &
     )
   else
     echo "[iso-up] agentd already running"
