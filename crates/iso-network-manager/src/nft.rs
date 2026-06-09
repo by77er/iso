@@ -35,6 +35,7 @@ fn chain_name(kind: ChainKind) -> &'static str {
         ChainKind::Prerouting => "prerouting",
         ChainKind::Forward => "forward",
         ChainKind::Input => "input",
+        ChainKind::Output => "output",
         ChainKind::Postrouting => "postrouting",
     }
 }
@@ -44,6 +45,7 @@ fn chain_attrs(kind: ChainKind) -> (ChainType, HookClass, i32, Option<ChainPolic
     match kind {
         ChainKind::Prerouting => (ChainType::Nat, HookClass::PreRouting, -100, None),
         ChainKind::Postrouting => (ChainType::Nat, HookClass::PostRouting, 100, None),
+        ChainKind::Output => (ChainType::Nat, HookClass::Out, -100, None),
         ChainKind::Forward => (
             ChainType::Filter,
             HookClass::Forward,
@@ -145,6 +147,18 @@ fn build_rule(chain: &Chain, r: &NftRule) -> Result<Rule> {
                 .daddr(IpAddr::V4(*daddr))
                 .dport(*dport, nft_proto(*proto));
             add_nat(&mut rule, NatType::DNat, *to, None);
+        }
+        NftRule::DnatHairpin {
+            host_addr,
+            proto,
+            host_port,
+            to,
+            to_port,
+        } => {
+            rule = rule
+                .daddr(IpAddr::V4(*host_addr))
+                .dport(*host_port, nft_proto(*proto));
+            add_nat(&mut rule, NatType::DNat, *to, Some(*to_port));
         }
         NftRule::RedirectProxy {
             iif,

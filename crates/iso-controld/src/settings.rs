@@ -11,6 +11,19 @@ pub struct Settings {
     pub firecracker: iso_firecracker::Config,
     /// Admin API unix socket.
     pub control_sock: PathBuf,
+    /// Admin API TCP listener (for the agentd frontend's HTTP client).
+    pub control_tcp: std::net::SocketAddr,
+}
+
+/// The host's primary IPv4 (source IP toward the internet) — used for the
+/// host-local hairpin to VM forwarded ports.
+pub fn primary_ipv4() -> Option<std::net::Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("1.1.1.1:53").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v) => Some(v),
+        _ => None,
+    }
 }
 
 /// The default-route interface, parsed from `/proc/net/route`.
@@ -55,6 +68,7 @@ pub fn from_env() -> Settings {
         },
         network: iso_network_manager::Config {
             uplink,
+            host_addr: primary_ipv4(),
             ..Default::default()
         },
         storage: iso_storage_manager::Config {
@@ -69,5 +83,16 @@ pub fn from_env() -> Settings {
             ..Default::default()
         },
         control_sock: state.join("control.sock"),
+        // Bind the admin API on the host's reachable IP so a co-located *or*
+        // remote agentd can use it (and derive the same address for ssh).
+        // Unauthenticated for now — front it appropriately.
+        control_tcp: env("ISO_ADMIN_TCP")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                let ip = primary_ipv4()
+                    .map(std::net::IpAddr::V4)
+                    .unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
+                std::net::SocketAddr::new(ip, 7070)
+            }),
     }
 }

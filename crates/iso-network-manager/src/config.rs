@@ -23,6 +23,9 @@ pub struct Config {
     pub proxy_port: u16,
     /// Host uplink interface used for masquerade and inbound forwards.
     pub uplink: String,
+    /// Host primary IP for host-local hairpin to forwarded ports. `None`
+    /// disables the OUTPUT-chain hairpin (external forwards still work).
+    pub host_addr: Option<std::net::Ipv4Addr>,
     /// Constant guest MAC (routed datapath, never bridged).
     pub mac: MacAddr,
     /// TAP interface name inside every VM's netns. Constant (not slot-derived):
@@ -40,6 +43,7 @@ impl Default for Config {
             services: Ipv4Addr::new(172, 22, 0, 1),
             proxy_port: 3128,
             uplink: "eth0".to_string(),
+            host_addr: None,
             mac: MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
             tap_name: "tap0".to_string(),
         }

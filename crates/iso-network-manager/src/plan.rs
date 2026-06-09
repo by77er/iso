@@ -17,6 +17,7 @@ pub enum ChainKind {
     Prerouting,
     Forward,
     Input,
+    Output,
     Postrouting,
 }
 
@@ -54,6 +55,15 @@ pub enum NftRule {
         proto: Protocol,
         dport: u16,
         to: Ipv4Addr,
+    },
+    /// `ip daddr <host_addr> <proto> dport <host_port> dnat to <to>:<to_port>`
+    /// (host-local hairpin for an ingress forward, in OUTPUT).
+    DnatHairpin {
+        host_addr: Ipv4Addr,
+        proto: Protocol,
+        host_port: u16,
+        to: Ipv4Addr,
+        to_port: u16,
     },
     /// `iifname <iif> ip daddr != <except> <proto> ... dnat to <to>:<to_port>` (Proxy intercept)
     RedirectProxy {
@@ -172,26 +182,35 @@ fn host_ruleset(fx: &NetworkFixture, policy: &NetworkPolicy, cfg: &Config) -> Ru
         oif: up.clone(),
     }];
 
+    // Host-local hairpin: let processes on the host (e.g. agentd) reach a VM's
+    // forwarded ports via the host's own primary IP (locally-originated traffic
+    // skips the uplink prerouting hook, so DNAT in OUTPUT).
+    let mut chains = vec![
+        ChainSpec { kind: ChainKind::Prerouting, rules: prerouting },
+        ChainSpec { kind: ChainKind::Forward, rules: forward },
+        ChainSpec { kind: ChainKind::Input, rules: input },
+        ChainSpec { kind: ChainKind::Postrouting, rules: postrouting },
+    ];
+    if let Some(host_addr) = cfg.host_addr {
+        let output: Vec<NftRule> = policy
+            .ingress
+            .iter()
+            .map(|f| NftRule::DnatHairpin {
+                host_addr,
+                proto: f.proto,
+                host_port: f.host_port,
+                to: fx.vp_ip,
+                to_port: f.vm_port,
+            })
+            .collect();
+        if !output.is_empty() {
+            chains.push(ChainSpec { kind: ChainKind::Output, rules: output });
+        }
+    }
+
     Ruleset {
         table: table_name(fx.slot),
-        chains: vec![
-            ChainSpec {
-                kind: ChainKind::Prerouting,
-                rules: prerouting,
-            },
-            ChainSpec {
-                kind: ChainKind::Forward,
-                rules: forward,
-            },
-            ChainSpec {
-                kind: ChainKind::Input,
-                rules: input,
-            },
-            ChainSpec {
-                kind: ChainKind::Postrouting,
-                rules: postrouting,
-            },
-        ],
+        chains,
     }
 }
 

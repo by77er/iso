@@ -18,6 +18,7 @@ use iso_storage_manager::command::SystemRunner;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s = settings::from_env();
     let control_sock = s.control_sock.clone();
+    let control_tcp = s.control_tcp;
 
     let cp = Arc::new(ControlPlane::new(
         s.control,
@@ -67,8 +68,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::remove_file(&control_sock);
-    let listener = tokio::net::UnixListener::bind(&control_sock)?;
-    eprintln!("iso-controld: admin API on {}", control_sock.display());
-    axum::serve(listener, http::router(cp)).await?;
+    let unix = tokio::net::UnixListener::bind(&control_sock)?;
+    eprintln!("iso-controld: admin API on {} and {control_tcp}", control_sock.display());
+
+    // TCP admin listener for the agentd frontend's HTTP client.
+    let tcp_cp = cp.clone();
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(control_tcp).await {
+            Ok(l) => {
+                if let Err(e) = axum::serve(l, http::router(tcp_cp)).await {
+                    eprintln!("iso-controld: tcp admin exited: {e}");
+                }
+            }
+            Err(e) => eprintln!("iso-controld: tcp admin bind {control_tcp} failed: {e}"),
+        }
+    });
+
+    axum::serve(unix, http::router(cp)).await?;
     Ok(())
 }
