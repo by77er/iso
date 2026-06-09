@@ -193,6 +193,23 @@ pub fn host_init(cfg: &Config) -> Result<()> {
     })
 }
 
+/// Re-apply only the nftables rulesets (root + netns) for an already-placed
+/// slot — egress steering reconciles via nft flush+add, and we never touch the
+/// interfaces, so it's safe while the VMM holds the TAP. Requires root.
+pub fn reapply(plan: &Plan) -> Result<()> {
+    nft::apply(&plan.host)?;
+    let ns = NetNs::new(&plan.fixture.netns)
+        .or_else(|_| NetNs::get(&plan.fixture.netns))
+        .map_err(be)?;
+    let netns_rules = plan.netns.clone();
+    ns.run(move |_| -> Result<()> {
+        nft::apply(&netns_rules)?;
+        Ok(())
+    })
+    .map_err(be)??;
+    Ok(())
+}
+
 /// Converge a slot to `plan`: create/ensure the netns, veth, addressing, TAP,
 /// routes, sysctls, and both nftables tables. Idempotent. Requires root.
 pub fn converge(plan: &Plan, _cfg: &Config) -> Result<()> {

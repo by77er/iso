@@ -397,6 +397,9 @@ mod tests {
                 mac: MacAddr([2, 0, 0, 0, 0, 1]),
             })
         }
+        async fn reapply_policy(&self, _slot: SlotId, _p: &NetworkPolicy) -> IRes<()> {
+            Ok(())
+        }
         async fn teardown(&self, _slot: SlotId) -> IRes<()> {
             Ok(())
         }

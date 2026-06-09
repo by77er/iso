@@ -501,7 +501,8 @@ where
                 egress: rec.egress,
                 ingress: rec.ingress.clone(),
             };
-            self.net.apply(slot, &policy).await?;
+            // nft-only re-steer: must not touch the running VM's TAP/veth.
+            self.net.reapply_policy(slot, &policy).await?;
         }
         Ok(())
     }
@@ -581,6 +582,9 @@ mod tests {
         async fn apply(&self, slot: SlotId, _p: &NetworkPolicy) -> IRes<NetworkFixture> {
             self.log.push(format!("net.apply:{}", slot.get()));
             Ok(fixture(slot))
+        }
+        async fn reapply_policy(&self, _slot: SlotId, _p: &NetworkPolicy) -> IRes<()> {
+            Ok(())
         }
         async fn teardown(&self, slot: SlotId) -> IRes<()> {
             self.log.push(format!("net.teardown:{}", slot.get()));

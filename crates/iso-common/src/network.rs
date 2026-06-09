@@ -185,6 +185,16 @@ pub trait NetworkManager {
         policy: &NetworkPolicy,
     ) -> impl Future<Output = Result<NetworkFixture>> + Send;
 
+    /// Re-apply only the egress **policy** (nftables rulesets) for an already-
+    /// placed slot, leaving its interfaces untouched — so it's safe on a running
+    /// VM whose TAP is held open by the VMM (a full re-`apply` would fail with
+    /// `TUNSETIFF ... busy`). Default: a full [`apply`](Self::apply).
+    fn reapply_policy(
+        &self,
+        slot: SlotId,
+        policy: &NetworkPolicy,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     /// Converge `slot` to absent — tear down all network resources. Idempotent:
     /// tearing down an absent slot succeeds.
     fn teardown(&self, slot: SlotId) -> impl Future<Output = Result<()>> + Send;

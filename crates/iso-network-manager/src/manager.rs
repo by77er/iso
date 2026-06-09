@@ -87,6 +87,13 @@ impl NetworkManager for Manager {
         Ok(fx)
     }
 
+    async fn reapply_policy(&self, slot: SlotId, policy: &NetworkPolicy) -> Result<()> {
+        // Re-render + re-apply only the nft rulesets (host + netns); leave the
+        // veth/tap/addressing in place so a running VM isn't disturbed.
+        let plan = self.plan(slot, policy)?;
+        spawn_blocking(move || netlink::reapply(&plan)).await
+    }
+
     async fn teardown(&self, slot: SlotId) -> Result<()> {
         let fx = self.fixture(slot);
         spawn_blocking(move || netlink::destroy(&fx)).await
