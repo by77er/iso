@@ -7,12 +7,40 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use iso_common::network::NetworkManager;
+use iso_common::runtime::VmRuntime;
+use iso_common::storage::StorageManager;
+use iso_common::EgressMode;
 use iso_control_plane::ControlPlane;
 use iso_controld::{http, identify, metadata, settings};
 use iso_firecracker::FirecrackerRuntime;
 use iso_storage_manager::command::SystemRunner;
+
+/// DNS redirect resolver: `Allow`-mode VMs get their proxied domains steered to
+/// the egress proxy (the services IP); everything else resolves normally.
+struct CpRedirect<N, S, R> {
+    cp: Arc<ControlPlane<N, S, R>>,
+    proxy_ip: Ipv4Addr,
+}
+
+impl<N, S, R> iso_dns_server::RedirectResolver for CpRedirect<N, S, R>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    fn redirect(&self, src: IpAddr, name: &str) -> Option<Ipv4Addr> {
+        let IpAddr::V4(v4) = src else { return None };
+        let rec = self.cp.identify(v4).ok()??;
+        if rec.egress == EgressMode::Allow && rec.allow.iter().any(|d| d == name) {
+            Some(self.proxy_ip)
+        } else {
+            None
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,8 +69,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metadata_ip: host.services_addr,
         ..Default::default()
     };
+    let dns_resolver: Arc<dyn iso_dns_server::RedirectResolver> = Arc::new(CpRedirect {
+        cp: cp.clone(),
+        proxy_ip: host.services_addr,
+    });
     tokio::spawn(async move {
-        if let Err(e) = iso_dns_server::run(dns_cfg).await {
+        if let Err(e) = iso_dns_server::run(dns_cfg, dns_resolver).await {
             eprintln!("iso-controld: dns server exited: {e}");
         }
     });

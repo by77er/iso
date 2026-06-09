@@ -32,8 +32,9 @@ type UpstreamClient = Client<HttpsConnector<HttpConnector>, Incoming>;
 
 /// Proxy configuration.
 pub struct ProxyConfig {
-    /// Address to accept redirected egress on (e.g. `172.22.0.1:443`).
-    pub listen: SocketAddr,
+    /// Addresses to accept redirected egress on: the nft Proxy-mode DNAT target
+    /// (`:3128`) and the DNS-redirect target for Allow mode (`:443`).
+    pub listen: Vec<SocketAddr>,
     pub ca_sock: PathBuf,
     pub secrets_sock: PathBuf,
     /// Resolves a connection's source IP to its VM's egress policy.
@@ -49,19 +50,37 @@ struct Ctx {
     resolver: Arc<dyn PolicyResolver>,
 }
 
-/// Run the proxy, binding `cfg.listen`.
+/// Run the proxy, binding every address in `cfg.listen`.
 pub async fn run(cfg: ProxyConfig) -> std::io::Result<()> {
-    let listener = TcpListener::bind(cfg.listen).await?;
-    run_with_listener(listener, cfg).await
+    let ctx = build_ctx(&cfg.ca_sock, &cfg.secrets_sock, cfg.resolver.clone())?;
+    let mut handles = Vec::new();
+    for addr in cfg.listen {
+        let listener = TcpListener::bind(addr).await?;
+        tracing::info!("iso-proxy listening on {addr}");
+        let ctx = ctx.clone();
+        handles.push(tokio::spawn(accept_loop(listener, ctx)));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    Ok(())
 }
 
 /// Run the proxy on an already-bound listener (used by tests that need `:0`).
 pub async fn run_with_listener(listener: TcpListener, cfg: ProxyConfig) -> std::io::Result<()> {
-    let ca = Arc::new(
-        CaClient::new(cfg.ca_sock).map_err(|e| std::io::Error::other(e.to_string()))?,
-    );
-    let secrets = Arc::new(SecretsClient::new(cfg.secrets_sock));
+    let ctx = build_ctx(&cfg.ca_sock, &cfg.secrets_sock, cfg.resolver)?;
+    accept_loop(listener, ctx).await
+}
 
+fn build_ctx(
+    ca_sock: &std::path::Path,
+    secrets_sock: &std::path::Path,
+    resolver: Arc<dyn PolicyResolver>,
+) -> std::io::Result<Ctx> {
+    let ca = Arc::new(
+        CaClient::new(ca_sock.to_path_buf()).map_err(|e| std::io::Error::other(e.to_string()))?,
+    );
+    let secrets = Arc::new(SecretsClient::new(secrets_sock.to_path_buf()));
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
@@ -69,16 +88,15 @@ pub async fn run_with_listener(listener: TcpListener, cfg: ProxyConfig) -> std::
         .enable_http2()
         .build();
     let client: UpstreamClient = Client::builder(TokioExecutor::new()).build(https);
-
-    let ctx = Ctx {
+    Ok(Ctx {
         ca,
         secrets,
         client,
-        resolver: cfg.resolver,
-    };
+        resolver,
+    })
+}
 
-    tracing::info!("iso-proxy listening on {:?}", listener.local_addr());
-
+async fn accept_loop(listener: TcpListener, ctx: Ctx) -> std::io::Result<()> {
     loop {
         let (tcp, peer) = listener.accept().await?;
         let ctx = ctx.clone();

@@ -1123,10 +1123,12 @@ dependencies = [
 name = "iso-dns-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "hickory-proto",
  "hickory-resolver",
  "hickory-server",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

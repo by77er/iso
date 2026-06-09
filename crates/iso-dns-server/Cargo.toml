@@ -9,3 +9,5 @@ hickory-proto = "0.26.1"
 hickory-resolver = "0.26.1"
 hickory-server = { version = "0.26.1", features = ["resolver"] }
 tokio = { version = "1.52.3", features = ["rt", "net", "macros"] }
+tracing = "0.1"
+async-trait = "0.1"

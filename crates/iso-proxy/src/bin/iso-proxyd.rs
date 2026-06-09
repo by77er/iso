@@ -17,10 +17,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let state = PathBuf::from(std::env::var("ISO_STATE_DIR").unwrap_or_else(|_| ".".into()));
-    // Default to the services IP : proxy_port (the nft Proxy-mode DNAT target).
+    // The nft Proxy-mode DNAT target (:3128) and the Allow-mode DNS-redirect
+    // target (:443), both on the services IP.
     let listen = std::env::var("ISO_PROXY_LISTEN")
-        .unwrap_or_else(|_| "172.22.0.1:3128".into())
-        .parse()?;
+        .unwrap_or_else(|_| "172.22.0.1:3128,172.22.0.1:443".into())
+        .split(',')
+        .map(|s| s.trim().parse())
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Per-VM policy comes from the control plane (identify RPC), short-TTL cached.
     let resolver = Arc::new(RpcResolver::new(

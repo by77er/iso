@@ -52,7 +52,7 @@ async fn injects_headers_and_enforces_allowlist() {
     tokio::spawn(run_with_listener(
         listener,
         ProxyConfig {
-            listen: proxy_addr,
+            listen: vec![proxy_addr], // unused by run_with_listener
             ca_sock,
             secrets_sock,
             resolver: Arc::new(StaticResolver(Policy {

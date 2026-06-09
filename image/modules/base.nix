@@ -37,6 +37,12 @@ in
     lib.optionals (builtins.pathExists ../ca.crt) [ ../ca.crt ];
   environment.variables.NODE_EXTRA_CA_CERTS = "/etc/ssl/certs/ca-bundle.crt";
 
+  # pi / the Anthropic SDK refuse to start without an API key in the env, and
+  # they send it as the `x-api-key` header. The egress proxy OVERRIDES that
+  # header with the real key (from the host secret store), so this is a
+  # non-secret placeholder — the real key never lives in the guest.
+  environment.variables.ANTHROPIC_API_KEY = "iso-proxy-injects-the-real-key";
+
   services.openssh = {
     enable = true;
     settings = {
