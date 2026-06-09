@@ -1,7 +1,7 @@
 {
   description = "iso — NixOS Firecracker microVM base image (kernel + rootfs)";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
 
   outputs =
     { self, nixpkgs }:
