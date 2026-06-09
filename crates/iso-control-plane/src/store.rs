@@ -57,6 +57,11 @@ fn ingress_from_json(s: &str) -> std::result::Result<Vec<PortForward>, serde_jso
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        // ensure the state directory exists (skip for the `:memory:` sentinel).
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Store(format!("create {parent:?}: {e}")))?;
+        }
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "

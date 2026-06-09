@@ -2,23 +2,26 @@
 //!
 //! Wires the real network/storage managers + the Firecracker runtime into the
 //! control-plane core, starts host subsystems, runs the supervisor, and serves
-//! the admin HTTP API over a unix socket.
-
-mod http;
+//! the admin HTTP API over a unix socket. All state lives under `ISO_STATE_DIR`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use iso_control_plane::{Config, ControlPlane};
+use iso_control_plane::ControlPlane;
+use iso_controld::{http, settings};
 use iso_firecracker::FirecrackerRuntime;
+use iso_storage_manager::command::SystemRunner;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let s = settings::from_env();
+    let control_sock = s.control_sock.clone();
+
     let cp = Arc::new(ControlPlane::new(
-        Config::default(),
-        iso_network_manager::Manager::default(),
-        iso_storage_manager::Manager::with_defaults(),
-        FirecrackerRuntime::new(iso_firecracker::Config::default()),
+        s.control,
+        iso_network_manager::Manager::new(s.network),
+        iso_storage_manager::Manager::new(s.storage, Arc::new(SystemRunner)),
+        FirecrackerRuntime::new(s.firecracker),
     )?);
 
     let host = cp.start().await?;
@@ -27,16 +30,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         host.services_addr, host.proxy_port
     );
 
-    // background supervisor: reconcile running VMs against the VMM.
     tokio::spawn(cp.clone().supervise(Duration::from_secs(2)));
 
-    let sock = "/run/iso/control.sock";
-    if let Some(parent) = std::path::Path::new(sock).parent() {
+    if let Some(parent) = control_sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::remove_file(sock);
-    let listener = tokio::net::UnixListener::bind(sock)?;
-    eprintln!("iso-controld: admin API listening on {sock}");
+    let _ = std::fs::remove_file(&control_sock);
+    let listener = tokio::net::UnixListener::bind(&control_sock)?;
+    eprintln!("iso-controld: admin API on {}", control_sock.display());
     axum::serve(listener, http::router(cp)).await?;
     Ok(())
 }

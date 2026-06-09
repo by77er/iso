@@ -484,6 +484,7 @@ dependencies = [
  "iso-firecracker",
  "iso-network-manager",
  "iso-storage-manager",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

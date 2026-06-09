@@ -23,4 +23,6 @@ hyper = { version = "1.10.1", features = ["server", "http1"] }
 tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
+libc = "0.2.186"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tower = { version = "0.5", features = ["util"] }
