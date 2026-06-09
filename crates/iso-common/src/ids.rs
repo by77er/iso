@@ -22,6 +22,15 @@ impl VmId {
     pub const fn as_u128(self) -> u128 {
         self.0
     }
+
+    /// Parse from canonical hyphenated or bare 32-hex form.
+    pub fn parse(s: &str) -> Option<Self> {
+        let hex: String = s.chars().filter(|c| *c != '-').collect();
+        if hex.len() != 32 {
+            return None;
+        }
+        u128::from_str_radix(&hex, 16).ok().map(Self)
+    }
 }
 
 impl fmt::Display for VmId {

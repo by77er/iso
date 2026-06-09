@@ -32,10 +32,12 @@
 pub mod error;
 pub mod ids;
 pub mod network;
+pub mod runtime;
 pub mod storage;
 
 pub use error::{Error, Result};
 pub use ids::{SlotId, VmId};
+pub use runtime::{InstanceSpec, SnapshotRef, VmRuntime, VmStatus};
 pub use network::{
     EgressMode, HostNetwork, MacAddr, NetworkFixture, NetworkManager, NetworkPolicy, PortForward,
     Protocol,
