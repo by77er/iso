@@ -8,6 +8,7 @@
 //! yet fleshed out. Expect [`VolumeSpec`] / [`StorageHandle`] to grow (read-only
 //! layers, snapshots, sizing overrides, …).
 
+use std::future::Future;
 use std::path::PathBuf;
 
 use crate::error::Result;
@@ -48,16 +49,20 @@ pub struct PoolStats {
 pub trait StorageManager {
     /// One-time host storage setup (sparse file → loop → PV → VG → thin pool).
     /// Idempotent.
-    async fn init(&self) -> Result<()>;
+    fn init(&self) -> impl Future<Output = Result<()>> + Send;
 
     /// Provision storage for `vm` per `spec`. Idempotent: re-provisioning an
     /// existing VM returns its existing handle.
-    async fn provision(&self, vm: VmId, spec: &VolumeSpec) -> Result<StorageHandle>;
+    fn provision(
+        &self,
+        vm: VmId,
+        spec: &VolumeSpec,
+    ) -> impl Future<Output = Result<StorageHandle>> + Send;
 
     /// Tear down all storage for `vm`. Idempotent: tearing down absent storage
     /// succeeds.
-    async fn teardown(&self, vm: VmId) -> Result<()>;
+    fn teardown(&self, vm: VmId) -> impl Future<Output = Result<()>> + Send;
 
     /// Current backing-pool utilisation.
-    async fn pool_stats(&self) -> Result<PoolStats>;
+    fn pool_stats(&self) -> impl Future<Output = Result<PoolStats>> + Send;
 }

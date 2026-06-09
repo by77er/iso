@@ -5,6 +5,7 @@
 //! The spec is VMM-neutral; backend-specific configuration lives in the backend
 //! crate, not here.
 
+use std::future::Future;
 use std::path::PathBuf;
 
 use crate::error::Result;
@@ -67,23 +68,23 @@ pub enum VmStatus {
 pub trait VmRuntime {
     /// Define the instance: spawn the VMM and load config or a snapshot. Not
     /// yet executing.
-    async fn create(&self, spec: &InstanceSpec) -> Result<()>;
+    fn create(&self, spec: &InstanceSpec) -> impl Future<Output = Result<()>> + Send;
 
     /// Begin or resume execution.
-    async fn start(&self, vm: VmId) -> Result<()>;
+    fn start(&self, vm: VmId) -> impl Future<Output = Result<()>> + Send;
 
     /// Pause execution (and snapshot to disk for a later resume).
-    async fn suspend(&self, vm: VmId) -> Result<()>;
+    fn suspend(&self, vm: VmId) -> impl Future<Output = Result<()>> + Send;
 
     /// Request graceful in-guest shutdown.
-    async fn stop(&self, vm: VmId) -> Result<()>;
+    fn stop(&self, vm: VmId) -> impl Future<Output = Result<()>> + Send;
 
     /// Forcefully terminate the instance.
-    async fn halt(&self, vm: VmId) -> Result<()>;
+    fn halt(&self, vm: VmId) -> impl Future<Output = Result<()>> + Send;
 
     /// Remove the instance and its VMM artifacts.
-    async fn destroy(&self, vm: VmId) -> Result<()>;
+    fn destroy(&self, vm: VmId) -> impl Future<Output = Result<()>> + Send;
 
     /// Current observed status.
-    async fn status(&self, vm: VmId) -> Result<VmStatus>;
+    fn status(&self, vm: VmId) -> impl Future<Output = Result<VmStatus>> + Send;
 }

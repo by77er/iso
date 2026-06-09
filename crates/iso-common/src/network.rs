@@ -4,6 +4,7 @@
 //! firewall design that backs this interface.
 
 use std::fmt;
+use std::future::Future;
 use std::net::Ipv4Addr;
 
 use crate::error::Result;
@@ -169,7 +170,7 @@ pub trait NetworkManager {
     /// One-time host network setup (IP forwarding, RPF, the services dummy
     /// interface, …). Idempotent. Returns the host-wide facts callers need to
     /// bind services.
-    async fn init(&self) -> Result<HostNetwork>;
+    fn init(&self) -> impl Future<Output = Result<HostNetwork>> + Send;
 
     /// Converge `slot` to `policy`, creating the network fixtures if they do not
     /// yet exist. Idempotent: applying the same policy twice changes nothing,
@@ -178,11 +179,15 @@ pub trait NetworkManager {
     ///
     /// A `policy.ingress` containing duplicate `(host_port, proto)` pairs is
     /// rejected with [`crate::Error::DuplicatePortForward`].
-    async fn apply(&self, slot: SlotId, policy: &NetworkPolicy) -> Result<NetworkFixture>;
+    fn apply(
+        &self,
+        slot: SlotId,
+        policy: &NetworkPolicy,
+    ) -> impl Future<Output = Result<NetworkFixture>> + Send;
 
     /// Converge `slot` to absent — tear down all network resources. Idempotent:
     /// tearing down an absent slot succeeds.
-    async fn teardown(&self, slot: SlotId) -> Result<()>;
+    fn teardown(&self, slot: SlotId) -> impl Future<Output = Result<()>> + Send;
 
     /// Reverse of the fixture derivation: map a host-side veth address (a VM's
     /// post-SNAT `vp` source, as seen by services bound to the dummy) back to

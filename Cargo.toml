@@ -8,6 +8,7 @@ members = [
     "crates/iso-proxy",
     "crates/iso-control-plane",
     "crates/iso-firecracker",
+    "crates/iso-controld",
     "crates/iso-cli",
 ]
 

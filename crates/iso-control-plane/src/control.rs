@@ -4,11 +4,12 @@
 //! Transport-agnostic — the axum HTTP layer is a thin wrapper over these
 //! methods.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use iso_common::{
     HostNetwork, InstanceSpec, NetworkManager, NetworkPolicy, StorageManager, VmId, VmRuntime,
-    VolumeSpec,
+    VmStatus, VolumeSpec,
 };
 
 use crate::config::Config;
@@ -222,10 +223,14 @@ where
         Ok(())
     }
 
-    /// Graceful shutdown, then apply lifecycle policy.
+    /// Graceful shutdown (escalating to force after the timeout), then apply
+    /// lifecycle policy.
     pub async fn stop_vm(&self, id: VmId) -> Result<()> {
         let rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
         self.runtime.stop(id).await?;
+        if !self.wait_exit(id, self.cfg.graceful_stop).await {
+            let _ = self.runtime.halt(id).await;
+        }
         self.finalize_stop(rec).await
     }
 
@@ -234,6 +239,21 @@ where
         let rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
         self.runtime.halt(id).await?;
         self.finalize_stop(rec).await
+    }
+
+    /// Poll until the VMM reports the instance gone, or `timeout` elapses.
+    /// Returns whether it exited.
+    async fn wait_exit(&self, id: VmId, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                match self.runtime.status(id).await {
+                    Ok(VmStatus::Stopped) | Ok(VmStatus::Absent) => return,
+                    _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+            }
+        })
+        .await
+        .is_ok()
     }
 
     /// Release placement; tear down storage + record for Ephemeral, keep storage
@@ -344,6 +364,31 @@ where
             self.start_vm(id).await
         } else {
             self.finalize_stop(rec).await
+        }
+    }
+
+    /// One supervision pass: reconcile each Running record against live VMM
+    /// state, invoking the exit handler for any that have gone away.
+    pub async fn supervise_tick(&self) -> Result<()> {
+        for rec in self.store.list_vms()? {
+            if rec.state == VmState::Running {
+                match self.runtime.status(rec.id).await? {
+                    VmStatus::Running | VmStatus::Suspended => {}
+                    // unexpected exit; treat as failure so OnFailure restarts.
+                    _ => {
+                        let _ = self.handle_exit(rec.id, true).await;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the supervisor loop forever, polling every `interval`.
+    pub async fn supervise(self: Arc<Self>, interval: Duration) {
+        loop {
+            tokio::time::sleep(interval).await;
+            let _ = self.supervise_tick().await;
         }
     }
 
@@ -467,41 +512,61 @@ mod tests {
         }
     }
 
+    type States = Arc<Mutex<std::collections::HashMap<VmId, VmStatus>>>;
+
     struct MockRuntime {
         log: Log,
         fail_start: bool,
+        states: States,
+    }
+    impl MockRuntime {
+        fn set(&self, vm: VmId, s: VmStatus) {
+            self.states.lock().unwrap().insert(vm, s);
+        }
     }
     impl VmRuntime for MockRuntime {
         async fn create(&self, spec: &InstanceSpec) -> IRes<()> {
             self.log.push(format!("rt.create:resume={}", spec.resume_from.is_some()));
+            self.set(spec.vm, VmStatus::Created);
             Ok(())
         }
-        async fn start(&self, _vm: VmId) -> IRes<()> {
+        async fn start(&self, vm: VmId) -> IRes<()> {
             self.log.push("rt.start");
             if self.fail_start {
                 Err(IErr::Backend("boom".into()))
             } else {
+                self.set(vm, VmStatus::Running);
                 Ok(())
             }
         }
-        async fn suspend(&self, _vm: VmId) -> IRes<()> {
+        async fn suspend(&self, vm: VmId) -> IRes<()> {
             self.log.push("rt.suspend");
+            self.set(vm, VmStatus::Suspended);
             Ok(())
         }
-        async fn stop(&self, _vm: VmId) -> IRes<()> {
+        async fn stop(&self, vm: VmId) -> IRes<()> {
             self.log.push("rt.stop");
+            self.set(vm, VmStatus::Stopped);
             Ok(())
         }
-        async fn halt(&self, _vm: VmId) -> IRes<()> {
+        async fn halt(&self, vm: VmId) -> IRes<()> {
             self.log.push("rt.halt");
+            self.set(vm, VmStatus::Stopped);
             Ok(())
         }
-        async fn destroy(&self, _vm: VmId) -> IRes<()> {
+        async fn destroy(&self, vm: VmId) -> IRes<()> {
             self.log.push("rt.destroy");
+            self.states.lock().unwrap().remove(&vm);
             Ok(())
         }
-        async fn status(&self, _vm: VmId) -> IRes<VmStatus> {
-            Ok(VmStatus::Running)
+        async fn status(&self, vm: VmId) -> IRes<VmStatus> {
+            Ok(self
+                .states
+                .lock()
+                .unwrap()
+                .get(&vm)
+                .copied()
+                .unwrap_or(VmStatus::Absent))
         }
     }
 
@@ -524,8 +589,9 @@ mod tests {
         )
     }
 
-    fn build(slot_capacity: usize, pool: f64, fail_start: bool) -> (Cp, Log) {
+    fn build3(slot_capacity: usize, pool: f64, fail_start: bool) -> (Cp, Log, States) {
         let log = Log::default();
+        let states: States = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let (config, pstats) = cfg(slot_capacity, pool);
         let cp = ControlPlane::new(
             config,
@@ -537,9 +603,15 @@ mod tests {
             MockRuntime {
                 log: log.clone(),
                 fail_start,
+                states: states.clone(),
             },
         )
         .unwrap();
+        (cp, log, states)
+    }
+
+    fn build(slot_capacity: usize, pool: f64, fail_start: bool) -> (Cp, Log) {
+        let (cp, log, _states) = build3(slot_capacity, pool, fail_start);
         (cp, log)
     }
 
@@ -695,6 +767,27 @@ mod tests {
         let (cp, _log) = build(8, 10.0, false);
         let err = cp.create_vm(CreateVm::new("ghost")).await.unwrap_err();
         assert!(matches!(err, Error::UnknownTemplate(_)));
+    }
+
+    #[tokio::test]
+    async fn supervisor_finalizes_crashed_ephemeral() {
+        let (cp, _log, states) = build3(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp.create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never)).await.unwrap();
+        // simulate an unexpected exit
+        states.lock().unwrap().insert(id, VmStatus::Stopped);
+        cp.supervise_tick().await.unwrap();
+        assert!(cp.get_vm(id).unwrap().is_none(), "crashed ephemeral is reaped");
+    }
+
+    #[tokio::test]
+    async fn supervisor_restarts_when_policy_always() {
+        let (cp, _log, states) = build3(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp.create_vm(req(Lifecycle::Durable, RestartPolicy::Always)).await.unwrap();
+        states.lock().unwrap().insert(id, VmStatus::Stopped);
+        cp.supervise_tick().await.unwrap();
+        assert_eq!(cp.get_vm(id).unwrap().unwrap().state, VmState::Running);
     }
 
     #[tokio::test]
