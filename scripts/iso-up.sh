@@ -42,6 +42,21 @@ if [ -f "$STATE/templates/agent/vmstate" ]; then
   echo "[iso-up] template 'agent' registered ($code) via $ADMIN"
 fi
 
+# --- Docker hole-punch: this host runs Docker, whose `ip filter FORWARD` policy
+#     is drop. iso VMs forward through the root netns (host veth `vm<slot>` <->
+#     uplink), so allow-egress VMs are dropped unless we accept their traffic.
+#     DOCKER-USER is the Docker-sanctioned hook for custom forward rules; a
+#     single `vm*` pair covers every VM. Idempotent; tagged via comment. ---
+if sudo -n nft list chain ip filter DOCKER-USER >/dev/null 2>&1; then
+  if ! sudo -n nft list chain ip filter DOCKER-USER 2>/dev/null | grep -q 'iso-vm-egress'; then
+    sudo -n nft insert rule ip filter DOCKER-USER oifname \"vm*\" counter accept comment \"iso-vm-egress\"
+    sudo -n nft insert rule ip filter DOCKER-USER iifname \"vm*\" counter accept comment \"iso-vm-egress\"
+    echo "[iso-up] installed DOCKER-USER carve-out for vm* egress"
+  else
+    echo "[iso-up] DOCKER-USER carve-out already present"
+  fi
+fi
+
 # --- agentd (user). Runs even without a bot token (gateway just stays
 #     down); dynamic CONTROL_PLANE_URL tracks the host IP across reboots. ---
 if [ -f "$STATE/agentd.env" ] && [ -d "$AGENTD" ]; then

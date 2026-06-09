@@ -62,6 +62,15 @@ struct Bake {
     /// Seconds to wait for the guest to come up before snapshotting.
     #[arg(long, default_value_t = 90)]
     boot_timeout: u64,
+    /// Skip rebuilding the rootfs (mkfs + nixos-install) and re-snapshot the
+    /// existing `tpl_<name>` instead. Use after editing/injecting a template.
+    #[arg(long, default_value_t = false)]
+    skip_install: bool,
+    /// Extra nix store closures to copy into the rootfs and expose on the
+    /// `coder` PATH (`~/.nix-profile/bin/<bin>`), e.g. the `pi` agent. Done
+    /// BEFORE the snapshot so warm-resumed clones can see them. Repeatable.
+    #[arg(long)]
+    inject: Vec<String>,
 }
 
 fn run(args: &[&str]) -> R<()> {
@@ -99,6 +108,32 @@ fn nix_build(flake: &str, attr: &str) -> R<String> {
     ])
 }
 
+/// Copy nix closures into a (currently unmounted) rootfs LV and symlink each
+/// closure's `bin/*` onto the `coder` user's PATH.
+fn inject_closures(dev: &str, paths: &[String]) -> R<()> {
+    let mnt = run_out(&["mktemp", "-d"])?;
+    run(&["mount", dev, &mnt])?;
+    let res = (|| -> R<()> {
+        let bindir = format!("{mnt}/home/coder/.nix-profile/bin");
+        run(&["install", "-d", "-o", "1000", "-g", "1000", &bindir])?;
+        for path in paths {
+            eprintln!("[bake] inject {path}");
+            run(&["nix", "copy", "--no-check-sigs", "--to", &format!("local?root={mnt}"), path])?;
+            for entry in std::fs::read_dir(format!("{path}/bin"))?.flatten() {
+                let target = entry.path();
+                let link = format!("{bindir}/{}", entry.file_name().to_string_lossy());
+                let _ = std::fs::remove_file(&link);
+                std::os::unix::fs::symlink(&target, &link)?;
+                run(&["chown", "-h", "1000:1000", &link])?;
+            }
+        }
+        Ok(())
+    })();
+    run(&["sync"]).ok();
+    let _ = run(&["umount", "-R", &mnt]);
+    res
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> R<()> {
     match Cli::parse().cmd {
@@ -129,20 +164,31 @@ async fn bake(b: Bake) -> R<()> {
         Arc::new(iso_storage_manager::command::SystemRunner),
     );
     storage.init().await?;
-    storage.create_template(&b.name, &b.size).await?;
     let tpl_lv = storage.template_lv(&b.name);
     let dev = storage.dev_path(&tpl_lv);
-    eprintln!("[bake] mkfs + nixos-install onto {}", dev.display());
-    run(&["mkfs.ext4", "-F", "-q", &dev.to_string_lossy()])?;
-    let mnt = run_out(&["mktemp", "-d"])?;
-    run(&["mount", &dev.to_string_lossy(), &mnt])?;
-    let install = run(&[
-        &nixos_install, "--root", &mnt, "--system", &toplevel,
-        "--no-bootloader", "--no-root-passwd", "--no-channel-copy",
-    ]);
-    run(&["sync"]).ok();
-    let _ = run(&["umount", "-R", &mnt]);
-    install?;
+    if b.skip_install {
+        eprintln!("[bake] --skip-install: re-using existing rootfs {}", dev.display());
+    } else {
+        storage.create_template(&b.name, &b.size).await?;
+        eprintln!("[bake] mkfs + nixos-install onto {}", dev.display());
+        run(&["mkfs.ext4", "-F", "-q", &dev.to_string_lossy()])?;
+        let mnt = run_out(&["mktemp", "-d"])?;
+        run(&["mount", &dev.to_string_lossy(), &mnt])?;
+        let install = run(&[
+            &nixos_install, "--root", &mnt, "--system", &toplevel,
+            "--no-bootloader", "--no-root-passwd", "--no-channel-copy",
+        ]);
+        run(&["sync"]).ok();
+        let _ = run(&["umount", "-R", &mnt]);
+        install?;
+    }
+
+    // Inject extra closures (e.g. `pi`) into the rootfs BEFORE booting/snapshotting:
+    // warm-resumed clones restore a frozen page cache, so files added to the
+    // template *after* the snapshot are invisible to them. Idempotent.
+    if !b.inject.is_empty() {
+        inject_closures(&dev.to_string_lossy(), &b.inject)?;
+    }
 
     // --- network: transient netns/veth/tap for the builder ---
     let ncfg = iso_network_manager::Config {
