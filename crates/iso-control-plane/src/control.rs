@@ -169,6 +169,8 @@ where
             state: VmState::Creating,
             rootfs_device: None,
             tap: None,
+            principal: req.principal.clone(),
+            allow: req.allow.clone(),
         };
         // write-ahead intent so a crash mid-create is recoverable.
         self.store.insert_vm(&rec)?;
@@ -462,6 +464,26 @@ where
 
     pub fn list_vms(&self) -> Result<Vec<VmRecord>> {
         self.store.list_vms()
+    }
+
+    /// Update a VM's egress policy: the (opaque) `principal` it acts as and/or
+    /// the `allow` domain list routed through the proxy. `None` fields are left
+    /// unchanged. Mutable at runtime (e.g. set per agent turn).
+    pub fn set_policy(
+        &self,
+        id: VmId,
+        principal: Option<String>,
+        allow: Option<Vec<String>>,
+    ) -> Result<()> {
+        let mut rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
+        if let Some(p) = principal {
+            rec.principal = Some(p);
+        }
+        if let Some(a) = allow {
+            rec.allow = a;
+        }
+        self.store.update_vm(&rec)?;
+        Ok(())
     }
 
     pub fn services(&self) -> Option<HostNetwork> {

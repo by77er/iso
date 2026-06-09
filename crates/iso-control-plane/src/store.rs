@@ -89,10 +89,15 @@ impl Store {
                 state         TEXT NOT NULL,
                 rootfs_device TEXT,
                 tap           TEXT,
+                principal     TEXT,
+                allow         TEXT NOT NULL DEFAULT '[]',
                 created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
             ",
         )?;
+        // Migrate pre-policy databases (idempotent; errors = column exists).
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN principal TEXT", []);
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN allow TEXT NOT NULL DEFAULT '[]'", []);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -152,8 +157,8 @@ impl Store {
         self.lock().execute(
             "INSERT INTO vms
                 (id, slot, template, egress, ingress, labels, lifecycle, restart,
-                 vcpus, mem_mib, state, rootfs_device, tap)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                 vcpus, mem_mib, state, rootfs_device, tap, principal, allow)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             rusqlite::params![
                 v.id.to_string(),
                 v.slot.map(|s| s.get()),
@@ -168,6 +173,8 @@ impl Store {
                 v.state.as_str(),
                 v.rootfs_device.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 v.tap,
+                v.principal,
+                serde_json::to_string(&v.allow)?,
             ],
         )?;
         Ok(())
@@ -177,7 +184,7 @@ impl Store {
     pub fn update_vm(&self, v: &VmRecord) -> Result<()> {
         self.lock().execute(
             "UPDATE vms SET slot=?2, egress=?3, ingress=?4, state=?5,
-                rootfs_device=?6, tap=?7 WHERE id=?1",
+                rootfs_device=?6, tap=?7, principal=?8, allow=?9 WHERE id=?1",
             rusqlite::params![
                 v.id.to_string(),
                 v.slot.map(|s| s.get()),
@@ -186,6 +193,8 @@ impl Store {
                 v.state.as_str(),
                 v.rootfs_device.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 v.tap,
+                v.principal,
+                serde_json::to_string(&v.allow)?,
             ],
         )?;
         Ok(())
@@ -219,8 +228,8 @@ impl Store {
     }
 }
 
-const VM_SELECT: &str = "SELECT id, slot, template, egress, ingress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap FROM vms WHERE id=?1";
-const VM_SELECT_ALL: &str = "SELECT id, slot, template, egress, ingress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap FROM vms";
+const VM_SELECT: &str = "SELECT id, slot, template, egress, ingress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow FROM vms WHERE id=?1";
+const VM_SELECT_ALL: &str = "SELECT id, slot, template, egress, ingress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow FROM vms";
 
 fn template_from_row(r: &rusqlite::Row<'_>) -> Result<TemplateDef> {
     let mem: Option<String> = r.get(2)?;
@@ -259,6 +268,8 @@ fn vm_from_row(r: &rusqlite::Row<'_>) -> Result<VmRecord> {
         .ok_or_else(|| Error::Store("bad state".into()))?;
     let rootfs_device: Option<String> = r.get(11)?;
     let tap: Option<String> = r.get(12)?;
+    let principal: Option<String> = r.get(13)?;
+    let allow: Vec<String> = serde_json::from_str(&r.get::<_, String>(14)?)?;
     Ok(VmRecord {
         id,
         slot: slot.and_then(|s| SlotId::new(s).ok()),
@@ -273,5 +284,7 @@ fn vm_from_row(r: &rusqlite::Row<'_>) -> Result<VmRecord> {
         state,
         rootfs_device: rootfs_device.map(PathBuf::from),
         tap,
+        principal,
+        allow,
     })
 }

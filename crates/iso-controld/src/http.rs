@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use iso_common::{
     EgressMode, NetworkManager, PortForward, Protocol, SnapshotRef, StorageManager, VmId,
@@ -76,6 +76,10 @@ struct CreateReq {
     vcpus: Option<u32>,
     #[serde(default)]
     mem_mib: Option<u32>,
+    #[serde(default)]
+    principal: Option<String>,
+    #[serde(default)]
+    allow: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -96,6 +100,16 @@ struct VmResp {
     ingress: Vec<PortForwardDto>,
     tap: Option<String>,
     rootfs_device: Option<String>,
+    principal: Option<String>,
+    allow: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PolicyReq {
+    #[serde(default)]
+    principal: Option<String>,
+    #[serde(default)]
+    allow: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -176,6 +190,8 @@ fn to_req(r: CreateReq) -> CreateVm {
         restart: restart_from(&r.restart),
         vcpus: r.vcpus,
         mem_mib: r.mem_mib,
+        principal: r.principal,
+        allow: r.allow,
     }
 }
 
@@ -200,6 +216,8 @@ fn vm_resp(r: &VmRecord) -> VmResp {
             .collect(),
         tap: r.tap.clone(),
         rootfs_device: r.rootfs_device.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        principal: r.principal.clone(),
+        allow: r.allow.clone(),
     }
 }
 
@@ -291,6 +309,20 @@ where
     Ok(StatusCode::CREATED)
 }
 
+async fn set_policy<N, S, R>(
+    State(cp): State<Cp<N, S, R>>,
+    Path(id): Path<String>,
+    Json(req): Json<PolicyReq>,
+) -> Result<StatusCode, ApiError>
+where
+    N: iso_common::network::NetworkManager + Send + Sync + 'static,
+    S: iso_common::storage::StorageManager + Send + Sync + 'static,
+    R: iso_common::runtime::VmRuntime + Send + Sync + 'static,
+{
+    cp.set_policy(parse_id(&id)?, req.principal, req.allow)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn stats<N, S, R>(State(cp): State<Cp<N, S, R>>) -> Result<Json<StatsResp>, ApiError>
 where
     N: NetworkManager + Send + Sync + 'static,
@@ -321,6 +353,7 @@ where
         .route("/vms/{id}/stop", post(stop::<N, S, R>))
         .route("/vms/{id}/suspend", post(suspend::<N, S, R>))
         .route("/vms/{id}/halt", post(halt::<N, S, R>))
+        .route("/vms/{id}/policy", patch(set_policy::<N, S, R>))
         .route("/templates", post(register_template::<N, S, R>))
         .route("/stats", get(stats::<N, S, R>))
         .with_state(cp)

@@ -112,6 +112,13 @@ pub struct VmRecord {
     pub state: VmState,
     pub rootfs_device: Option<PathBuf>,
     pub tap: Option<String>,
+    /// Security principal the VM acts as (selects per-principal injected creds).
+    /// Deliberately mutable at runtime.
+    pub principal: Option<String>,
+    /// Domains routed through the egress proxy (intercept for policy +
+    /// credential injection). In `Allow` mode the rest go direct; in `Proxy`
+    /// mode the rest are denied.
+    pub allow: Vec<String>,
 }
 
 /// Request to create a VM.
@@ -125,6 +132,8 @@ pub struct CreateVm {
     pub restart: RestartPolicy,
     pub vcpus: Option<u32>,
     pub mem_mib: Option<u32>,
+    pub principal: Option<String>,
+    pub allow: Vec<String>,
 }
 
 impl CreateVm {
@@ -140,6 +149,8 @@ impl CreateVm {
             restart: RestartPolicy::Never,
             vcpus: None,
             mem_mib: None,
+            principal: None,
+            allow: Vec::new(),
         }
     }
 }
