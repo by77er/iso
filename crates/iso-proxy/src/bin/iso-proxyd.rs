@@ -17,8 +17,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let state = PathBuf::from(std::env::var("ISO_STATE_DIR").unwrap_or_else(|_| ".".into()));
+    // Default to the services IP : proxy_port (the nft Proxy-mode DNAT target).
     let listen = std::env::var("ISO_PROXY_LISTEN")
-        .unwrap_or_else(|_| "172.22.0.1:443".into())
+        .unwrap_or_else(|_| "172.22.0.1:3128".into())
         .parse()?;
 
     // Per-VM policy comes from the control plane (identify RPC), short-TTL cached.

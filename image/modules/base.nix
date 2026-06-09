@@ -30,6 +30,13 @@ in
   security.sudo.enable = true;
   security.sudo.wheelNeedsPassword = false;
 
+  # Trust the iso egress-proxy CA, if its cert was staged next to the flake
+  # before baking (cp state/ca/ca.crt image/ca.crt). Lets MITM'd TLS validate
+  # inside the guest. NODE_EXTRA_CA_CERTS points node/pi at the system bundle.
+  security.pki.certificateFiles =
+    lib.optionals (builtins.pathExists ../ca.crt) [ ../ca.crt ];
+  environment.variables.NODE_EXTRA_CA_CERTS = "/etc/ssl/certs/ca-bundle.crt";
+
   services.openssh = {
     enable = true;
     settings = {

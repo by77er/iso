@@ -42,6 +42,24 @@ if [ -f "$STATE/templates/agent/vmstate" ]; then
   echo "[iso-up] template 'agent' registered ($code) via $ADMIN"
 fi
 
+# --- egress proxy stack (root): CA minter, secret provider, MITM proxy.
+#     Reads state/{ca,secrets.toml}; proxy resolves per-VM policy via the
+#     control plane's identify.sock and serves the nft Proxy-mode DNAT target. ---
+start_svc() { # name binary
+  if ! pgrep -f "$2" >/dev/null 2>&1; then
+    echo "[iso-up] starting $1"
+    sudo -n setsid env "PATH=$PATH" ISO_STATE_DIR="$STATE" "$2" \
+      >"$STATE/$1.log" 2>&1 </dev/null &
+  fi
+}
+start_svc iso-cad "$REPO/target/debug/iso-cad"
+if [ -f "$STATE/secrets.toml" ]; then
+  start_svc iso-secretsd "$REPO/target/debug/iso-secretsd"
+else
+  echo "[iso-up] $STATE/secrets.toml missing — skipping iso-secretsd (no injection)"
+fi
+start_svc iso-proxyd "$REPO/target/debug/iso-proxyd"
+
 # --- Docker hole-punch: this host runs Docker, whose `ip filter FORWARD` policy
 #     is drop. iso VMs forward through the root netns (host veth `vm<slot>` <->
 #     uplink), so allow-egress VMs are dropped unless we accept their traffic.
