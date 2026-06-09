@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use iso_common::{
-    InstanceSpec, NetworkManager, NetworkPolicy, SlotId, SnapshotRef, StorageManager, VmId,
-    VmRuntime,
+    EgressMode, InstanceSpec, NetworkManager, NetworkPolicy, SlotId, SnapshotRef, StorageManager,
+    VmId, VmRuntime,
 };
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
@@ -78,6 +78,15 @@ struct Bake {
     /// across every VM cloned from the template. Repeatable.
     #[arg(long)]
     seed_repo: Vec<String>,
+    /// Commands to run inside the builder as `coder` (over ssh) AFTER boot and
+    /// BEFORE the snapshot, e.g. to warm a toolchain once so it's CoW-shared
+    /// across all VMs. Implies egress=Allow for the builder. Non-fatal.
+    /// Repeatable.
+    #[arg(long)]
+    provision: Vec<String>,
+    /// SSH key for `--provision` (default: <state>/keys/test_ed25519).
+    #[arg(long)]
+    ssh_key: Option<PathBuf>,
 }
 
 fn run(args: &[&str]) -> R<()> {
@@ -245,9 +254,16 @@ async fn bake(b: Bake) -> R<()> {
     let net = iso_network_manager::Manager::new(ncfg.clone());
     net.init().await?;
     let slot = SlotId::new(b.slot)?;
-    let fixture = net
-        .apply(slot, &NetworkPolicy::default()) // Deny: builder needs no egress
-        .await?;
+    // Provisioning needs network; otherwise the builder needs no egress.
+    let policy = if b.provision.is_empty() {
+        NetworkPolicy::default()
+    } else {
+        NetworkPolicy {
+            egress: EgressMode::Allow,
+            ingress: Vec::new(),
+        }
+    };
+    let fixture = net.apply(slot, &policy).await?;
 
     // --- runtime: boot the builder VM directly on the rootfs LV ---
     let fcfg = iso_firecracker::Config {
@@ -277,7 +293,11 @@ async fn bake(b: Bake) -> R<()> {
         resume_from: None,
     };
 
-    let result = bake_inner(&rt, &net, &fixture.netns, slot, builder, inner_vm, &spec, b.boot_timeout, &b.state, &b.name).await;
+    let ssh_key = b
+        .ssh_key
+        .clone()
+        .unwrap_or_else(|| b.state.join("keys/test_ed25519"));
+    let result = bake_inner(&rt, &net, &fixture.netns, slot, builder, inner_vm, &spec, b.boot_timeout, &b.state, &b.name, &b.provision, &ssh_key).await;
 
     // always tear the builder down (keep the rootfs LV + the snapshot)
     let _ = rt.destroy(builder).await;
@@ -320,6 +340,8 @@ async fn bake_inner(
     boot_timeout: u64,
     state: &Path,
     name: &str,
+    provision: &[String],
+    ssh_key: &Path,
 ) -> R<(PathBuf, PathBuf)> {
     eprintln!("[bake] booting builder VM in netns {netns}");
     rt.create(spec).await?;
@@ -345,8 +367,28 @@ async fn bake_inner(
     if !up {
         return Err("guest never reached sshd within the boot timeout".into());
     }
-    eprintln!("[bake] guest up; pausing + snapshotting");
+    eprintln!("[bake] guest up");
 
+    // Run provisioning commands as `coder` inside the builder (over ssh in the
+    // netns) before snapshotting, so any warmed state is CoW-shared. Non-fatal.
+    for cmd in provision {
+        eprintln!("[bake] provision: {cmd}");
+        let ok = Command::new("ip")
+            .args([
+                "netns", "exec", netns, "ssh", "-i", &ssh_key.to_string_lossy(),
+                "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=15", "-o", "LogLevel=ERROR",
+                &format!("coder@{inner_vm}"), cmd,
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("[bake] provision command failed (continuing): {cmd}");
+        }
+    }
+
+    eprintln!("[bake] pausing + snapshotting");
     // suspend = pause + CreateSnapshot into the runtime's per-vm dir.
     rt.suspend(builder).await?;
 
