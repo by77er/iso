@@ -10,3 +10,11 @@ path = "src/main.rs"
 
 [dependencies]
 iso-common = { path = "../iso-common" }
+iso-control-plane = { path = "../iso-control-plane" }
+iso-network-manager = { path = "../iso-network-manager" }
+iso-storage-manager = { path = "../iso-storage-manager" }
+iso-firecracker = { path = "../iso-firecracker" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+libc = "0.2.186"

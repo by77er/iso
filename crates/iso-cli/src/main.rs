@@ -1,11 +1,271 @@
-//! `isoctl` — out-of-band setup/admin actions for iso (template baking, host
-//! setup, ...). Deliberately kept separate from the control-plane core so these
-//! one-shot, privileged operations aren't intermingled with the long-running
-//! service, and can be replaced by an external process later.
+//! `isoctl` — out-of-band setup for iso. Today: bake "warm" templates.
 //!
-//! Intentionally minimal for now.
+//! A warm template is a *resume point*: a rootfs LV plus a Firecracker memory
+//! snapshot taken once the guest has fully booted. The control plane then clones
+//! VMs by thin-snapshotting the rootfs and resuming the shared memory snapshot —
+//! millisecond boots. This keeps that one-shot, privileged flow out of the
+//! long-running daemon.
 
-fn main() {
-    eprintln!("isoctl: not yet implemented");
-    std::process::exit(1);
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use clap::{Parser, Subcommand};
+use iso_common::{
+    InstanceSpec, NetworkManager, NetworkPolicy, SlotId, SnapshotRef, StorageManager, VmId,
+    VmRuntime,
+};
+
+type R<T> = Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Parser)]
+#[command(name = "isoctl", about = "iso out-of-band setup")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Build a warm template: bake the rootfs, boot it once, snapshot it.
+    Bake(Bake),
+}
+
+#[derive(Parser)]
+struct Bake {
+    /// Template name (rootfs LV `tpl_<name>` + snapshot dir).
+    #[arg(long)]
+    name: String,
+    /// Path to the image flake (provides #kernel, #toplevel, #nixos-install-tools).
+    #[arg(long, default_value = "image")]
+    flake: String,
+    /// State root (must match the control plane's ISO_STATE_DIR).
+    #[arg(long, default_value = "/var/lib/iso")]
+    state: PathBuf,
+    /// LVM volume group (must match the control plane's).
+    #[arg(long, default_value = "iso")]
+    vg: String,
+    /// Host uplink (for the builder's transient network namespace).
+    #[arg(long, default_value = "eth0")]
+    uplink: String,
+    /// Rootfs LV virtual size.
+    #[arg(long, default_value = "8G")]
+    size: String,
+    #[arg(long, default_value_t = 1)]
+    vcpus: u32,
+    #[arg(long, default_value_t = 512)]
+    mem_mib: u32,
+    /// Transient placement slot used for the builder VM.
+    #[arg(long, default_value_t = 0)]
+    slot: u16,
+    /// Seconds to wait for the guest to come up before snapshotting.
+    #[arg(long, default_value_t = 90)]
+    boot_timeout: u64,
+}
+
+fn run(args: &[&str]) -> R<()> {
+    let st = Command::new(args[0]).args(&args[1..]).status()?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(format!("command failed ({st}): {}", args.join(" ")).into())
+    }
+}
+
+fn run_out(args: &[&str]) -> R<String> {
+    let out = Command::new(args[0]).args(&args[1..]).output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "command failed: {}\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn nix_build(flake: &str, attr: &str) -> R<String> {
+    let flake_abs = std::fs::canonicalize(flake)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| flake.to_string());
+    run_out(&[
+        "nix",
+        "build",
+        &format!("path:{flake_abs}#{attr}"),
+        "--no-link",
+        "--print-out-paths",
+    ])
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> R<()> {
+    match Cli::parse().cmd {
+        Cmd::Bake(b) => bake(b).await,
+    }
+}
+
+async fn bake(b: Bake) -> R<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("bake must run as root (LVM, netns, KVM)".into());
+    }
+
+    eprintln!("[bake] building image from flake {}", b.flake);
+    let kernel = PathBuf::from(nix_build(&b.flake, "kernel")?).join("vmlinux");
+    let toplevel = nix_build(&b.flake, "toplevel")?;
+    let nixos_install = format!("{}/bin/nixos-install", nix_build(&b.flake, "nixos-install-tools")?);
+    eprintln!("[bake] kernel={} toplevel={}", kernel.display(), toplevel);
+
+    // --- storage: backing pool + rootfs LV, install the system into it ---
+    let scfg = iso_storage_manager::Config {
+        image_path: b.state.join("storage.img"),
+        image_size: 100 * 1024 * 1024 * 1024,
+        vg: b.vg.clone(),
+        ..Default::default()
+    };
+    let storage = iso_storage_manager::Manager::new(
+        scfg,
+        Arc::new(iso_storage_manager::command::SystemRunner),
+    );
+    storage.init().await?;
+    storage.create_template(&b.name, &b.size).await?;
+    let tpl_lv = storage.template_lv(&b.name);
+    let dev = storage.dev_path(&tpl_lv);
+    eprintln!("[bake] mkfs + nixos-install onto {}", dev.display());
+    run(&["mkfs.ext4", "-F", "-q", &dev.to_string_lossy()])?;
+    let mnt = run_out(&["mktemp", "-d"])?;
+    run(&["mount", &dev.to_string_lossy(), &mnt])?;
+    let install = run(&[
+        &nixos_install, "--root", &mnt, "--system", &toplevel,
+        "--no-bootloader", "--no-root-passwd", "--no-channel-copy",
+    ]);
+    run(&["sync"]).ok();
+    let _ = run(&["umount", "-R", &mnt]);
+    install?;
+
+    // --- network: transient netns/veth/tap for the builder ---
+    let ncfg = iso_network_manager::Config {
+        uplink: b.uplink.clone(),
+        ..Default::default()
+    };
+    let net = iso_network_manager::Manager::new(ncfg.clone());
+    net.init().await?;
+    let slot = SlotId::new(b.slot)?;
+    let fixture = net
+        .apply(slot, &NetworkPolicy::default()) // Deny: builder needs no egress
+        .await?;
+
+    // --- runtime: boot the builder VM directly on the rootfs LV ---
+    let fcfg = iso_firecracker::Config {
+        socket_dir: b.state.join("fc/sock"),
+        state_dir: b.state.join("fc/state"),
+        ..Default::default()
+    };
+    let rt = iso_firecracker::FirecrackerRuntime::new(fcfg.clone());
+    let builder = VmId::from_u128(0xba6e_0000_0000_0000_0000_0000_0000_0001);
+    let inner_vm = ncfg.inner_vm;
+    let gw = ncfg.inner_tap;
+    let boot_args = format!(
+        "console=ttyS0 reboot=k panic=1 acpi=off quiet loglevel=3 \
+         root=/dev/vda rootfstype=ext4 rw ip={inner_vm}::{gw}:255.255.255.254::eth0:off \
+         init=/nix/var/nix/profiles/system/init"
+    );
+    let spec = InstanceSpec {
+        vm: builder,
+        netns: fixture.netns.clone(),
+        tap: fixture.tap.clone(),
+        mac: fixture.mac,
+        rootfs_device: dev.clone(),
+        vcpus: b.vcpus,
+        mem_mib: b.mem_mib,
+        kernel: kernel.clone(),
+        boot_args: boot_args.clone(),
+        resume_from: None,
+    };
+
+    let result = bake_inner(&rt, &net, &fixture.netns, slot, builder, inner_vm, &spec, b.boot_timeout, &b.state, &b.name).await;
+
+    // always tear the builder down (keep the rootfs LV + the snapshot)
+    let _ = rt.destroy(builder).await;
+    let _ = net.teardown(slot).await;
+    let (snap_mem, snap_vmstate) = result?;
+
+    // --- emit the template registration (POST this to controld /templates) ---
+    let reg = serde_json::json!({
+        "name": b.name,
+        "rootfs_template": b.name,
+        "snapshot_mem": snap_mem.to_string_lossy(),
+        "snapshot_vmstate": snap_vmstate.to_string_lossy(),
+        "vcpus": b.vcpus,
+        "mem_mib": b.mem_mib,
+        "kernel": kernel.to_string_lossy(),
+        "boot_args": boot_args,
+    });
+    // sanity: the SnapshotRef shape the control plane consumes.
+    let _ = SnapshotRef { mem_file: snap_mem.clone(), vmstate: snap_vmstate.clone() };
+
+    println!("{}", serde_json::to_string_pretty(&reg)?);
+    eprintln!(
+        "[bake] done. Register with:\n  curl -s --unix-socket {}/control.sock \
+         -H 'content-type: application/json' -d @- http://x/templates <<'JSON'\n{}\nJSON",
+        b.state.display(),
+        serde_json::to_string_pretty(&reg)?
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn bake_inner(
+    rt: &iso_firecracker::FirecrackerRuntime,
+    _net: &iso_network_manager::Manager,
+    netns: &str,
+    _slot: SlotId,
+    builder: VmId,
+    inner_vm: std::net::Ipv4Addr,
+    spec: &InstanceSpec,
+    boot_timeout: u64,
+    state: &Path,
+    name: &str,
+) -> R<(PathBuf, PathBuf)> {
+    eprintln!("[bake] booting builder VM in netns {netns}");
+    rt.create(spec).await?;
+    rt.start(builder).await?;
+
+    // wait until the guest's sshd is accepting (it's fully booted by then).
+    eprintln!("[bake] waiting for guest to come up (<= {boot_timeout}s)");
+    let deadline = Instant::now() + Duration::from_secs(boot_timeout);
+    let probe = format!("cat </dev/null >/dev/tcp/{inner_vm}/22");
+    let mut up = false;
+    while Instant::now() < deadline {
+        let ok = Command::new("ip")
+            .args(["netns", "exec", netns, "timeout", "2", "bash", "-c", &probe])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if !up {
+        return Err("guest never reached sshd within the boot timeout".into());
+    }
+    eprintln!("[bake] guest up; pausing + snapshotting");
+
+    // suspend = pause + CreateSnapshot into the runtime's per-vm dir.
+    rt.suspend(builder).await?;
+
+    // copy the snapshot to a stable, template-scoped location that survives the
+    // builder's teardown.
+    let src = state.join("fc/state").join(builder.to_string());
+    let dst = state.join("templates").join(name);
+    std::fs::create_dir_all(&dst)?;
+    let mem = dst.join("mem");
+    let vmstate = dst.join("vmstate");
+    std::fs::copy(src.join("mem"), &mem)?;
+    std::fs::copy(src.join("vmstate"), &vmstate)?;
+    eprintln!("[bake] snapshot written to {}", dst.display());
+    Ok((mem, vmstate))
 }

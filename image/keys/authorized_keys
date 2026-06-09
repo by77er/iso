@@ -1,0 +1,11 @@
+# SSH public keys baked into the image for the `coder` user.
+# One key per line. Lines starting with '#' and blank lines are ignored.
+#
+# Example:
+#   ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... you@host
+#
+# NOTE: keys here are shared by every VM cloned from this image. For per-VM
+# keys, inject them at runtime instead (Firecracker MMDS, a config drive, or
+# the Coder agent) rather than baking them in.
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILUL1CCYApYb7tU66QblYXFh6uezqf4C/4e/ZVUvDIor coder-fc-test-key
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDPoK3Ov4n7z93+GEBSVYiJ6RpvEsU2qHIAY5jNPNVP0 isolates-guest
