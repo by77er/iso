@@ -60,7 +60,7 @@ impl RequestHandler for RedirectHandler {
                     let mut meta = Metadata::response_from_request(&request.metadata);
                     meta.authoritative = true;
                     meta.recursion_available = true;
-                    let err_meta = meta.clone();
+                    let err_meta = meta; // Metadata: Copy
                     let builder = MessageResponseBuilder::from_message_request(request);
                     let response = builder.build(
                         meta,
