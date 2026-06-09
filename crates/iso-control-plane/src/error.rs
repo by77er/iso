@@ -9,6 +9,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// No free placement slots remain.
     SlotsExhausted,
+    /// No free host ports remain for ingress forwards.
+    PortsExhausted,
     /// No VM with this id is known.
     UnknownVm(VmId),
     /// No template registered under this name.
@@ -34,6 +36,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::SlotsExhausted => write!(f, "no free slots remain"),
+            Error::PortsExhausted => write!(f, "no free forward ports remain"),
             Error::UnknownVm(id) => write!(f, "unknown vm {id}"),
             Error::UnknownTemplate(n) => write!(f, "unknown template '{n}'"),
             Error::PoolFull {

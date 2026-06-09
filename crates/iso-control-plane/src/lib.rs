@@ -11,6 +11,7 @@
 pub mod config;
 pub mod control;
 pub mod error;
+pub mod port;
 pub mod slot;
 pub mod store;
 pub mod types;

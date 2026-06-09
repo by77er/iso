@@ -18,6 +18,8 @@ pub struct Config {
     pub graceful_stop: Duration,
     /// Number of placement slots (also bounds the network's `/16`).
     pub slot_capacity: usize,
+    /// Host-port range `[start, end)` for ingress forwards.
+    pub forward_ports: (u16, u16),
 }
 
 impl Default for Config {
@@ -29,6 +31,7 @@ impl Default for Config {
             pool_watermark_percent: 90.0,
             graceful_stop: Duration::from_secs(30),
             slot_capacity: SlotId::MAX as usize + 1,
+            forward_ports: (20000, 30000),
         }
     }
 }

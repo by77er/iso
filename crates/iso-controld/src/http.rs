@@ -52,6 +52,8 @@ fn parse_id(s: &str) -> Result<VmId, ApiError> {
 
 #[derive(Serialize, Deserialize)]
 struct PortForwardDto {
+    /// Allocated by the control plane; omit on create, reported on read.
+    #[serde(default)]
     host_port: u16,
     vm_port: u16,
     proto: String,
@@ -164,7 +166,7 @@ fn to_req(r: CreateReq) -> CreateVm {
             .ingress
             .into_iter()
             .map(|f| PortForward {
-                host_port: f.host_port,
+                host_port: 0, // control plane allocates
                 vm_port: f.vm_port,
                 proto: proto_from(&f.proto),
             })
@@ -420,6 +422,7 @@ mod tests {
             pool_watermark_percent: 90.0,
             graceful_stop: Duration::from_secs(1),
             slot_capacity: 8,
+            forward_ports: (20000, 30000),
         };
         let cp = Arc::new(
             ControlPlane::new(cfg, MNet, MStore, MRun(Mutex::new(Default::default()))).unwrap(),

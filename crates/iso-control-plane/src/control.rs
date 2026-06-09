@@ -14,8 +14,10 @@ use iso_common::{
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::port::PortAllocator;
 use crate::slot::SlotAllocator;
 use crate::store::Store;
+use iso_common::PortForward;
 use crate::types::{
     CreateVm, Lifecycle, RestartPolicy, Stats, TemplateDef, VmRecord, VmState,
 };
@@ -28,6 +30,7 @@ pub struct ControlPlane<N, S, R> {
     runtime: R,
     store: Store,
     slots: Mutex<SlotAllocator>,
+    ports: Mutex<PortAllocator>,
     services: Mutex<Option<HostNetwork>>,
 }
 
@@ -51,6 +54,7 @@ where
     pub fn new(cfg: Config, net: N, storage: S, runtime: R) -> Result<Self> {
         let store = Store::open(&cfg.db_path)?;
         let slots = SlotAllocator::new(cfg.slot_capacity);
+        let ports = PortAllocator::new(cfg.forward_ports.0, cfg.forward_ports.1);
         Ok(Self {
             cfg,
             net,
@@ -58,6 +62,7 @@ where
             runtime,
             store,
             slots: Mutex::new(slots),
+            ports: Mutex::new(ports),
             services: Mutex::new(None),
         })
     }
@@ -78,6 +83,9 @@ where
         for rec in self.store.list_vms()? {
             if let Some(slot) = rec.slot {
                 self.slots.lock().unwrap().reserve(slot);
+            }
+            for f in &rec.ingress {
+                self.ports.lock().unwrap().reserve(f.host_port);
             }
             // Reconcile against the VMM: a VM the store thinks is running but
             // whose process is gone gets the exit handler.
@@ -124,12 +132,35 @@ where
             .allocate()
             .ok_or(Error::SlotsExhausted)?;
 
+        // Allocate an external host port for each requested forward (ssh is
+        // just a forward; nothing special). The resolved ports are reported in
+        // the VM record.
+        let mut ingress: Vec<PortForward> = Vec::with_capacity(req.ingress.len());
+        for f in &req.ingress {
+            let host_port = match self.ports.lock().unwrap().allocate() {
+                Some(p) => p,
+                None => {
+                    let mut pa = self.ports.lock().unwrap();
+                    for done in &ingress {
+                        pa.free(done.host_port);
+                    }
+                    self.slots.lock().unwrap().free(slot);
+                    return Err(Error::PortsExhausted);
+                }
+            };
+            ingress.push(PortForward {
+                host_port,
+                vm_port: f.vm_port,
+                proto: f.proto,
+            });
+        }
+
         let mut rec = VmRecord {
             id,
             slot: Some(slot),
             template: req.template.clone(),
             egress: req.egress,
-            ingress: req.ingress.clone(),
+            ingress: ingress.clone(),
             labels: req.labels.clone(),
             lifecycle: req.lifecycle,
             restart: req.restart,
@@ -149,9 +180,22 @@ where
                 Ok(id)
             }
             Err(e) => {
+                {
+                    let mut pa = self.ports.lock().unwrap();
+                    for f in &ingress {
+                        pa.free(f.host_port);
+                    }
+                }
                 self.rollback(id, slot).await;
                 Err(e)
             }
+        }
+    }
+
+    fn free_ports(&self, ingress: &[PortForward]) {
+        let mut pa = self.ports.lock().unwrap();
+        for f in ingress {
+            pa.free(f.host_port);
         }
     }
 
@@ -218,6 +262,7 @@ where
             let _ = self.net.teardown(slot).await;
             self.slots.lock().unwrap().free(slot);
         }
+        self.free_ports(&rec.ingress);
         let _ = self.storage.teardown(id).await;
         self.store.delete_vm(id)?;
         Ok(())
@@ -266,10 +311,14 @@ where
         }
         match rec.lifecycle {
             Lifecycle::Ephemeral => {
+                self.free_ports(&rec.ingress);
                 let _ = self.storage.teardown(rec.id).await;
                 self.store.delete_vm(rec.id)?;
             }
             Lifecycle::Durable => {
+                // keep the host ports reserved so the VM keeps its stable
+                // external ports across stop/start (placement/slot is recreated,
+                // ports are the durable external identity).
                 rec.slot = None;
                 rec.tap = None;
                 rec.state = VmState::Stopped;
@@ -581,6 +630,7 @@ mod tests {
                 pool_watermark_percent: 90.0,
                 graceful_stop: Duration::from_secs(30),
                 slot_capacity,
+                forward_ports: (20000, 20010),
             },
             PoolStats {
                 data_percent: pool,
@@ -760,6 +810,27 @@ mod tests {
         let err = cp.create_vm(CreateVm::new("base")).await.unwrap_err();
         assert!(matches!(err, Error::PoolFull { .. }));
         assert_eq!(cp.stats().await.unwrap().slots_used, 0);
+    }
+
+    #[tokio::test]
+    async fn allocates_and_reports_forward_ports() {
+        use iso_common::{PortForward, Protocol};
+        let (cp, _log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let req = CreateVm {
+            // ssh is just a forward: caller gives vm_port, control plane assigns host_port.
+            ingress: vec![PortForward { host_port: 0, vm_port: 22, proto: Protocol::Tcp }],
+            ..req(Lifecycle::Ephemeral, RestartPolicy::Never)
+        };
+        let id = cp.create_vm(req).await.unwrap();
+        let rec = cp.get_vm(id).unwrap().unwrap();
+        assert_eq!(rec.ingress.len(), 1);
+        let f = rec.ingress[0];
+        assert_eq!(f.vm_port, 22);
+        assert!((20000..20010).contains(&f.host_port), "allocated host port reported");
+
+        // freed on destroy
+        cp.destroy_vm(id).await.unwrap();
     }
 
     #[tokio::test]
