@@ -69,6 +69,25 @@ in
     vim
     less
     procps
+    # dev toolbelt for the monorepo tooling
+    git
+    gh
+    direnv
+    # `devtool` launcher: find the repo root and exec its ./devtool (mirrors the
+    # host's /usr/local/bin/devtool). The toolchain itself is managed by ./devtool.
+    (writeShellScriptBin "devtool" ''
+      set -euo pipefail
+      root="$(pwd)"
+      while [ -n "$root" ] && [ "$root" != "/" ] && [ ! -e "$root/.git" ]; do
+        root="$(dirname "$root")"
+      done
+      if [ -z "$root" ] || [ "$root" = "/" ] || [ ! -x "$root/devtool" ]; then
+        echo "devtool: must be run inside a repo" >&2
+        exit 1
+      fi
+      cd "$root"
+      exec ./devtool "$@"
+    '')
   ];
 
   environment.variables.EDITOR = "vim";

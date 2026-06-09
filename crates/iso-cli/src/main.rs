@@ -71,6 +71,13 @@ struct Bake {
     /// BEFORE the snapshot so warm-resumed clones can see them. Repeatable.
     #[arg(long)]
     inject: Vec<String>,
+    /// Seed a git repo into the rootfs as `src:dest`, e.g.
+    /// `/srv/myrepo:/home/coder/myrepo`. Cloned single-branch from
+    /// the local `main` (fast, no network), with the remote reset to `src`'s
+    /// origin and a single-branch fetch refspec; owned by `coder`. CoW-shared
+    /// across every VM cloned from the template. Repeatable.
+    #[arg(long)]
+    seed_repo: Vec<String>,
 }
 
 fn run(args: &[&str]) -> R<()> {
@@ -134,6 +141,43 @@ fn inject_closures(dev: &str, paths: &[String]) -> R<()> {
     res
 }
 
+/// Clone repos (single-branch `main`) into a rootfs LV, owned by `coder`.
+fn seed_repos(dev: &str, specs: &[String]) -> R<()> {
+    let mnt = run_out(&["mktemp", "-d"])?;
+    run(&["mount", dev, &mnt])?;
+    let res = (|| -> R<()> {
+        for spec in specs {
+            let (src, dest) = spec
+                .split_once(':')
+                .ok_or("--seed-repo must be src:dest")?;
+            let target = format!("{mnt}{dest}");
+            eprintln!("[bake] seed-repo {src} (main) -> {dest}");
+            // Real remote to leave configured in the guest (so it fetches GitHub).
+            let origin = run_out(&[
+                "git", "-C", src, "-c", "safe.directory=*", "remote", "get-url", "origin",
+            ])
+            .unwrap_or_default();
+            run(&[
+                "git", "-c", "safe.directory=*", "clone", "--single-branch", "--branch", "main",
+                "--no-tags", "--no-hardlinks", &format!("file://{src}"), &target,
+            ])?;
+            if !origin.is_empty() {
+                run(&["git", "-C", &target, "remote", "set-url", "origin", &origin])?;
+            }
+            // Fetch only `main` going forward.
+            run(&[
+                "git", "-C", &target, "config", "remote.origin.fetch",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ])?;
+            run(&["chown", "-R", "1000:1000", &target])?;
+        }
+        Ok(())
+    })();
+    run(&["sync"]).ok();
+    let _ = run(&["umount", "-R", &mnt]);
+    res
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> R<()> {
     match Cli::parse().cmd {
@@ -188,6 +232,9 @@ async fn bake(b: Bake) -> R<()> {
     // template *after* the snapshot are invisible to them. Idempotent.
     if !b.inject.is_empty() {
         inject_closures(&dev.to_string_lossy(), &b.inject)?;
+    }
+    if !b.seed_repo.is_empty() {
+        seed_repos(&dev.to_string_lossy(), &b.seed_repo)?;
     }
 
     // --- network: transient netns/veth/tap for the builder ---
