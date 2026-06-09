@@ -5,10 +5,17 @@
 //! pull in hyper + a unix connector.
 
 use std::path::Path;
+use std::time::Duration;
 
 use iso_common::{Error, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+// Cap on a single firecracker API request. The API is sub-millisecond in
+// practice (the slowest is a full-memory snapshot); this only exists so a
+// wedged or orphaned VMM (e.g. one inherited across a control-plane restart)
+// can't block lifecycle ops (stop/destroy) forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn be<E: std::fmt::Display>(e: E) -> Error {
     Error::Backend(e.to_string())
@@ -25,8 +32,20 @@ fn content_length(headers: &str) -> Option<usize> {
         .and_then(|(_, v)| v.trim().parse().ok())
 }
 
-/// One request/response. Returns `(status_code, body)`.
+/// One request/response. Returns `(status_code, body)`. Bounded by
+/// [`REQUEST_TIMEOUT`] so a hung VMM can't block the caller indefinitely.
 pub async fn request(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<(u16, String)> {
+    tokio::time::timeout(REQUEST_TIMEOUT, request_inner(socket, method, path, body))
+        .await
+        .map_err(|_| Error::Backend(format!("firecracker API {method} {path} timed out")))?
+}
+
+async fn request_inner(
     socket: &Path,
     method: &str,
     path: &str,

@@ -96,6 +96,14 @@ impl FirecrackerRuntime {
         }
     }
 
+    /// Poll until `vm`'s process is gone (or `timeout` elapses).
+    async fn wait_dead(&self, vm: VmId, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.pid_alive(vm) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Spawn a detached firecracker in `netns`, writing its pidfile.
     fn spawn(&self, vm: VmId, netns: &str) -> Result<()> {
         std::fs::create_dir_all(&self.cfg.socket_dir).map_err(be)?;
@@ -254,8 +262,16 @@ impl VmRuntime for FirecrackerRuntime {
 
     async fn destroy(&self, vm: VmId) -> Result<()> {
         self.kill(vm);
-        if let Some(mut child) = self.children.lock().unwrap().remove(&vm) {
-            let _ = child.wait();
+        let own_child = self.children.lock().unwrap().remove(&vm);
+        match own_child {
+            // our own child: reap it.
+            Some(mut child) => {
+                let _ = child.wait();
+            }
+            // VM re-adopted across a restart (no Child handle): wait for the
+            // SIGKILL'd process to actually exit so its rootfs LV is released
+            // before storage teardown (else lvremove fails on an open device).
+            None => self.wait_dead(vm, Duration::from_secs(5)).await,
         }
         let _ = std::fs::remove_file(self.socket(vm));
         let _ = std::fs::remove_file(self.pidfile(vm));
