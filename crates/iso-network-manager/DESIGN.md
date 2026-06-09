@@ -90,13 +90,25 @@ Given `slot ∈ 0..32767`:
 
 ```text
 netns      = "vm<slot:04x>"            # e.g. vm7fff
-tap        = "tap<slot:04x>"
+tap        = "tap0"                    # CONSTANT across all netns (see below)
 veth_host  = "vm<slot:04x>"            # host side
 veth_netns = "vp<slot:04x>"            # netns side
 vh_ip      = 172.21.(slot >> 7).((slot & 0x7f) << 1)        # /31 base
 vp_ip      = vh_ip + 1
 mac        = 02:xx:xx:xx:xx:xx         # constant
 ```
+
+> **The TAP name is constant**, not slot-derived. The TAP lives inside the
+> isolated per-VM netns, so an identical name in every namespace is safe — and
+> it means a Firecracker memory snapshot's frozen network config
+> (`host_dev_name=tap0`) is valid for *every* clone with zero per-VM override.
+> This is the same "identical inner config" principle that lets one snapshot
+> resume across many VMs; the veth stays unique because it lives in the shared
+> root namespace.
+
+> **Reverse lookup:** `address_to_slot(vp_ip|vh_ip) -> slot` inverts the veth
+> derivation (`slot = (addr - veth_net) / 2`), letting host-local services (the
+> metadata endpoint) identify a caller by its post-SNAT source address.
 
 > Linux caps interface names at 15 chars (`IFNAMSIZ-1`). Use the compact **hex**
 > scheme above (`vm7fff`, `vp7fff`) so the high end of the slot range never

@@ -183,4 +183,11 @@ pub trait NetworkManager {
     /// Converge `slot` to absent — tear down all network resources. Idempotent:
     /// tearing down an absent slot succeeds.
     async fn teardown(&self, slot: SlotId) -> Result<()>;
+
+    /// Reverse of the fixture derivation: map a host-side veth address (a VM's
+    /// post-SNAT `vp` source, as seen by services bound to the dummy) back to
+    /// its slot. Pure; `None` if the address is outside the managed range.
+    ///
+    /// Used by the metadata endpoint to identify a caller by its source IP.
+    fn address_to_slot(&self, addr: Ipv4Addr) -> Option<SlotId>;
 }

@@ -11,8 +11,10 @@ use crate::config::Config;
 
 /// Derive the [`NetworkFixture`] for `slot` under `cfg`.
 ///
-/// Interface names use a compact hex scheme (`vm7fff`, `vp7fff`, `tap7fff`) so
-/// the top of the slot range stays within the 15-char `IFNAMSIZ` limit. The
+/// veth interface names use a compact hex scheme (`vm7fff`, `vp7fff`) so the top
+/// of the slot range stays within the 15-char `IFNAMSIZ` limit. The TAP name is
+/// **constant** (`cfg.tap_name`) across all netns — they're isolated, so an
+/// identical name keeps the Firecracker snapshot valid for every clone. The
 /// veth `/31` base is `veth_net + slot*2`; the netns side is `+1`.
 pub fn derive(slot: SlotId, cfg: &Config) -> NetworkFixture {
     let s = slot.get() as u32;
@@ -23,7 +25,7 @@ pub fn derive(slot: SlotId, cfg: &Config) -> NetworkFixture {
     NetworkFixture {
         slot,
         netns: format!("vm{s:04x}"),
-        tap: format!("tap{s:04x}"),
+        tap: cfg.tap_name.clone(),
         veth_host: format!("vm{s:04x}"),
         veth_netns: format!("vp{s:04x}"),
         vh_ip,
@@ -45,7 +47,7 @@ mod tests {
         let f = fx(0);
         assert_eq!(f.netns, "vm0000");
         assert_eq!(f.veth_netns, "vp0000");
-        assert_eq!(f.tap, "tap0000");
+        assert_eq!(f.tap, "tap0"); // constant across slots
         assert_eq!(f.vh_ip, Ipv4Addr::new(172, 21, 0, 0));
         assert_eq!(f.vp_ip, Ipv4Addr::new(172, 21, 0, 1));
     }
@@ -57,6 +59,7 @@ mod tests {
         // 32767*2 = 65534 -> 172.21.255.254 / .255
         assert_eq!(f.vh_ip, Ipv4Addr::new(172, 21, 255, 254));
         assert_eq!(f.vp_ip, Ipv4Addr::new(172, 21, 255, 255));
+        assert_eq!(f.tap, "tap0"); // constant regardless of slot
         // names stay within IFNAMSIZ (15).
         assert!(f.netns.len() <= 15 && f.veth_netns.len() <= 15 && f.tap.len() <= 15);
     }

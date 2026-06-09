@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use iso_common::{Error, Result, StorageHandle, StorageManager, VmId, VolumeSpec};
+use iso_common::{Error, PoolStats, Result, StorageHandle, StorageManager, VmId, VolumeSpec};
 
 use crate::command::{Cmd, CommandRunner, SystemRunner};
 use crate::config::Config;
@@ -221,13 +221,25 @@ impl Manager {
         Ok(())
     }
 
-    // ---- async wrappers ----
-
-    /// Ensure the backing chain exists (off the async executor).
-    pub async fn init(&self) -> Result<()> {
-        let this = self.clone();
-        blocking(move || this.ensure_backing_sync().map(|_| ())).await
+    /// Read thin-pool utilisation (data/metadata percent).
+    pub fn pool_stats_sync(&self) -> Result<PoolStats> {
+        let out = self.runner.run(&Cmd::new(&[
+            "lvs",
+            "--noheadings",
+            "--nosuffix",
+            "-o",
+            "data_percent,metadata_percent",
+            &self.vg_lv(&self.cfg.thin_pool),
+        ]))?;
+        let mut fields = out.stdout.split_whitespace();
+        let parse = |s: Option<&str>| s.and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        Ok(PoolStats {
+            data_percent: parse(fields.next()),
+            metadata_percent: parse(fields.next()),
+        })
     }
+
+    // ---- async wrappers ----
 
     /// Ensure a template volume exists (off the async executor).
     pub async fn create_template(&self, name: &str, virtual_size: &str) -> Result<()> {
@@ -250,6 +262,11 @@ where
 }
 
 impl StorageManager for Manager {
+    async fn init(&self) -> Result<()> {
+        let this = self.clone();
+        blocking(move || this.ensure_backing_sync().map(|_| ())).await
+    }
+
     async fn provision(&self, vm: VmId, spec: &VolumeSpec) -> Result<StorageHandle> {
         let this = self.clone();
         let spec = spec.clone();
@@ -259,6 +276,11 @@ impl StorageManager for Manager {
     async fn teardown(&self, vm: VmId) -> Result<()> {
         let this = self.clone();
         blocking(move || this.teardown_sync(vm)).await
+    }
+
+    async fn pool_stats(&self) -> Result<PoolStats> {
+        let this = self.clone();
+        blocking(move || this.pool_stats_sync()).await
     }
 }
 
@@ -285,6 +307,17 @@ mod tests {
         );
         assert_eq!(m.template_lv("ubuntu"), "tpl_ubuntu");
         assert_eq!(m.dev_path("vm_x"), PathBuf::from("/dev/iso/vm_x"));
+    }
+
+    #[test]
+    fn pool_stats_parses_lvs_output() {
+        let runner = Arc::new(RecordingRunner::with_responder(|_| CmdOut {
+            ok: true,
+            stdout: "  12.50  3.20 \n".to_string(),
+        }));
+        let stats = manager_with(runner).pool_stats_sync().unwrap();
+        assert_eq!(stats.data_percent, 12.5);
+        assert_eq!(stats.metadata_percent, 3.2);
     }
 
     #[test]

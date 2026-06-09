@@ -40,4 +40,4 @@ pub use network::{
     EgressMode, HostNetwork, MacAddr, NetworkFixture, NetworkManager, NetworkPolicy, PortForward,
     Protocol,
 };
-pub use storage::{StorageHandle, StorageManager, VolumeSpec};
+pub use storage::{PoolStats, StorageHandle, StorageManager, VolumeSpec};

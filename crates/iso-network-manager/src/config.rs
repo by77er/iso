@@ -25,6 +25,10 @@ pub struct Config {
     pub uplink: String,
     /// Constant guest MAC (routed datapath, never bridged).
     pub mac: MacAddr,
+    /// TAP interface name inside every VM's netns. Constant (not slot-derived):
+    /// the netns is isolated, so an identical name in each makes the Firecracker
+    /// snapshot's frozen network config valid for every clone without override.
+    pub tap_name: String,
 }
 
 impl Default for Config {
@@ -37,6 +41,7 @@ impl Default for Config {
             proxy_port: 3128,
             uplink: "eth0".to_string(),
             mac: MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            tap_name: "tap0".to_string(),
         }
     }
 }

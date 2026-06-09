@@ -91,6 +91,15 @@ impl NetworkManager for Manager {
         let fx = self.fixture(slot);
         spawn_blocking(move || netlink::destroy(&fx)).await
     }
+
+    fn address_to_slot(&self, addr: std::net::Ipv4Addr) -> Option<SlotId> {
+        // vp = veth_net + slot*2 + 1, vh = +slot*2; either maps to the slot.
+        let offset = addr.to_bits().checked_sub(self.cfg.veth_net.to_bits())?;
+        if offset >= 1 << 16 {
+            return None; // outside the /16
+        }
+        SlotId::new((offset / 2) as u16).ok()
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +148,19 @@ mod tests {
             ],
         };
         assert!(m.plan(slot(1), &policy).is_ok());
+    }
+
+    #[test]
+    fn address_to_slot_reverses_derivation() {
+        use std::net::Ipv4Addr;
+        let m = Manager::default();
+        let s = |a: Ipv4Addr| m.address_to_slot(a).map(|s| s.get());
+        assert_eq!(s(Ipv4Addr::new(172, 21, 0, 2)), Some(1)); // vh of slot 1
+        assert_eq!(s(Ipv4Addr::new(172, 21, 0, 3)), Some(1)); // vp of slot 1
+        assert_eq!(s(Ipv4Addr::new(172, 21, 0, 0)), Some(0));
+        assert_eq!(s(Ipv4Addr::new(172, 21, 255, 255)), Some(32767));
+        assert_eq!(s(Ipv4Addr::new(172, 22, 0, 1)), None); // above the /16
+        assert_eq!(s(Ipv4Addr::new(172, 20, 0, 1)), None); // below the base
     }
 
     #[test]
@@ -248,11 +270,11 @@ mod tests {
         // the TAP exists inside the netns.
         assert!(
             std::process::Command::new("ip")
-                .args(["-n", "vm1092", "link", "show", "tap1092"])
+                .args(["-n", "vm1092", "link", "show", "tap0"])
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false),
-            "tap1092 should exist in the netns"
+            "tap0 should exist in the netns"
         );
 
         // idempotent re-apply must succeed unchanged.

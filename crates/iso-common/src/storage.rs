@@ -31,11 +31,25 @@ pub struct StorageHandle {
     pub device_path: PathBuf,
 }
 
+/// Backing-pool utilisation, for monitoring. A thin pool that fills up fails
+/// writes and wedges every VM, so this is watched and gated on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PoolStats {
+    /// Percent of the pool's data space in use (0..=100).
+    pub data_percent: f64,
+    /// Percent of the pool's metadata space in use (0..=100).
+    pub metadata_percent: f64,
+}
+
 /// Manages durable per-VM storage on a single host.
 ///
 /// Keyed on [`VmId`] so volumes survive re-placement onto a different slot.
 /// Methods are expected to be **idempotent**.
 pub trait StorageManager {
+    /// One-time host storage setup (sparse file → loop → PV → VG → thin pool).
+    /// Idempotent.
+    async fn init(&self) -> Result<()>;
+
     /// Provision storage for `vm` per `spec`. Idempotent: re-provisioning an
     /// existing VM returns its existing handle.
     async fn provision(&self, vm: VmId, spec: &VolumeSpec) -> Result<StorageHandle>;
@@ -43,4 +57,7 @@ pub trait StorageManager {
     /// Tear down all storage for `vm`. Idempotent: tearing down absent storage
     /// succeeds.
     async fn teardown(&self, vm: VmId) -> Result<()>;
+
+    /// Current backing-pool utilisation.
+    async fn pool_stats(&self) -> Result<PoolStats>;
 }

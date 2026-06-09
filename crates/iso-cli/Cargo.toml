@@ -1,0 +1,12 @@
+[package]
+name = "iso-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "isoctl"
+path = "src/main.rs"
+
+[dependencies]
+iso-common = { path = "../iso-common" }
