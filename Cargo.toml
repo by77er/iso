@@ -6,6 +6,8 @@ members = [
     "crates/iso-network-manager",
     "crates/iso-dns-server",
     "crates/iso-proxy",
+    "crates/iso-ca",
+    "crates/iso-secrets",
     "crates/iso-control-plane",
     "crates/iso-firecracker",
     "crates/iso-controld",

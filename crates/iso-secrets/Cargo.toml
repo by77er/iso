@@ -1,0 +1,17 @@
+[package]
+name = "iso-secrets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "macros"] }
+tracing = "0.1"
+
+[[bin]]
+name = "iso-secretsd"
+path = "src/bin/iso-secretsd.rs"
