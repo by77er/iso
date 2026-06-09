@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use iso_ca::Ca;
-use iso_proxy::{ProxyConfig, run_with_listener};
+use iso_proxy::{Policy, ProxyConfig, StaticResolver, run_with_listener};
 use iso_secrets::TomlSecretProvider;
 use tokio::net::TcpListener;
 
@@ -55,8 +55,11 @@ async fn injects_headers_and_enforces_allowlist() {
             listen: proxy_addr,
             ca_sock,
             secrets_sock,
-            principal: Some("default".into()),
-            allow: HashSet::from([ECHO.to_string()]),
+            resolver: Arc::new(StaticResolver(Policy {
+                egress: "proxy".into(),
+                principal: Some("default".into()),
+                allow: HashSet::from([ECHO.to_string()]),
+            })),
         },
     ));
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;

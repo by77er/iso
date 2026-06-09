@@ -18,7 +18,7 @@ use tokio::net::UnixStream;
 use iso_ca::{SignRequest, SignResponse};
 use iso_secrets::{HeadersRequest, HeadersResponse};
 
-async fn call<Req: Serialize, Resp: DeserializeOwned>(
+pub(crate) async fn call<Req: Serialize, Resp: DeserializeOwned>(
     sock: &Path,
     req: &Req,
 ) -> std::io::Result<Resp> {

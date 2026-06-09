@@ -1,9 +1,11 @@
 //! iso-proxy — credential-injecting, policy-enforcing transparent MITM HTTPS
 //! proxy. The backend for the `Proxy` egress mode. See `DESIGN.md`.
 
+mod policy;
 mod rpc;
 
-use std::collections::HashSet;
+pub use policy::{Policy, PolicyResolver, RpcResolver, StaticResolver};
+
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,14 +32,12 @@ type UpstreamClient = Client<HttpsConnector<HttpConnector>, Incoming>;
 
 /// Proxy configuration.
 pub struct ProxyConfig {
-    /// Address to accept redirected egress on (e.g. `172.22.0.1:8443`).
+    /// Address to accept redirected egress on (e.g. `172.22.0.1:443`).
     pub listen: SocketAddr,
     pub ca_sock: PathBuf,
     pub secrets_sock: PathBuf,
-    /// Static policy (until the control-plane `identify` resolver lands): the
-    /// principal + allow-list applied to every proxied connection.
-    pub principal: Option<String>,
-    pub allow: HashSet<String>,
+    /// Resolves a connection's source IP to its VM's egress policy.
+    pub resolver: Arc<dyn PolicyResolver>,
 }
 
 /// Shared, cheap-to-clone request context.
@@ -46,8 +46,7 @@ struct Ctx {
     ca: Arc<CaClient>,
     secrets: Arc<SecretsClient>,
     client: UpstreamClient,
-    principal: Arc<Option<String>>,
-    allow: Arc<HashSet<String>>,
+    resolver: Arc<dyn PolicyResolver>,
 }
 
 /// Run the proxy, binding `cfg.listen`.
@@ -75,8 +74,7 @@ pub async fn run_with_listener(listener: TcpListener, cfg: ProxyConfig) -> std::
         ca,
         secrets,
         client,
-        principal: Arc::new(cfg.principal),
-        allow: Arc::new(cfg.allow),
+        resolver: cfg.resolver,
     };
 
     tracing::info!("iso-proxy listening on {:?}", listener.local_addr());
@@ -92,7 +90,7 @@ pub async fn run_with_listener(listener: TcpListener, cfg: ProxyConfig) -> std::
     }
 }
 
-async fn serve_conn(tcp: TcpStream, _peer: IpAddr, ctx: Ctx) -> Result<(), BoxError> {
+async fn serve_conn(tcp: TcpStream, peer: IpAddr, ctx: Ctx) -> Result<(), BoxError> {
     // Peek the ClientHello: non-TLS never produces one → dropped here.
     let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp);
     let handshake = match acceptor.await {
@@ -105,11 +103,19 @@ async fn serve_conn(tcp: TcpStream, _peer: IpAddr, ctx: Ctx) -> Result<(), BoxEr
         None => return Ok(()), // no SNI → unroutable
     };
 
-    // Policy: default-deny by exact-match allow-list.
-    if !ctx.allow.contains(&sni) {
-        tracing::info!("deny {sni} (not in allow-list)");
+    // Resolve this VM's current policy by source IP; default-deny.
+    let policy = match ctx.resolver.resolve(peer).await {
+        Some(p) => p,
+        None => {
+            tracing::info!("deny {sni}: unknown source {peer}");
+            return Ok(());
+        }
+    };
+    if !policy.allow.contains(&sni) {
+        tracing::info!("deny {sni} for {peer} (not in allow-list)");
         return Ok(());
     }
+    let principal = policy.principal.clone();
 
     // Mint (fail-closed) and terminate.
     let server_cfg = match ctx.ca.server_config(&sni).await {
@@ -123,14 +129,21 @@ async fn serve_conn(tcp: TcpStream, _peer: IpAddr, ctx: Ctx) -> Result<(), BoxEr
 
     let sni2 = sni.clone();
     let ctx2 = ctx.clone();
-    let service = service_fn(move |req| handle(req, sni2.clone(), ctx2.clone()));
+    let service = service_fn(move |req| {
+        handle(req, sni2.clone(), principal.clone(), ctx2.clone())
+    });
 
     hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
         .serve_connection(TokioIo::new(tls), service)
         .await
 }
 
-async fn handle(req: Request<Incoming>, sni: String, ctx: Ctx) -> Result<Resp, BoxError> {
+async fn handle(
+    req: Request<Incoming>,
+    sni: String,
+    principal: Option<String>,
+    ctx: Ctx,
+) -> Result<Resp, BoxError> {
     // Anti-fronting: the request authority must equal the SNI we terminated.
     let authority = req
         .uri()
@@ -162,7 +175,7 @@ async fn handle(req: Request<Incoming>, sni: String, ctx: Ctx) -> Result<Resp, B
     parts.uri = uri;
     parts.headers.remove(HOST); // re-derived from the authority by the client
 
-    for (k, v) in ctx.secrets.headers(&sni, ctx.principal.as_deref()).await {
+    for (k, v) in ctx.secrets.headers(&sni, principal.as_deref()).await {
         if let (Ok(name), Ok(val)) = (
             http::header::HeaderName::from_bytes(k.as_bytes()),
             http::header::HeaderValue::from_str(&v),

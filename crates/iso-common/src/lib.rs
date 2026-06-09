@@ -30,6 +30,7 @@
 #![allow(async_fn_in_trait)]
 
 pub mod error;
+pub mod identify;
 pub mod ids;
 pub mod network;
 pub mod runtime;

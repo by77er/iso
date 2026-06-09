@@ -10,7 +10,7 @@ use std::time::Duration;
 use std::net::SocketAddr;
 
 use iso_control_plane::ControlPlane;
-use iso_controld::{http, metadata, settings};
+use iso_controld::{http, identify, metadata, settings};
 use iso_firecracker::FirecrackerRuntime;
 use iso_storage_manager::command::SystemRunner;
 
@@ -61,6 +61,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(e) => eprintln!("iso-controld: metadata bind {meta_addr} failed: {e}"),
+        }
+    });
+
+    // identify RPC for the egress proxy (src_ip -> policy), same dir as the
+    // admin socket.
+    let id_sock = control_sock
+        .parent()
+        .map(|p| p.join("identify.sock"))
+        .unwrap_or_else(|| std::path::PathBuf::from("identify.sock"));
+    let id_cp = cp.clone();
+    tokio::spawn(async move {
+        if let Err(e) = identify::serve(id_cp, &id_sock).await {
+            eprintln!("iso-controld: identify server exited: {e}");
         }
     });
 
