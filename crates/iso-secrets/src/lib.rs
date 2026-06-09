@@ -12,8 +12,9 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -54,36 +55,78 @@ struct SecretsFile {
     principals: HashMap<String, DomainHeaders>,
 }
 
-/// TOML-backed secret provider.
-pub struct TomlSecretProvider {
+struct Cached {
     file: SecretsFile,
+    mtime: Option<SystemTime>,
+}
+
+fn mtime_of(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+/// TOML-backed secret provider. Hot-reloads the file when it changes on disk
+/// (checked per request + by a background watcher in [`serve_unix`]).
+pub struct TomlSecretProvider {
+    path: Option<PathBuf>,
+    cache: RwLock<Cached>,
 }
 
 impl TomlSecretProvider {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
         Ok(Self {
-            file: toml::from_str(&text)?,
+            path: Some(path.to_path_buf()),
+            cache: RwLock::new(Cached {
+                file: toml::from_str(&text)?,
+                mtime: mtime_of(path),
+            }),
         })
     }
 
     pub fn from_toml(text: &str) -> Result<Self> {
         Ok(Self {
-            file: toml::from_str(text)?,
+            path: None,
+            cache: RwLock::new(Cached {
+                file: toml::from_str(text)?,
+                mtime: None,
+            }),
         })
+    }
+
+    /// Reload the TOML if it changed since the last read (cheap mtime check).
+    /// A parse failure keeps the last-good config and logs, so a bad edit can't
+    /// take down injection.
+    pub fn reload_if_changed(&self) {
+        let Some(path) = &self.path else { return };
+        let cur = mtime_of(path);
+        if self.cache.read().unwrap().mtime == cur {
+            return;
+        }
+        match std::fs::read_to_string(path).and_then(|t| {
+            toml::from_str::<SecretsFile>(&t)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }) {
+            Ok(file) => {
+                *self.cache.write().unwrap() = Cached { file, mtime: cur };
+                tracing::info!("secrets reloaded from {}", path.display());
+            }
+            Err(e) => tracing::warn!("secrets reload skipped ({e}); keeping previous config"),
+        }
     }
 
     /// Effective headers for `(domain, principal)`: per-principal first, then
     /// global overlaid on top (global wins).
     pub fn headers(&self, domain: &str, principal: Option<&str>) -> HashMap<String, String> {
+        self.reload_if_changed();
+        let cache = self.cache.read().unwrap();
         let mut out = HashMap::new();
         if let Some(p) = principal
-            && let Some(by_domain) = self.file.principals.get(p)
+            && let Some(by_domain) = cache.file.principals.get(p)
             && let Some(h) = by_domain.get(domain)
         {
             out.extend(h.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
-        if let Some(h) = self.file.global.get(domain) {
+        if let Some(h) = cache.file.global.get(domain) {
             out.extend(h.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
         out
@@ -92,6 +135,17 @@ impl TomlSecretProvider {
 
 /// Serve the SecretProvider RPC on `sock` (JSON, half-close delimited).
 pub async fn serve_unix(provider: Arc<TomlSecretProvider>, sock: &Path) -> std::io::Result<()> {
+    // Watch the config file: reload on change even when idle.
+    {
+        let provider = provider.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                provider.reload_if_changed();
+            }
+        });
+    }
+
     let _ = std::fs::remove_file(sock);
     let listener = UnixListener::bind(sock)?;
     loop {
