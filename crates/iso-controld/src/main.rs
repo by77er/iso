@@ -7,8 +7,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::net::SocketAddr;
+
 use iso_control_plane::ControlPlane;
-use iso_controld::{http, settings};
+use iso_controld::{http, metadata, settings};
 use iso_firecracker::FirecrackerRuntime;
 use iso_storage_manager::command::SystemRunner;
 
@@ -31,6 +33,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     tokio::spawn(cp.clone().supervise(Duration::from_secs(2)));
+
+    // dual-horizon DNS on the dummy: metadata.iso.local -> dummy, else forward.
+    let dns_cfg = iso_dns_server::Config {
+        bind: SocketAddr::new(host.services_addr.into(), 53),
+        metadata_ip: host.services_addr,
+        ..Default::default()
+    };
+    tokio::spawn(async move {
+        if let Err(e) = iso_dns_server::run(dns_cfg).await {
+            eprintln!("iso-controld: dns server exited: {e}");
+        }
+    });
+
+    // VM-facing metadata server on the dummy (:80).
+    let meta_addr = SocketAddr::new(host.services_addr.into(), 80);
+    let meta_cp = cp.clone();
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(meta_addr).await {
+            Ok(l) => {
+                eprintln!("iso-controld: metadata server on {meta_addr}");
+                let svc = metadata::router(meta_cp)
+                    .into_make_service_with_connect_info::<SocketAddr>();
+                if let Err(e) = axum::serve(l, svc).await {
+                    eprintln!("iso-controld: metadata server exited: {e}");
+                }
+            }
+            Err(e) => eprintln!("iso-controld: metadata bind {meta_addr} failed: {e}"),
+        }
+    });
 
     if let Some(parent) = control_sock.parent() {
         let _ = std::fs::create_dir_all(parent);

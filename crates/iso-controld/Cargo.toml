@@ -21,6 +21,7 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "s
 hyper-util = { version = "0.1.20", features = ["server", "server-auto", "tokio", "service"] }
 hyper = { version = "1.10.1", features = ["server", "http1"] }
 tower = { version = "0.5", features = ["util"] }
+iso-dns-server = { version = "0.1.0", path = "../iso-dns-server" }
 
 [dev-dependencies]
 libc = "0.2.186"

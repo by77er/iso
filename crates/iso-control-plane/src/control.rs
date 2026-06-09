@@ -443,6 +443,19 @@ where
 
     // ---- queries ----
 
+    /// Resolve a caller's source IP (a VM's post-SNAT `vp`) to its slot, then
+    /// to its VM record — used by the metadata server to identify the caller.
+    pub fn identify(&self, addr: std::net::Ipv4Addr) -> Result<Option<VmRecord>> {
+        let Some(slot) = self.net.address_to_slot(addr) else {
+            return Ok(None);
+        };
+        Ok(self
+            .store
+            .list_vms()?
+            .into_iter()
+            .find(|v| v.slot == Some(slot)))
+    }
+
     pub fn get_vm(&self, id: VmId) -> Result<Option<VmRecord>> {
         self.store.get_vm(id)
     }

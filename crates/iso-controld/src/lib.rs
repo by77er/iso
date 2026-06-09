@@ -2,4 +2,5 @@
 //! so integration tests (and the binary) can share them.
 
 pub mod http;
+pub mod metadata;
 pub mod settings;

@@ -251,6 +251,9 @@
 
   # The kernel `ip=` param doesn't populate a resolver, so bake one in: iso's
   # control plane serves DNS on the services dummy address.
+  # `metadata.iso.internal` resolves here (the `.internal` TLD avoids the
+  # `.local` mDNS reservation, so systemd-resolved sends it to this unicast
+  # server rather than multicast).
   networking.nameservers = [
     "172.22.0.1"
   ];

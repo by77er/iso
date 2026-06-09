@@ -5,3 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+hickory-proto = "0.26.1"
+hickory-resolver = "0.26.1"
+hickory-server = { version = "0.26.1", features = ["resolver"] }
+tokio = { version = "1.52.3", features = ["rt", "net", "macros"] }
