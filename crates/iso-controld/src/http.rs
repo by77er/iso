@@ -15,7 +15,7 @@ use iso_common::{
     EgressMode, NetworkManager, PortForward, Protocol, SnapshotRef, StorageManager, VmId,
     VmRuntime,
 };
-use iso_control_plane::types::{egress_str, TemplateDef};
+use iso_control_plane::types::{egress_parse, egress_str, TemplateDef};
 use iso_control_plane::{ControlPlane, CreateVm, Error as CpError, VmRecord};
 use serde::{Deserialize, Serialize};
 
@@ -110,6 +110,9 @@ struct PolicyReq {
     principal: Option<String>,
     #[serde(default)]
     allow: Option<Vec<String>>,
+    /// `"allow" | "proxy" | "deny"`; invalid/absent leaves it unchanged.
+    #[serde(default)]
+    egress: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -319,7 +322,9 @@ where
     S: iso_common::storage::StorageManager + Send + Sync + 'static,
     R: iso_common::runtime::VmRuntime + Send + Sync + 'static,
 {
-    cp.set_policy(parse_id(&id)?, req.principal, req.allow)?;
+    let egress = req.egress.as_deref().and_then(egress_parse);
+    cp.set_policy(parse_id(&id)?, req.principal, req.allow, egress)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iso_common::{
-    HostNetwork, InstanceSpec, NetworkManager, NetworkPolicy, StorageManager, VmId, VmRuntime,
+    EgressMode, HostNetwork, InstanceSpec, NetworkManager, NetworkPolicy, StorageManager, VmId,
+    VmRuntime,
     VmStatus, VolumeSpec,
 };
 
@@ -469,11 +470,12 @@ where
     /// Update a VM's egress policy: the (opaque) `principal` it acts as and/or
     /// the `allow` domain list routed through the proxy. `None` fields are left
     /// unchanged. Mutable at runtime (e.g. set per agent turn).
-    pub fn set_policy(
+    pub async fn set_policy(
         &self,
         id: VmId,
         principal: Option<String>,
         allow: Option<Vec<String>>,
+        egress: Option<EgressMode>,
     ) -> Result<()> {
         let mut rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
         if let Some(p) = principal {
@@ -482,7 +484,25 @@ where
         if let Some(a) = allow {
             rec.allow = a;
         }
+        let egress_changed = egress.is_some_and(|e| e != rec.egress);
+        if let Some(e) = egress {
+            rec.egress = e;
+        }
         self.store.update_vm(&rec)?;
+
+        // The allow-list is read live by the proxy/DNS via `identify`; only an
+        // egress *mode* change needs a network re-steer. `apply` (converge) is
+        // idempotent, so it re-renders the nft ruleset without disturbing the
+        // running VM's netns/veth/tap.
+        if egress_changed {
+            if let Some(slot) = rec.slot {
+                let policy = NetworkPolicy {
+                    egress: rec.egress,
+                    ingress: rec.ingress.clone(),
+                };
+                self.net.apply(slot, &policy).await?;
+            }
+        }
         Ok(())
     }
 
