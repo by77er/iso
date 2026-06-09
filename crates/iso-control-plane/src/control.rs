@@ -494,14 +494,14 @@ where
         // egress *mode* change needs a network re-steer. `apply` (converge) is
         // idempotent, so it re-renders the nft ruleset without disturbing the
         // running VM's netns/veth/tap.
-        if egress_changed {
-            if let Some(slot) = rec.slot {
-                let policy = NetworkPolicy {
-                    egress: rec.egress,
-                    ingress: rec.ingress.clone(),
-                };
-                self.net.apply(slot, &policy).await?;
-            }
+        if egress_changed
+            && let Some(slot) = rec.slot
+        {
+            let policy = NetworkPolicy {
+                egress: rec.egress,
+                ingress: rec.ingress.clone(),
+            };
+            self.net.apply(slot, &policy).await?;
         }
         Ok(())
     }
