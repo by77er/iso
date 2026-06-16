@@ -15,6 +15,21 @@ let
     (map lib.trim)
     (lib.filter (l: l != "" && !lib.hasPrefix "#" l))
   ];
+
+  # pi reads `AGENTS.md` from its config dir (~/.pi/agent) as global, always-on
+  # system-prompt context. Bake a note there so the agent knows the egress proxy
+  # injects credentials for it — same idea as the ANTHROPIC_API_KEY placeholder.
+  piAgentNotes = pkgs.writeText "pi-global-agents.md" ''
+    # Global agent notes
+
+    ## Outbound network & credentials
+
+    Outbound HTTPS is routed through iso's egress proxy, which injects
+    credentials in flight. For GitHub (github.com, api.github.com) you do NOT
+    need to log in, set a token, or run `gh auth login`: `gh`, `git` over
+    HTTPS, and direct API calls are authenticated for you automatically. Just
+    make the request.
+  '';
 in
 {
   users.users.coder = {
@@ -88,6 +103,15 @@ in
       cd "$root"
       exec ./devtool "$@"
     '')
+  ];
+
+  # Seed pi's global system-prompt context (`piAgentNotes`) into the coder
+  # home before the snapshot, so every warm-resumed clone carries it. Owned by
+  # coder so pi can keep writing its other config (settings.json, auth.json).
+  systemd.tmpfiles.rules = [
+    "d /home/coder/.pi 0755 coder users -"
+    "d /home/coder/.pi/agent 0755 coder users -"
+    "C /home/coder/.pi/agent/AGENTS.md 0644 coder users - ${piAgentNotes}"
   ];
 
   environment.variables.EDITOR = "vim";

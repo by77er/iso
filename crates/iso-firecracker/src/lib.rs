@@ -204,6 +204,13 @@ impl VmRuntime for FirecrackerRuntime {
                 "path_on_host": spec.rootfs_device.to_string_lossy(),
                 "is_root_device": true,
                 "is_read_only": false,
+                // Honor guest flush/FUA so ext4 journaling is actually durable.
+                // The Firecracker default ("Unsafe") silently drops flushes;
+                // combined with snapshot-then-SIGKILL (no clean unmount), that
+                // left the baked rootfs — notably a freshly-seeded `.git` — with
+                // torn metadata on the LV, so every CoW clone read a corrupt repo.
+                // Baked into the vmstate, so resumed clones inherit it too.
+                "cache_type": "Writeback",
             }),
         )
         .await?;

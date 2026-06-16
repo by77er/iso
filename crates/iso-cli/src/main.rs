@@ -388,6 +388,26 @@ async fn bake_inner(
         }
     }
 
+    // Flush the guest fs to the backing LV before snapshotting. With the rootfs
+    // drive in Writeback mode this becomes a host fsync, so the on-disk template
+    // is byte-consistent with the frozen page cache. Without it, dirty ext4
+    // metadata (e.g. the seeded `.git`, written by git/direnv activity during
+    // boot) never reaches the LV and every CoW clone reads a torn repo.
+    eprintln!("[bake] sync guest fs before snapshot");
+    let sync_ok = Command::new("ip")
+        .args([
+            "netns", "exec", netns, "ssh", "-i", &ssh_key.to_string_lossy(),
+            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=15", "-o", "LogLevel=ERROR",
+            &format!("coder@{inner_vm}"), "sync",
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !sync_ok {
+        eprintln!("[bake] warning: guest sync before snapshot failed (rootfs may be inconsistent)");
+    }
+
     eprintln!("[bake] pausing + snapshotting");
     // suspend = pause + CreateSnapshot into the runtime's per-vm dir.
     rt.suspend(builder).await?;
