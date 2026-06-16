@@ -414,7 +414,11 @@ mod tests {
             Ok(())
         }
         async fn provision(&self, vm: VmId, _s: &VolumeSpec) -> IRes<StorageHandle> {
-            Ok(StorageHandle { vm, device_path: "/dev/iso/x".into() })
+            Ok(StorageHandle {
+                vm,
+                device_path: "/dev/iso/x".into(),
+                backing_device: Some("/dev/iso/tpl_x".into()),
+            })
         }
         async fn teardown(&self, _vm: VmId) -> IRes<()> {
             Ok(())

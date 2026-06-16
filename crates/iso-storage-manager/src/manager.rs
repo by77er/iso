@@ -118,11 +118,15 @@ impl Manager {
     pub fn provision_sync(&self, vm: VmId, spec: &VolumeSpec) -> Result<StorageHandle> {
         let volume = self.volume_lv(vm);
         let device_path = self.dev_path(&volume);
+        // The base device this volume is (or will be) a CoW snapshot of — the
+        // path a warm snapshot of `spec.template` reopens on resume. Recorded
+        // here, at the one operation that knows the template→volume pairing.
+        let backing_device = Some(self.dev_path(&self.template_lv(&spec.template)));
 
         if self.lv_exists(&volume)? {
             // already provisioned: just (re)activate and return.
             self.runner.run(&self.activate_cmd(&volume))?;
-            return Ok(StorageHandle { vm, device_path });
+            return Ok(StorageHandle { vm, device_path, backing_device });
         }
 
         let template = self.template_lv(&spec.template);
@@ -136,7 +140,7 @@ impl Manager {
 
         self.runner.run(&self.snapshot_cmd(&template, &volume))?;
         self.runner.run(&self.activate_cmd(&volume))?;
-        Ok(StorageHandle { vm, device_path })
+        Ok(StorageHandle { vm, device_path, backing_device })
     }
 
     /// Tear down `vm`'s volume. Idempotent.

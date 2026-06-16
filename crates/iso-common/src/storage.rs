@@ -30,6 +30,12 @@ pub struct StorageHandle {
     pub vm: VmId,
     /// Host path of the block device / image to hand to Firecracker.
     pub device_path: PathBuf,
+    /// Host path of the base device this volume was cut from (its template's
+    /// rootfs). A warm snapshot reopens this baked path on resume, so the VMM
+    /// redirects it to `device_path`; the storage layer is the source of truth
+    /// for the pairing, established at provision time. `None` when the volume
+    /// has no distinct backing (e.g. not template-derived).
+    pub backing_device: Option<PathBuf>,
 }
 
 /// Backing-pool utilisation, for monitoring. A thin pool that fills up fails

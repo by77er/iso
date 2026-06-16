@@ -11,7 +11,7 @@ mod client;
 use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -105,7 +105,12 @@ impl FirecrackerRuntime {
     }
 
     /// Spawn a detached firecracker in `netns`, writing its pidfile.
-    fn spawn(&self, vm: VmId, netns: &str) -> Result<()> {
+    ///
+    /// `rootfs_bind` is `Some((device, baked_path))` on snapshot resume: the
+    /// snapshot reopens `baked_path` (the template's base device), so we redirect
+    /// it to this VM's CoW `device` with a bind mount inside a fresh, private
+    /// mount namespace. Without it every clone would write the shared template.
+    fn spawn(&self, vm: VmId, netns: &str, rootfs_bind: Option<(&Path, &Path)>) -> Result<()> {
         std::fs::create_dir_all(&self.cfg.socket_dir).map_err(be)?;
         std::fs::create_dir_all(&self.cfg.state_dir).map_err(be)?;
         let socket = self.socket(vm);
@@ -121,6 +126,17 @@ impl FirecrackerRuntime {
             )));
         }
 
+        // Prepare the bind paths as CStrings up front (no allocation in the
+        // post-fork pre_exec hook, which must stay async-signal-safe).
+        let bind = match rootfs_bind {
+            Some((dev, baked)) => {
+                let d = std::ffi::CString::new(dev.as_os_str().as_bytes()).map_err(be)?;
+                let b = std::ffi::CString::new(baked.as_os_str().as_bytes()).map_err(be)?;
+                Some((d, b))
+            }
+            None => None,
+        };
+
         let mut cmd = Command::new(&self.cfg.bin);
         cmd.arg("--api-sock").arg(&socket).stdin(Stdio::null());
         if let Ok(log) = std::fs::File::create(self.cfg.state_dir.join(format!("{vm}.log")))
@@ -128,11 +144,40 @@ impl FirecrackerRuntime {
         {
             cmd.stdout(log).stderr(log2);
         }
-        // Enter the netns and start a new session (detach) before exec.
+        // Enter the netns, redirect the rootfs (resume only), and start a new
+        // session (detach) before exec.
         unsafe {
             cmd.pre_exec(move || {
                 if libc::setns(nsfd, libc::CLONE_NEWNET) != 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                if let Some((dev, baked)) = &bind {
+                    // Private mount ns so the bind never leaks to the host.
+                    if libc::unshare(libc::CLONE_NEWNS) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let root = c"/".as_ptr();
+                    if libc::mount(
+                        std::ptr::null(),
+                        root,
+                        std::ptr::null(),
+                        libc::MS_REC | libc::MS_PRIVATE,
+                        std::ptr::null(),
+                    ) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // Bind this VM's CoW device over the baked template path.
+                    if libc::mount(
+                        dev.as_ptr(),
+                        baked.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND,
+                        std::ptr::null(),
+                    ) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 libc::setsid();
                 Ok(())
@@ -163,7 +208,13 @@ impl FirecrackerRuntime {
 
 impl VmRuntime for FirecrackerRuntime {
     async fn create(&self, spec: &InstanceSpec) -> Result<()> {
-        self.spawn(spec.vm, &spec.netns)?;
+        // On resume, redirect the snapshot's baked rootfs path to this VM's CoW
+        // device (see `spawn`); a fresh boot attaches `rootfs_device` directly.
+        let rootfs_bind = spec
+            .rootfs_backing
+            .as_deref()
+            .map(|baked| (spec.rootfs_device.as_path(), baked));
+        self.spawn(spec.vm, &spec.netns, rootfs_bind)?;
         self.wait_socket(spec.vm).await?;
         let socket = self.socket(spec.vm);
 
@@ -409,6 +460,7 @@ mod tests {
             kernel: kernel.clone(),
             boot_args: "console=ttyS0 reboot=k pci=off".into(),
             resume_from: None,
+            rootfs_backing: None,
         };
         rt.create(&spec).await.expect("create vm1");
         rt.start(vm1).await.expect("start vm1");

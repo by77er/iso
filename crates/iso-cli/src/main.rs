@@ -291,6 +291,7 @@ async fn bake(b: Bake) -> R<()> {
         kernel: kernel.clone(),
         boot_args: boot_args.clone(),
         resume_from: None,
+        rootfs_backing: None,
     };
 
     let ssh_key = b

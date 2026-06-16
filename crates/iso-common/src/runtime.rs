@@ -43,6 +43,12 @@ pub struct InstanceSpec {
     /// If set, resume from this snapshot instead of a fresh boot. (Resuming
     /// pins vcpus/mem to the snapshot's values.)
     pub resume_from: Option<SnapshotRef>,
+    /// On resume, the rootfs `path_on_host` baked into the snapshot (the
+    /// template's base device). Firecracker reopens that baked path, so the
+    /// runtime bind-mounts `rootfs_device` (this VM's CoW volume) over it inside
+    /// a private mount namespace — otherwise every clone would write the shared
+    /// template. `None` for a fresh boot, where `rootfs_device` is used directly.
+    pub rootfs_backing: Option<PathBuf>,
 }
 
 /// Observed instance state from the VMM's perspective. Polled by the supervisor.

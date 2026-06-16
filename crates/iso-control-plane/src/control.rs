@@ -226,6 +226,13 @@ where
         } else {
             None
         };
+        // On resume, redirect the snapshot's baked rootfs path to this VM's own
+        // CoW volume (the runtime binds it in a private mount ns) so clones
+        // never write the shared template. The backing device is the storage
+        // layer's metadata, recorded when the volume was provisioned.
+        let rootfs_backing = resume_from
+            .as_ref()
+            .and_then(|_| storage.backing_device.clone());
         let spec = InstanceSpec {
             vm: rec.id,
             netns: fixture.netns.clone(),
@@ -237,6 +244,7 @@ where
             kernel: tpl.kernel.clone(),
             boot_args: tpl.boot_args.clone(),
             resume_from,
+            rootfs_backing,
         };
         self.runtime.create(&spec).await?;
         self.runtime.start(rec.id).await?;
@@ -609,6 +617,7 @@ mod tests {
             Ok(StorageHandle {
                 vm,
                 device_path: format!("/dev/iso/{vm}").into(),
+                backing_device: Some(format!("/dev/iso/tpl_{}", spec.template).into()),
             })
         }
         async fn teardown(&self, _vm: VmId) -> IRes<()> {
