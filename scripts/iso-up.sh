@@ -33,9 +33,10 @@ ADMIN="http://${HOST_IP}:7070"
 
 # --- register the prewarmed 'agent' template (idempotent) ---
 # Which baked rootfs/snapshot the 'agent' template resolves to. Bump when you
-# bake a new image (agent_v1 = NixOS 25.05 + monorepo tooling + pi); the LV is
-# tpl_<AGENT_ROOTFS>, the snapshot is state/templates/<AGENT_ROOTFS>.
-AGENT_ROOTFS="${AGENT_ROOTFS:-agent_v1}"
+# bake a new image (agent_v1 = NixOS 25.05 + monorepo tooling + pi; agent_v2
+# adds the metadata-service AGENTS.md note); the LV is tpl_<AGENT_ROOTFS>, the
+# snapshot is state/templates/<AGENT_ROOTFS>.
+AGENT_ROOTFS="${AGENT_ROOTFS:-agent_v2}"
 if [ -f "$STATE/templates/$AGENT_ROOTFS/vmstate" ]; then
   KERNEL="$(nix build "path:$REPO/image#kernel" --no-link --print-out-paths 2>/dev/null)/vmlinux"
   BOOTARGS="console=ttyS0 reboot=k panic=1 acpi=off quiet loglevel=3 root=/dev/vda rootfstype=ext4 rw ip=172.20.0.1::172.20.0.0:255.255.255.254::eth0:off init=/nix/var/nix/profiles/system/init"
