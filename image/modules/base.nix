@@ -29,6 +29,22 @@ let
     need to log in, set a token, or run `gh auth login`: `gh`, `git` over
     HTTPS, and direct API calls are authenticated for you automatically. Just
     make the request.
+
+    ## Your VM identity & service endpoints
+
+    You run inside an iso microVM. To learn who you are and how you're reached
+    from outside, query the metadata service:
+
+        curl -s http://metadata.iso.internal/ | jq
+
+    It returns your `name`, the `host` you're reachable at (the iso server's
+    address), and `endpoints` — one entry per forwarded port, each with
+    `vm_port`, `host_port`, and a ready-to-use `endpoint` (`host:host_port`).
+
+    If a user asks for the URL/endpoint of a service you're running, look up its
+    `vm_port` in `endpoints` and give them that entry's `endpoint`. Only ports
+    listed there are reachable from outside the VM; a service on an unlisted
+    port has no external forward.
   '';
 in
 {

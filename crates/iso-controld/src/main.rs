@@ -47,6 +47,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s = settings::from_env();
     let control_sock = s.control_sock.clone();
     let control_tcp = s.control_tcp;
+    // The host's reachable IPv4 (where VM forwarded ports are exposed) — handed
+    // to the metadata server so guests can learn their own external endpoint.
+    let host_addr = s.network.host_addr;
 
     let cp = Arc::new(ControlPlane::new(
         s.control,
@@ -86,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match tokio::net::TcpListener::bind(meta_addr).await {
             Ok(l) => {
                 eprintln!("iso-controld: metadata server on {meta_addr}");
-                let svc = metadata::router(meta_cp)
+                let svc = metadata::router(meta_cp, host_addr)
                     .into_make_service_with_connect_info::<SocketAddr>();
                 if let Err(e) = axum::serve(l, svc).await {
                     eprintln!("iso-controld: metadata server exited: {e}");
