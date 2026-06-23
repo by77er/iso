@@ -1,6 +1,6 @@
 //! Control-plane error type.
 
-use iso_common::VmId;
+use iso_common::{Protocol, VmId};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -15,6 +15,8 @@ pub enum Error {
     UnknownVm(VmId),
     /// No template registered under this name.
     UnknownTemplate(String),
+    /// No ingress forward with this `(host_port, proto)` exists on the VM.
+    UnknownForward { host_port: u16, proto: Protocol },
     /// The backing pool is too full to provision into.
     PoolFull {
         data_percent: f64,
@@ -39,6 +41,9 @@ impl std::fmt::Display for Error {
             Error::PortsExhausted => write!(f, "no free forward ports remain"),
             Error::UnknownVm(id) => write!(f, "unknown vm {id}"),
             Error::UnknownTemplate(n) => write!(f, "unknown template '{n}'"),
+            Error::UnknownForward { host_port, proto } => {
+                write!(f, "no ingress forward {proto}/{host_port} on this vm")
+            }
             Error::PoolFull {
                 data_percent,
                 metadata_percent,

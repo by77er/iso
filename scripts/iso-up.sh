@@ -47,6 +47,25 @@ if [ -f "$STATE/templates/$AGENT_ROOTFS/vmstate" ]; then
   echo "[iso-up] template 'agent' -> rootfs '$AGENT_ROOTFS' registered ($code) via $ADMIN"
 fi
 
+# --- register the prewarmed 'coder' dev-box template (idempotent, in addition
+# to 'agent'). Baked separately from the vendored sibling flake:
+#   sudo target/debug/iso-cli bake --name coder --flake image-coder \
+#     --size 30G --vcpus 4 --mem-mib 4096
+# (vcpus/mem MUST match the values below — a Firecracker snapshot can only be
+# resumed with the same vCPU count + memory size it was taken with.) Gated on
+# the snapshot existing, so this is a no-op until you've baked it. The coder
+# rootfs reuses the base image's kernel, so image#kernel is correct here. ---
+CODER_ROOTFS="${CODER_ROOTFS:-coder}"
+if [ -f "$STATE/templates/$CODER_ROOTFS/vmstate" ]; then
+  KERNEL="$(nix build "path:$REPO/image#kernel" --no-link --print-out-paths 2>/dev/null)/vmlinux"
+  BOOTARGS="console=ttyS0 reboot=k panic=1 acpi=off quiet loglevel=3 root=/dev/vda rootfstype=ext4 rw ip=172.20.0.1::172.20.0.0:255.255.255.254::eth0:off init=/nix/var/nix/profiles/system/init"
+  code=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H 'content-type: application/json' \
+    -d "{\"name\":\"coder\",\"rootfs_template\":\"$CODER_ROOTFS\",\"snapshot_mem\":\"$STATE/templates/$CODER_ROOTFS/mem\",\"snapshot_vmstate\":\"$STATE/templates/$CODER_ROOTFS/vmstate\",\"vcpus\":4,\"mem_mib\":4096,\"kernel\":\"$KERNEL\",\"boot_args\":\"$BOOTARGS\"}" \
+    "$ADMIN/templates")
+  echo "[iso-up] template 'coder' -> rootfs '$CODER_ROOTFS' registered ($code) via $ADMIN"
+fi
+
 # --- egress proxy stack (root): CA minter, secret provider, MITM proxy.
 #     Reads state/{ca,secrets.toml}; proxy resolves per-VM policy via the
 #     control plane's identify.sock and serves the nft Proxy-mode DNAT target. ---

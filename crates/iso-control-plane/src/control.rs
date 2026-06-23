@@ -4,6 +4,7 @@
 //! Transport-agnostic — the axum HTTP layer is a thin wrapper over these
 //! methods.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::port::PortAllocator;
 use crate::slot::SlotAllocator;
 use crate::store::Store;
-use iso_common::PortForward;
+use iso_common::{PortForward, Protocol};
 use crate::types::{
     CreateVm, Lifecycle, RestartPolicy, Stats, TemplateDef, VmRecord, VmState,
 };
@@ -33,6 +34,12 @@ pub struct ControlPlane<N, S, R> {
     slots: Mutex<SlotAllocator>,
     ports: Mutex<PortAllocator>,
     services: Mutex<Option<HostNetwork>>,
+    /// Per-VM async locks serializing the *network application* for a VM — its
+    /// lifecycle apply/teardown and the policy/forward re-steers — so two of them
+    /// can't race the same slot's netns/nft. Data-race safety of the *declaration*
+    /// is the store's job now (normalized `port_forwards` rows + disjoint column
+    /// updates), not this lock's; different VMs stay fully concurrent.
+    vm_locks: Mutex<HashMap<VmId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 fn random_vmid() -> VmId {
@@ -65,7 +72,26 @@ where
             slots: Mutex::new(slots),
             ports: Mutex::new(ports),
             services: Mutex::new(None),
+            vm_locks: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The per-VM serialization lock, created on first use. Callers `.await` its
+    /// `.lock()` and hold the guard across the whole read-modify-write.
+    fn vm_lock(&self, id: VmId) -> Arc<tokio::sync::Mutex<()>> {
+        self.vm_locks
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Drop a destroyed VM's lock entry. Safe because VM ids are random and
+    /// never reused: any in-flight holder keeps its own `Arc` alive, and no
+    /// future op will ever reference this id again (it resolves to `UnknownVm`).
+    fn forget_lock(&self, id: VmId) {
+        self.vm_locks.lock().unwrap().remove(&id);
     }
 
     /// Initialize host subsystems and recover persisted VMs. Returns the
@@ -126,6 +152,10 @@ where
         }
 
         let id = random_vmid();
+        // Hold this VM's lock from the moment its id exists, so a concurrent
+        // supervise/handle_exit can't act on the half-created record.
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
         let slot = self
             .slots
             .lock()
@@ -173,13 +203,23 @@ where
             principal: req.principal.clone(),
             allow: req.allow.clone(),
         };
-        // write-ahead intent so a crash mid-create is recoverable.
+        // write-ahead intent so a crash mid-create is recoverable. `rec.ingress`
+        // drives bring_up's apply; the persisted desired state is the normalized
+        // `port_forwards` rows we insert next (a crash before they land just
+        // means fewer forwards — never a torn record).
         self.store.insert_vm(&rec)?;
+        for f in &ingress {
+            if let Err(e) = self.store.add_forward(id, f) {
+                self.free_ports(&ingress);
+                self.rollback(id, slot).await;
+                return Err(e);
+            }
+        }
 
         match self.bring_up(&mut rec, &tpl, true).await {
             Ok(()) => {
                 rec.state = VmState::Running;
-                self.store.update_vm(&rec)?;
+                self.store.update_placement(&rec)?;
                 Ok(id)
             }
             Err(e) => {
@@ -261,10 +301,13 @@ where
         let _ = self.storage.teardown(id).await;
         self.slots.lock().unwrap().free(slot);
         let _ = self.store.delete_vm(id);
+        self.forget_lock(id);
     }
 
     /// Explicitly destroy a VM and all its resources, regardless of lifecycle.
     pub async fn destroy_vm(&self, id: VmId) -> Result<()> {
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
         let rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
         let _ = self.runtime.stop(id).await; // best-effort graceful
         let _ = self.runtime.halt(id).await;
@@ -276,12 +319,15 @@ where
         self.free_ports(&rec.ingress);
         let _ = self.storage.teardown(id).await;
         self.store.delete_vm(id)?;
+        self.forget_lock(id);
         Ok(())
     }
 
     /// Graceful shutdown (escalating to force after the timeout), then apply
     /// lifecycle policy.
     pub async fn stop_vm(&self, id: VmId) -> Result<()> {
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
         let rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
         self.runtime.stop(id).await?;
         if !self.wait_exit(id, self.cfg.graceful_stop).await {
@@ -292,6 +338,8 @@ where
 
     /// Forceful stop, then apply lifecycle policy.
     pub async fn halt_vm(&self, id: VmId) -> Result<()> {
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
         let rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
         self.runtime.halt(id).await?;
         self.finalize_stop(rec).await
@@ -325,6 +373,7 @@ where
                 self.free_ports(&rec.ingress);
                 let _ = self.storage.teardown(rec.id).await;
                 self.store.delete_vm(rec.id)?;
+                self.forget_lock(rec.id);
             }
             Lifecycle::Durable => {
                 // keep the host ports reserved so the VM keeps its stable
@@ -333,7 +382,7 @@ where
                 rec.slot = None;
                 rec.tap = None;
                 rec.state = VmState::Stopped;
-                self.store.update_vm(&rec)?;
+                self.store.update_placement(&rec)?;
             }
         }
         Ok(())
@@ -341,6 +390,8 @@ where
 
     /// Pause (and snapshot) a running VM.
     pub async fn suspend_vm(&self, id: VmId) -> Result<()> {
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
         let mut rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
         if rec.state != VmState::Running {
             return Err(Error::InvalidState {
@@ -351,19 +402,28 @@ where
         }
         self.runtime.suspend(id).await?;
         rec.state = VmState::Suspended;
-        self.store.update_vm(&rec)?;
+        self.store.update_placement(&rec)?;
         Ok(())
     }
 
     /// Start a suspended VM (resume in place) or a stopped Durable VM (re-place
     /// and boot from its persisted rootfs).
     pub async fn start_vm(&self, id: VmId) -> Result<()> {
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
+        self.start_vm_locked(id).await
+    }
+
+    /// `start_vm` body, assuming this VM's lock is already held. Internal callers
+    /// that already hold the guard (e.g. `handle_exit`) use this to avoid
+    /// re-acquiring the non-reentrant lock and deadlocking.
+    async fn start_vm_locked(&self, id: VmId) -> Result<()> {
         let mut rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
         match rec.state {
             VmState::Suspended => {
                 self.runtime.start(id).await?;
                 rec.state = VmState::Running;
-                self.store.update_vm(&rec)?;
+                self.store.update_placement(&rec)?;
                 Ok(())
             }
             VmState::Stopped => {
@@ -379,18 +439,18 @@ where
                     .ok_or(Error::SlotsExhausted)?;
                 rec.slot = Some(slot);
                 rec.state = VmState::Creating;
-                self.store.update_vm(&rec)?;
+                self.store.update_placement(&rec)?;
                 match self.bring_up(&mut rec, &tpl, false).await {
                     Ok(()) => {
                         rec.state = VmState::Running;
-                        self.store.update_vm(&rec)?;
+                        self.store.update_placement(&rec)?;
                         Ok(())
                     }
                     Err(e) => {
                         self.slots.lock().unwrap().free(slot);
                         rec.slot = None;
                         rec.state = VmState::Stopped;
-                        let _ = self.store.update_vm(&rec);
+                        let _ = self.store.update_placement(&rec);
                         Err(e)
                     }
                 }
@@ -406,6 +466,8 @@ where
     /// Handle an observed VMM exit (called by the supervisor): restart per
     /// policy, else finalize per lifecycle.
     pub async fn handle_exit(&self, id: VmId, failed: bool) -> Result<()> {
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
         let Some(rec) = self.store.get_vm(id)? else {
             return Ok(());
         };
@@ -420,8 +482,8 @@ where
             let mut rec = rec;
             rec.slot = None;
             rec.state = VmState::Stopped;
-            self.store.update_vm(&rec)?;
-            self.start_vm(id).await
+            self.store.update_placement(&rec)?;
+            self.start_vm_locked(id).await
         } else {
             self.finalize_stop(rec).await
         }
@@ -485,33 +547,99 @@ where
         allow: Option<Vec<String>>,
         egress: Option<EgressMode>,
     ) -> Result<()> {
-        let mut rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
-        if let Some(p) = principal {
-            rec.principal = Some(p);
-        }
-        if let Some(a) = allow {
-            rec.allow = a;
-        }
-        let egress_changed = egress.is_some_and(|e| e != rec.egress);
-        if let Some(e) = egress {
-            rec.egress = e;
-        }
-        self.store.update_vm(&rec)?;
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
+        let rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
+
+        // Merge the provided (Some) fields over the current values, then persist
+        // ONLY the policy columns — disjoint from placement, so this can't clobber
+        // a concurrent lifecycle transition's slot/state.
+        let new_principal = principal.or_else(|| rec.principal.clone());
+        let new_allow = allow.unwrap_or_else(|| rec.allow.clone());
+        let new_egress = egress.unwrap_or(rec.egress);
+        let egress_changed = new_egress != rec.egress;
+        self.store
+            .update_policy(id, new_principal.as_deref(), &new_allow, new_egress)?;
 
         // The allow-list is read live by the proxy/DNS via `identify`; only an
-        // egress *mode* change needs a network re-steer. `apply` (converge) is
-        // idempotent, so it re-renders the nft ruleset without disturbing the
-        // running VM's netns/veth/tap.
-        if egress_changed
-            && let Some(slot) = rec.slot
-        {
-            let policy = NetworkPolicy {
-                egress: rec.egress,
-                ingress: rec.ingress.clone(),
-            };
-            // nft-only re-steer: must not touch the running VM's TAP/veth.
-            self.net.reapply_policy(slot, &policy).await?;
+        // egress *mode* change needs a network re-steer.
+        if egress_changed {
+            self.apply_network(id).await?;
         }
+        Ok(())
+    }
+
+    /// Apply a VM's declared desired state to the live network: an nft-only
+    /// re-steer that never disturbs the running VM's netns/veth/tap. Reads the
+    /// desired set (egress + forwards) FRESH from the store, so it reflects the
+    /// declaration that just committed. No-op for a stopped VM (no slot) — its
+    /// forwards materialize at the next `bring_up` — or one that's been removed.
+    /// Caller must hold the VM lock (this is the "apply" half of declare→apply).
+    async fn apply_network(&self, id: VmId) -> Result<()> {
+        let Some(rec) = self.store.get_vm(id)? else {
+            return Ok(());
+        };
+        let Some(slot) = rec.slot else {
+            return Ok(());
+        };
+        let policy = NetworkPolicy {
+            egress: rec.egress,
+            ingress: rec.ingress,
+        };
+        self.net.reapply_policy(slot, &policy).await?;
+        Ok(())
+    }
+
+    /// Add an ingress port-forward at runtime. Two distinct steps: *declare* the
+    /// forward (allocate a host port + insert the `port_forwards` row — an atomic
+    /// store op that can't clobber any other field) then *apply* it to the live
+    /// network. For a stopped VM (no slot) only the declaration happens; it
+    /// materializes at the next `bring_up`. Returns the resolved forward.
+    ///
+    /// The VM lock here serializes the *application* against the VM's lifecycle
+    /// (so a re-steer can't race a teardown/boot); declaration safety comes from
+    /// the store, not the lock.
+    pub async fn add_forward(&self, id: VmId, vm_port: u16, proto: Protocol) -> Result<PortForward> {
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
+        if self.store.get_vm(id)?.is_none() {
+            return Err(Error::UnknownVm(id));
+        }
+
+        let host_port = self
+            .ports
+            .lock()
+            .unwrap()
+            .allocate()
+            .ok_or(Error::PortsExhausted)?;
+        let fwd = PortForward { host_port, vm_port, proto };
+
+        // Declare (atomic; the FK reports a vanished VM rather than orphaning).
+        if let Err(e) = self.store.add_forward(id, &fwd) {
+            self.ports.lock().unwrap().free(host_port);
+            return Err(e);
+        }
+        // Apply; retract the declaration if the data plane rejects it.
+        if let Err(e) = self.apply_network(id).await {
+            let _ = self.store.remove_forward(id, host_port, proto);
+            self.ports.lock().unwrap().free(host_port);
+            return Err(e);
+        }
+        Ok(fwd)
+    }
+
+    /// Remove an ingress port-forward (by its allocated `host_port` + `proto`) at
+    /// runtime: *undeclare* it (delete the row), *apply* the reduced set to the
+    /// live network, then release the host port. Errors with `UnknownForward` if
+    /// no such forward exists on the VM.
+    pub async fn remove_forward(&self, id: VmId, host_port: u16, proto: Protocol) -> Result<()> {
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
+        if !self.store.remove_forward(id, host_port, proto)? {
+            return Err(Error::UnknownForward { host_port, proto });
+        }
+        self.apply_network(id).await?;
+        self.ports.lock().unwrap().free(host_port);
         Ok(())
     }
 
@@ -592,6 +720,9 @@ mod tests {
             Ok(fixture(slot))
         }
         async fn reapply_policy(&self, _slot: SlotId, _p: &NetworkPolicy) -> IRes<()> {
+            // Yield so concurrent mutators actually interleave at this await
+            // point (exercises the declare/apply paths under real concurrency).
+            tokio::task::yield_now().await;
             Ok(())
         }
         async fn teardown(&self, slot: SlotId) -> IRes<()> {
@@ -936,5 +1067,121 @@ mod tests {
         cp.create_vm(CreateVm::new("base")).await.unwrap();
         let err = cp.create_vm(CreateVm::new("base")).await.unwrap_err();
         assert!(matches!(err, Error::SlotsExhausted));
+    }
+
+    #[tokio::test]
+    async fn add_then_remove_forward_roundtrips() {
+        let (cp, _log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp.create_vm(CreateVm::new("base")).await.unwrap();
+
+        // add: a host port is allocated from the configured range and persisted.
+        let fwd = cp.add_forward(id, 8080, Protocol::Tcp).await.unwrap();
+        assert_eq!(fwd.vm_port, 8080);
+        assert!((20000..20010).contains(&fwd.host_port));
+        let rec = cp.get_vm(id).unwrap().unwrap();
+        assert_eq!(rec.ingress, vec![fwd]);
+
+        // remove: gone from the record.
+        cp.remove_forward(id, fwd.host_port, Protocol::Tcp).await.unwrap();
+        assert!(cp.get_vm(id).unwrap().unwrap().ingress.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_unknown_forward_errs() {
+        let (cp, _log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp.create_vm(CreateVm::new("base")).await.unwrap();
+        let err = cp.remove_forward(id, 29999, Protocol::Tcp).await.unwrap_err();
+        assert!(matches!(err, Error::UnknownForward { host_port: 29999, .. }));
+    }
+
+    #[tokio::test]
+    async fn add_forward_on_unknown_vm_errs() {
+        let (cp, _log) = build(8, 10.0, false);
+        let err = cp
+            .add_forward(VmId::from_u128(0xdead_beef), 80, Protocol::Tcp)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::UnknownVm(_)));
+    }
+
+    #[tokio::test]
+    async fn concurrent_adds_dont_clobber() {
+        // Five adds fired concurrently on the same VM. Each is now an atomic
+        // `port_forwards` INSERT, so all five rows persist regardless of
+        // interleaving — the normalized store, not a lock, is what prevents the
+        // lost-update that the old JSON-blob read-modify-write suffered.
+        let (cp, _log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp.create_vm(CreateVm::new("base")).await.unwrap();
+
+        let (a, b, c, d, e) = tokio::join!(
+            cp.add_forward(id, 81, Protocol::Tcp),
+            cp.add_forward(id, 82, Protocol::Tcp),
+            cp.add_forward(id, 83, Protocol::Tcp),
+            cp.add_forward(id, 84, Protocol::Tcp),
+            cp.add_forward(id, 85, Protocol::Tcp),
+        );
+        for r in [&a, &b, &c, &d, &e] {
+            assert!(r.is_ok(), "every concurrent add must succeed");
+        }
+
+        let rec = cp.get_vm(id).unwrap().unwrap();
+        assert_eq!(rec.ingress.len(), 5, "no forward may be lost to a race");
+
+        let mut vm_ports: Vec<u16> = rec.ingress.iter().map(|f| f.vm_port).collect();
+        vm_ports.sort();
+        assert_eq!(vm_ports, vec![81, 82, 83, 84, 85]);
+
+        let mut host_ports: Vec<u16> = rec.ingress.iter().map(|f| f.host_port).collect();
+        host_ports.sort();
+        host_ports.dedup();
+        assert_eq!(host_ports.len(), 5, "host ports must be distinct");
+    }
+
+    #[tokio::test]
+    async fn set_policy_does_not_clobber_concurrent_forward() {
+        // The old set_policy clobber: an egress change concurrent with an add.
+        // They now touch disjoint state — set_policy UPDATEs only the egress
+        // column, add INSERTs a port_forwards row — so both stick no matter how
+        // they interleave. (Previously each rewrote the whole row and the last
+        // writer reverted the other's field.)
+        let (cp, _log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp.create_vm(CreateVm::new("base")).await.unwrap();
+
+        let (fwd, pol) = tokio::join!(
+            cp.add_forward(id, 90, Protocol::Tcp),
+            cp.set_policy(id, None, None, Some(EgressMode::Allow)),
+        );
+        fwd.unwrap();
+        pol.unwrap();
+
+        let rec = cp.get_vm(id).unwrap().unwrap();
+        assert_eq!(rec.ingress.len(), 1, "the forward must survive the egress change");
+        assert_eq!(rec.egress, EgressMode::Allow);
+    }
+
+    #[tokio::test]
+    async fn removed_forward_port_is_recycled() {
+        // 10 ports in the test range; exhaust them, free one, prove reuse.
+        let (cp, _log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp.create_vm(CreateVm::new("base")).await.unwrap();
+
+        let mut fwds = Vec::new();
+        for _ in 0..10 {
+            fwds.push(cp.add_forward(id, 80, Protocol::Tcp).await.unwrap());
+        }
+        assert!(matches!(
+            cp.add_forward(id, 80, Protocol::Tcp).await.unwrap_err(),
+            Error::PortsExhausted
+        ));
+
+        cp.remove_forward(id, fwds[0].host_port, Protocol::Tcp).await.unwrap();
+        // a fresh add now succeeds, reusing the freed port.
+        let reused = cp.add_forward(id, 80, Protocol::Tcp).await.unwrap();
+        assert_eq!(reused.host_port, fwds[0].host_port);
     }
 }

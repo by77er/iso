@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use iso_common::{
     EgressMode, NetworkManager, PortForward, Protocol, SnapshotRef, StorageManager, VmId,
@@ -34,10 +34,13 @@ impl IntoResponse for ApiError {
 impl From<CpError> for ApiError {
     fn from(e: CpError) -> Self {
         let code = match &e {
-            CpError::UnknownVm(_) | CpError::UnknownTemplate(_) => StatusCode::NOT_FOUND,
-            CpError::SlotsExhausted | CpError::PoolFull { .. } | CpError::InvalidState { .. } => {
-                StatusCode::CONFLICT
-            }
+            CpError::UnknownVm(_)
+            | CpError::UnknownTemplate(_)
+            | CpError::UnknownForward { .. } => StatusCode::NOT_FOUND,
+            CpError::SlotsExhausted
+            | CpError::PortsExhausted
+            | CpError::PoolFull { .. }
+            | CpError::InvalidState { .. } => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(code, e.to_string())
@@ -85,6 +88,24 @@ struct CreateReq {
 #[derive(Serialize)]
 struct IdResp {
     id: String,
+}
+
+/// Body for `POST /vms/{id}/forwards`: open a new ingress forward. The host
+/// port is allocated by the control plane and returned in the response.
+#[derive(Deserialize)]
+struct AddForwardReq {
+    vm_port: u16,
+    /// `"tcp"` (default) or `"udp"`.
+    #[serde(default)]
+    proto: String,
+}
+
+/// Query for `DELETE /vms/{id}/forwards/{host_port}`: which protocol's forward
+/// to remove (defaults to tcp, matching `AddForwardReq`).
+#[derive(Deserialize)]
+struct ProtoQuery {
+    #[serde(default)]
+    proto: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -328,6 +349,41 @@ where
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn add_forward<N, S, R>(
+    State(cp): State<Cp<N, S, R>>,
+    Path(id): Path<String>,
+    Json(req): Json<AddForwardReq>,
+) -> Result<Json<PortForwardDto>, ApiError>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    let fwd = cp
+        .add_forward(parse_id(&id)?, req.vm_port, proto_from(&req.proto))
+        .await?;
+    Ok(Json(PortForwardDto {
+        host_port: fwd.host_port,
+        vm_port: fwd.vm_port,
+        proto: proto_to(fwd.proto),
+    }))
+}
+
+async fn remove_forward<N, S, R>(
+    State(cp): State<Cp<N, S, R>>,
+    Path((id, host_port)): Path<(String, u16)>,
+    Query(q): Query<ProtoQuery>,
+) -> Result<StatusCode, ApiError>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    let proto = proto_from(q.proto.as_deref().unwrap_or("tcp"));
+    cp.remove_forward(parse_id(&id)?, host_port, proto).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn stats<N, S, R>(State(cp): State<Cp<N, S, R>>) -> Result<Json<StatsResp>, ApiError>
 where
     N: NetworkManager + Send + Sync + 'static,
@@ -359,6 +415,11 @@ where
         .route("/vms/{id}/suspend", post(suspend::<N, S, R>))
         .route("/vms/{id}/halt", post(halt::<N, S, R>))
         .route("/vms/{id}/policy", patch(set_policy::<N, S, R>))
+        .route("/vms/{id}/forwards", post(add_forward::<N, S, R>))
+        .route(
+            "/vms/{id}/forwards/{host_port}",
+            delete(remove_forward::<N, S, R>),
+        )
         .route("/templates", post(register_template::<N, S, R>))
         .route("/stats", get(stats::<N, S, R>))
         .with_state(cp)
