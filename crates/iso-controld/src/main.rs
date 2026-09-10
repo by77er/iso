@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let unix = tokio::net::UnixListener::bind(&control_sock)?;
     eprintln!("iso-controld: admin API on {} and {control_tcp}", control_sock.display());
 
-    // TCP admin listener for the agentd frontend's HTTP client.
+    // TCP admin listener for a remote orchestrator's HTTP client.
     let tcp_cp = cp.clone();
     tokio::spawn(async move {
         match tokio::net::TcpListener::bind(control_tcp).await {

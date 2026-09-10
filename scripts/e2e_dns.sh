@@ -2,16 +2,19 @@
 # Live test of the dual-horizon DNS + metadata server: boot a VM (Deny egress —
 # DNS/metadata are the always-on services baseline), and from inside it resolve
 # metadata.iso.internal (-> dummy) + hit the metadata server, plus a forwarded name.
+# Run as root from a `nix develop` shell after `cargo build`. Needs the guest
+# ssh key at state/keys/test_ed25519 (override with ISO_SSH_KEY).
 set -uo pipefail
 
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE=/var/tmp/iso-dnstest
 VG=isodnstest
 SOCK=$STATE/control.sock
-KEY=/home/user/.local/state/isolates/image-inputs/keys/test_ed25519
-KERNEL=$(nix build "path:/home/user/iso/image#kernel" --no-link --print-out-paths 2>/dev/null)/vmlinux
-SYS=$(nix build "path:/home/user/iso/image#toplevel" --no-link --print-out-paths 2>/dev/null)
-NIXOS_INSTALL=$(nix build "path:/home/user/iso/image#nixos-install-tools" --no-link --print-out-paths 2>/dev/null)/bin/nixos-install
-CONTROLD=/home/user/iso/target/debug/iso-controld
+KEY="${ISO_SSH_KEY:-$REPO/state/keys/test_ed25519}"
+KERNEL=$(nix build "path:$REPO/image#kernel" --no-link --print-out-paths 2>/dev/null)/vmlinux
+SYS=$(nix build "path:$REPO/image#toplevel" --no-link --print-out-paths 2>/dev/null)
+NIXOS_INSTALL=$(nix build "path:$REPO/image#nixos-install-tools" --no-link --print-out-paths 2>/dev/null)/bin/nixos-install
+CONTROLD=$REPO/target/debug/iso-controld
 BOOTARGS="console=ttyS0 reboot=k panic=1 acpi=off quiet loglevel=3 root=/dev/vda rootfstype=ext4 rw ip=172.20.0.1::172.20.0.0:255.255.255.254::eth0:off init=/nix/var/nix/profiles/system/init"
 CD=""
 api(){ local p="$1"; shift; curl -s --unix-socket "$SOCK" "$@" "http://x$p"; }
@@ -28,7 +31,7 @@ trap cleanup EXIT
 cleanup; mkdir -p $STATE
 
 echo "== controld up (state=$STATE) =="
-ISO_STATE_DIR=$STATE ISO_VG=$VG ISO_IMAGE_SIZE_GIB=16 ISO_UPLINK=ens3 "$CONTROLD" >$STATE/cd.log 2>&1 &
+ISO_STATE_DIR=$STATE ISO_VG=$VG ISO_IMAGE_SIZE_GIB=16 ISO_UPLINK="${ISO_UPLINK:-}" "$CONTROLD" >$STATE/cd.log 2>&1 &
 CD=$!
 for i in $(seq 1 150); do [ -S "$SOCK" ] && lvs "$VG/pool" >/dev/null 2>&1 && break; sleep 0.2; done
 lvs "$VG/pool" >/dev/null 2>&1 || { echo FAIL pool; cat $STATE/cd.log; exit 1; }

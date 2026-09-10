@@ -182,7 +182,7 @@ fn host_ruleset(fx: &NetworkFixture, policy: &NetworkPolicy, cfg: &Config) -> Ru
         oif: up.clone(),
     }];
 
-    // Host-local hairpin: let processes on the host (e.g. agentd) reach a VM's
+    // Host-local hairpin: let processes on the host (e.g. an orchestrator) reach a VM's
     // forwarded ports via the host's own primary IP (locally-originated traffic
     // skips the uplink prerouting hook, so DNAT in OUTPUT).
     let mut chains = vec![

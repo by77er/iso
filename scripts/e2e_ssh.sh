@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
-# End-to-end live validation of the iso system (self-contained; does NOT touch
-# the running isolates / coderthin / fcgw0 / 172.16.x):
+# End-to-end live validation of the iso system (self-contained; does NOT touch a
+# running iso deployment — it uses its own state dir and volume group):
 #   - bakes a NixOS rootfs into our OWN throwaway VG (isoe2e)
 #   - runs iso-controld, registers the template, and creates VMs via the HTTP API
 #   - SSHes into each VM and exercises Allow / Deny / Proxy egress
 #   - in Proxy mode, verifies a stand-in proxy on 172.22.0.1 receives the conn
+# Run as root from a `nix develop` shell after `cargo build`. Needs the guest
+# ssh key at state/keys/test_ed25519 (override with ISO_SSH_KEY).
 set -uo pipefail
 
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE=/var/tmp/iso-e2e
 VG=isoe2e
 SOCK=$STATE/control.sock
-KEY=/home/user/.local/state/isolates/image-inputs/keys/test_ed25519
-KERNEL=/home/user/iso/image/result-firecracker/kernel/vmlinux
-SYS=/nix/store/g2a39rgpr9b5hjxv2adm9lxk7a5yj3j7-nixos-system-nixos-24.11.20250630.50ab793
-NIXOS_INSTALL=/nix/store/sf3bwnxg1h2ylami1vvza9yaapgnw78f-nixos-install-tools-26.11pre-git/bin/nixos-install
-CONTROLD=/home/user/iso/target/debug/iso-controld
+KEY="${ISO_SSH_KEY:-$REPO/state/keys/test_ed25519}"
+KERNEL=$(nix build "path:$REPO/image#kernel" --no-link --print-out-paths 2>/dev/null)/vmlinux
+SYS=$(nix build "path:$REPO/image#toplevel" --no-link --print-out-paths 2>/dev/null)
+NIXOS_INSTALL=$(nix build "path:$REPO/image#nixos-install-tools" --no-link --print-out-paths 2>/dev/null)/bin/nixos-install
+CONTROLD=$REPO/target/debug/iso-controld
 PROXY_LOG=$STATE/proxy.log
 CONTROLD_LOG=$STATE/controld.log
 BOOTARGS="console=ttyS0 reboot=k panic=1 acpi=off quiet loglevel=3 root=/dev/vda rootfstype=ext4 rw ip=172.20.0.1::172.20.0.0:255.255.255.254::eth0:off init=/nix/var/nix/profiles/system/init"
@@ -42,7 +45,7 @@ cleanup
 mkdir -p "$STATE"
 
 echo "== starting iso-controld (state=$STATE vg=$VG) =="
-ISO_STATE_DIR=$STATE ISO_VG=$VG ISO_IMAGE_SIZE_GIB=16 ISO_UPLINK=ens3 "$CONTROLD" >"$CONTROLD_LOG" 2>&1 &
+ISO_STATE_DIR=$STATE ISO_VG=$VG ISO_IMAGE_SIZE_GIB=16 ISO_UPLINK="${ISO_UPLINK:-}" "$CONTROLD" >"$CONTROLD_LOG" 2>&1 &
 CONTROLD_PID=$!
 for i in $(seq 1 150); do [ -S "$SOCK" ] && lvs "$VG/pool" >/dev/null 2>&1 && break; sleep 0.2; done
 if ! lvs "$VG/pool" >/dev/null 2>&1; then echo "FAIL: controld didn't bring up the pool"; cat "$CONTROLD_LOG"; exit 1; fi
@@ -50,8 +53,8 @@ echo "controld up; services dummy: $(ip -4 -o addr show dummy0 | awk '{print $4}
 
 # This host runs Docker (ip filter FORWARD policy drop). Allow-mode direct
 # egress (172.21.x) isn't matched by Docker's rules, so carve our veth traffic
-# into DOCKER-USER. Disjoint from docker (172.17)/isolates (172.16); restored on
-# cleanup. Deny/Proxy don't need this.
+# into DOCKER-USER. Disjoint from docker (172.17); restored on cleanup.
+# Deny/Proxy don't need this.
 nft insert rule ip filter DOCKER-USER oifname "vm*" accept 2>/dev/null
 nft insert rule ip filter DOCKER-USER iifname "vm*" accept 2>/dev/null
 

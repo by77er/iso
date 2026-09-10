@@ -6,6 +6,4 @@
 #
 # NOTE: keys here are shared by every VM cloned from this image. For per-VM
 # keys, inject them at runtime instead (Firecracker MMDS, a config drive, or
-# the Coder agent) rather than baking them in.
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILUL1CCYApYb7tU66QblYXFh6uezqf4C/4e/ZVUvDIor coder-fc-test-key
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDPoK3Ov4n7z93+GEBSVYiJ6RpvEsU2qHIAY5jNPNVP0 isolates-guest
+# an in-guest agent) rather than baking them in.

@@ -11,7 +11,7 @@ pub struct Settings {
     pub firecracker: iso_firecracker::Config,
     /// Admin API unix socket.
     pub control_sock: PathBuf,
-    /// Admin API TCP listener (for the agentd frontend's HTTP client).
+    /// Admin API TCP listener (for a remote orchestrator's HTTP client).
     pub control_tcp: std::net::SocketAddr,
 }
 
@@ -84,7 +84,7 @@ pub fn from_env() -> Settings {
         },
         control_sock: state.join("control.sock"),
         // Bind the admin API on the host's reachable IP so a co-located *or*
-        // remote agentd can use it (and derive the same address for ssh).
+        // remote orchestrator can use it (and derive the same address for ssh).
         // Unauthenticated for now — front it appropriately.
         control_tcp: env("ISO_ADMIN_TCP")
             .and_then(|s| s.parse().ok())
