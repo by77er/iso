@@ -68,8 +68,10 @@ struct Bake {
     /// Template name (rootfs LV `tpl_<name>` + snapshot dir).
     #[arg(long)]
     name: String,
-    /// Path to the image flake (provides #kernel, #toplevel, #nixos-install-tools).
-    #[arg(long, default_value = "image")]
+    /// The flake providing #kernel, #toplevel and #nixos-install-tools: this
+    /// repository. Given as a plain path, so a git checkout contributes only
+    /// its tracked files (a new module must be `git add`ed to be seen).
+    #[arg(long, default_value = ".")]
     flake: String,
     /// State root (must match the control plane's ISO_STATE_DIR).
     #[arg(long, default_value = "/var/lib/iso")]
@@ -154,7 +156,7 @@ fn nix_build(flake: &str, attr: &str) -> R<String> {
     run_out(&[
         "nix",
         "build",
-        &format!("path:{flake_abs}#{attr}"),
+        &format!("{flake_abs}#{attr}"),
         "--no-link",
         "--print-out-paths",
     ])

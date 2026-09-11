@@ -1,5 +1,5 @@
 {
-  description = "iso development environment";
+  description = "iso: Firecracker microVM sandboxes for agents (dev shell and guest image)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -8,10 +8,16 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
+    # The guest image (see image/default.nix): userspace from a release, the
+    # kernel from a revision whose kconfig generation accepts our config.
+    nixpkgs-image.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs-kernel.url = "github:NixOS/nixpkgs/nixos-24.11";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, nixpkgs-image, nixpkgs-kernel }:
+    let
+      image = import ./image { nixpkgs = nixpkgs-image; inherit nixpkgs-kernel; };
+      dev = flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
@@ -72,6 +78,8 @@
             pkgs.openssl
             pkgs.cargo-nextest
             pkgs.cargo-watch
+            pkgs.e2fsprogs
+            pkgs.util-linux
             firecracker
           ];
 
@@ -85,4 +93,11 @@
           '';
         };
       });
+    in
+    nixpkgs.lib.recursiveUpdate dev {
+      # `nix build .#kernel`, `.#toplevel`, `.#nixos-install-tools`, `.#iso-guest-agent`;
+      # `isoctl bake` consumes the first three.
+      packages.${image.system} = image.packages;
+      nixosConfigurations.base = image.nixosConfiguration;
+    };
 }

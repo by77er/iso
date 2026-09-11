@@ -44,7 +44,7 @@ Not TLS, or no SNI: dropped. SNI not on the allow-list: reset. Request host that
 | `iso-admin-pki` | The admin API's own CA: server certificate and client certificates for mutual TLS. |
 | `iso-client` | Rust client for the admin API, generated from its OpenAPI document. |
 | `iso-cli` | `isoctl`: bake templates, issue admin client certificates, and drive VMs (`isoctl vm create`, `exec`, `cat`, `put`, …). |
-| `image/` | Nix flake for the guest: a stripped Firecracker kernel with vsock, and a lean NixOS rootfs with sshd, a `coder` user and the guest agent. |
+| `image/` | The guest image, built by the repository's flake (`nix build .#toplevel`): a stripped Firecracker kernel with vsock, and a lean NixOS rootfs with sshd, a `coder` user and the guest agent. |
 
 Design notes with the full reasoning: [`crates/iso-network-manager/DESIGN.md`](crates/iso-network-manager/DESIGN.md) and [`crates/iso-proxy/DESIGN.md`](crates/iso-proxy/DESIGN.md).
 
@@ -75,8 +75,8 @@ cat state/keys/test_ed25519.pub >> image/keys/authorized_keys
 # Control plane (root: netlink, nft, LVM, KVM). All state lives under ISO_STATE_DIR.
 sudo ISO_STATE_DIR=$PWD/state ISO_VG=iso ISO_UPLINK=eth0 target/debug/iso-controld &
 
-# Bake a warm template from image/ and register it.
-sudo target/debug/isoctl bake --name base --flake image --state $PWD/state --vg iso --uplink eth0 \
+# Bake a warm template from the flake's image (nix build .#toplevel) and register it.
+sudo target/debug/isoctl bake --name base --state $PWD/state --vg iso --uplink eth0 \
   | sudo curl -s --unix-socket state/control.sock -H 'content-type: application/json' -d @- http://x/templates
 
 # Boot a VM with no egress and run something in it through the guest agent.

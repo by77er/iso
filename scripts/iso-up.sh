@@ -41,7 +41,7 @@ api() { sudo -n curl -s --unix-socket "$SOCK" "$@"; }
 #     only resumes with the same machine size. The rootfs LV is tpl_<name> and
 #     the snapshot is state/templates/<name>; entries that aren't baked yet are
 #     skipped. ---
-KERNEL="$(nix build "path:$REPO/image#kernel" --no-link --print-out-paths 2>/dev/null)/vmlinux"
+KERNEL="$(nix build "$REPO#kernel" --no-link --print-out-paths 2>/dev/null)/vmlinux"
 BOOTARGS="console=ttyS0 reboot=k panic=1 acpi=off quiet loglevel=3 root=/dev/vda rootfstype=ext4 rw ip=172.20.0.1::172.20.0.0:255.255.255.254::eth0:off init=/nix/var/nix/profiles/system/init"
 for spec in ${ISO_TEMPLATES:-base:1:512}; do
   IFS=: read -r name vcpus mem <<<"$spec"

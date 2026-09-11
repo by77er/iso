@@ -11,9 +11,9 @@ STATE=/var/tmp/iso-dnstest
 VG=isodnstest
 SOCK=$STATE/control.sock
 KEY="${ISO_SSH_KEY:-$REPO/state/keys/test_ed25519}"
-KERNEL=$(nix build "path:$REPO/image#kernel" --no-link --print-out-paths 2>/dev/null)/vmlinux
-SYS=$(nix build "path:$REPO/image#toplevel" --no-link --print-out-paths 2>/dev/null)
-NIXOS_INSTALL=$(nix build "path:$REPO/image#nixos-install-tools" --no-link --print-out-paths 2>/dev/null)/bin/nixos-install
+KERNEL=$(nix build "$REPO#kernel" --no-link --print-out-paths 2>/dev/null)/vmlinux
+SYS=$(nix build "$REPO#toplevel" --no-link --print-out-paths 2>/dev/null)
+NIXOS_INSTALL=$(nix build "$REPO#nixos-install-tools" --no-link --print-out-paths 2>/dev/null)/bin/nixos-install
 CONTROLD=$REPO/target/debug/iso-controld
 BOOTARGS="console=ttyS0 reboot=k panic=1 acpi=off quiet loglevel=3 root=/dev/vda rootfstype=ext4 rw ip=172.20.0.1::172.20.0.0:255.255.255.254::eth0:off init=/nix/var/nix/profiles/system/init"
 CD=""

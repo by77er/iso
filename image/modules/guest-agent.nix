@@ -27,7 +27,15 @@ let
   };
 in
 {
-  environment.systemPackages = [ iso-guest-agent ];
+  # Exposed so the flake can build the agent on its own (`nix build .#iso-guest-agent`).
+  options.iso.guestAgent.package = lib.mkOption {
+    type = lib.types.package;
+    default = iso-guest-agent;
+    description = "The guest agent binary the service runs.";
+  };
+
+  config = {
+  environment.systemPackages = [ config.iso.guestAgent.package ];
 
   systemd.services.iso-guest-agent = {
     description = "iso guest agent (host exec and file access over vsock)";
@@ -35,7 +43,7 @@ in
     # vsock needs no network; start as early as the user database allows.
     after = [ "systemd-user-sessions.service" ];
     serviceConfig = {
-      ExecStart = "${iso-guest-agent}/bin/iso-guest-agent --port 5000";
+      ExecStart = "${config.iso.guestAgent.package}/bin/iso-guest-agent --port 5000";
       # Runs as the workspace user, so everything it does is done with that
       # user's permissions (passwordless sudo is available inside commands).
       User = "coder";
@@ -44,5 +52,6 @@ in
       Restart = "always";
       RestartSec = 1;
     };
+  };
   };
 }

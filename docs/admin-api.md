@@ -105,7 +105,7 @@ in time.
 ## The guest agent
 
 `exec` and the file operations are served by `iso-guest-agent`, a small
-service the base image runs as the `coder` user on vsock port 5000. The host
+service the base image (`nix build .#toplevel`) runs as the `coder` user on vsock port 5000. The host
 reaches it through Firecracker's vsock device, so nothing about it touches the
 VM's network policy: a `deny` VM is as reachable as any other. The agent speaks
 length-prefixed JSON frames (`crates/iso-guest-proto`); the admin API is the
