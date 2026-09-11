@@ -1,4 +1,5 @@
-//! `isoctl` — out-of-band setup for iso. Today: bake "warm" templates.
+//! `isoctl` — the iso command line: bake "warm" templates, manage the admin
+//! CA, and drive VMs through the admin API (`isoctl vm …`, see `vm.rs`).
 //!
 //! A warm template is a *resume point*: a rootfs LV plus a Firecracker memory
 //! snapshot taken once the guest has fully booted. The control plane then clones
@@ -10,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod vm;
 
 use clap::{Parser, Subcommand};
 use iso_common::{
@@ -32,6 +35,8 @@ enum Cmd {
     Bake(Bake),
     /// The admin API's certificate authority: issue client certificates.
     Admin(Admin),
+    /// Create, inspect and use VMs through the admin API.
+    Vm(vm::Vm),
 }
 
 #[derive(Parser)]
@@ -223,6 +228,7 @@ async fn main() -> R<()> {
     match Cli::parse().cmd {
         Cmd::Bake(b) => bake(b).await,
         Cmd::Admin(a) => admin(a),
+        Cmd::Vm(v) => vm::run(v).await,
     }
 }
 

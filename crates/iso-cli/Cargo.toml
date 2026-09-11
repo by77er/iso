@@ -15,7 +15,8 @@ iso-network-manager = { path = "../iso-network-manager" }
 iso-storage-manager = { path = "../iso-storage-manager" }
 iso-firecracker = { path = "../iso-firecracker" }
 iso-admin-pki = { path = "../iso-admin-pki" }
-clap = { version = "4", features = ["derive"] }
+iso-client = { path = "../iso-client" }
+clap = { version = "4", features = ["derive", "env"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 libc = "0.2.186"

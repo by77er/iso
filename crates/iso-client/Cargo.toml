@@ -1,0 +1,18 @@
+[package]
+name = "iso-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust client for the iso admin API, generated from its OpenAPI document, with mutual-TLS setup"
+
+[dependencies]
+# What the generated code (src/generated.rs) needs; see scripts/gen-client.sh.
+bytes = "1.9"
+futures-core = "0.3"
+progenitor-client = "0.15.0"
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls-no-provider"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_urlencoded = "0.7"
+# The hand-written part: certificates and the crypto provider.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde_json = "1"

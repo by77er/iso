@@ -1,0 +1,1617 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "iso admin API",
+    "description": "Create Firecracker microVMs, set their egress policy, and reach the agent inside them. Served on the daemon's unix socket (root only) and on its TCP listener, where a client certificate issued by the host's admin CA (`isoctl admin issue-client`) is required.",
+    "license": {
+      "name": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/stats": {
+      "get": {
+        "tags": [
+          "host"
+        ],
+        "operationId": "stats",
+        "responses": {
+          "200": {
+            "description": "Host capacity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stats"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/templates": {
+      "post": {
+        "tags": [
+          "templates"
+        ],
+        "operationId": "register_template",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TemplateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Registered (upsert by name)"
+          }
+        }
+      }
+    },
+    "/vms": {
+      "get": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "list",
+        "responses": {
+          "200": {
+            "description": "Every VM record",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Vm"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateVmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Created and booted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedVm"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown template",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No free slot or port, or the pool is over its watermark",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}": {
+      "get": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "get_one",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The VM",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Vm"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown VM",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "destroy",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Destroyed with its storage and placement, whatever its lifecycle"
+          },
+          "404": {
+            "description": "Unknown VM",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not valid in the VM's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}/agent": {
+      "get": {
+        "tags": [
+          "guest"
+        ],
+        "operationId": "agent_info",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The guest agent answered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentInfo"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The VM is not running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "No agent reachable in the guest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}/dir": {
+      "get": {
+        "tags": [
+          "guest"
+        ],
+        "operationId": "list_dir",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Absolute path inside the guest.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "max_bytes",
+            "in": "query",
+            "description": "Read at most this many bytes (default 16 MiB).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "recursive",
+            "in": "query",
+            "description": "Remove a directory and everything under it.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The entries, sorted by name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirListing"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No such directory",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The VM is not running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "No agent reachable in the guest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}/exec": {
+      "post": {
+        "tags": [
+          "guest"
+        ],
+        "operationId": "guest_exec",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The program ran (its exit status is in the body)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The agent refused: bad program, cwd, or request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The VM is not running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "No agent reachable in the guest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The agent did not answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}/files": {
+      "get": {
+        "tags": [
+          "guest"
+        ],
+        "operationId": "read_file",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Absolute path inside the guest.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "max_bytes",
+            "in": "query",
+            "description": "Read at most this many bytes (default 16 MiB).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "recursive",
+            "in": "query",
+            "description": "Remove a directory and everything under it.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The file, base64",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileContent"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No such file, or not a regular file",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The VM is not running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "No agent reachable in the guest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "guest"
+        ],
+        "operationId": "write_file",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Absolute path inside the guest.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "max_bytes",
+            "in": "query",
+            "description": "Read at most this many bytes (default 16 MiB).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "recursive",
+            "in": "query",
+            "description": "Remove a directory and everything under it.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteFileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Written"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad content, or the agent could not write there",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The VM is not running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "No agent reachable in the guest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "guest"
+        ],
+        "operationId": "remove_path",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Absolute path inside the guest.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "max_bytes",
+            "in": "query",
+            "description": "Read at most this many bytes (default 16 MiB).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "recursive",
+            "in": "query",
+            "description": "Remove a directory and everything under it.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "400": {
+            "description": "No such path, or a directory without recursive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The VM is not running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "No agent reachable in the guest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}/forwards": {
+      "post": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "add_forward",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddForwardRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The forward, with its allocated host port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortForward"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown VM",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No free host port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}/forwards/{host_port}": {
+      "delete": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "remove_forward",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "host_port",
+            "in": "path",
+            "description": "The allocated host port",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "proto",
+            "in": "query",
+            "description": "`tcp` (default) or `udp`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Closed"
+          },
+          "404": {
+            "description": "Unknown VM or forward",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}/halt": {
+      "post": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "halt",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Killed; an ephemeral VM is then deleted"
+          },
+          "404": {
+            "description": "Unknown VM",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not valid in the VM's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}/policy": {
+      "patch": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "set_policy",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Applied to new connections"
+          },
+          "404": {
+            "description": "Unknown VM",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}/start": {
+      "post": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "start",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Booted a stopped durable VM, or resumed a suspended one"
+          },
+          "404": {
+            "description": "Unknown VM",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not valid in the VM's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}/stop": {
+      "post": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "stop",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Shut down gracefully; an ephemeral VM is then deleted"
+          },
+          "404": {
+            "description": "Unknown VM",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not valid in the VM's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}/suspend": {
+      "post": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "suspend",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Paused and snapshotted in place"
+          },
+          "404": {
+            "description": "Unknown VM",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not valid in the VM's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AddForwardRequest": {
+        "type": "object",
+        "description": "Open a new ingress forward. The host port is allocated by the control\nplane and returned in the response.",
+        "required": [
+          "vm_port"
+        ],
+        "properties": {
+          "proto": {
+            "type": "string",
+            "description": "`tcp` (default) or `udp`."
+          },
+          "vm_port": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "AgentInfo": {
+        "type": "object",
+        "required": [
+          "agent",
+          "version",
+          "hostname",
+          "uid",
+          "cwd"
+        ],
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "uid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateVmRequest": {
+        "type": "object",
+        "description": "Create and boot a VM. Only `template` is required.",
+        "required": [
+          "template"
+        ],
+        "properties": {
+          "allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Domains routed through the egress proxy."
+          },
+          "egress": {
+            "type": "string",
+            "description": "`allow`, `proxy` or `deny` (default). Unrecognized values mean `deny`."
+          },
+          "ingress": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortForward"
+            },
+            "description": "Ports to forward into the VM; host ports are allocated."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Free-form labels; `name` is surfaced to the guest's metadata.",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "lifecycle": {
+            "type": "string",
+            "description": "`ephemeral` (default: deleted on stop) or `durable` (rootfs kept)."
+          },
+          "mem_mib": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Override the template's memory (forces a cold boot).",
+            "nullable": true,
+            "minimum": 0
+          },
+          "principal": {
+            "type": "string",
+            "description": "Principal whose credentials the egress proxy injects.",
+            "nullable": true
+          },
+          "restart": {
+            "type": "string",
+            "description": "`never` (default), `on_failure` or `always`."
+          },
+          "template": {
+            "type": "string",
+            "description": "A registered template name."
+          },
+          "vcpus": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Override the template's vCPU count (forces a cold boot).",
+            "nullable": true,
+            "minimum": 0
+          }
+        }
+      },
+      "CreatedVm": {
+        "type": "object",
+        "description": "The id of a newly created VM.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        }
+      },
+      "DirEntry": {
+        "type": "object",
+        "required": [
+          "name",
+          "kind",
+          "size",
+          "mode"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/FileKind"
+          },
+          "mode": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Permission bits (the low 12 bits of `st_mode`).",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "DirListing": {
+        "type": "object",
+        "description": "A directory listing (not recursive).",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DirEntry"
+            }
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "The shape of every error response.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "What went wrong."
+          }
+        }
+      },
+      "ExecRequest": {
+        "type": "object",
+        "description": "`exec` parameters.",
+        "required": [
+          "cmd"
+        ],
+        "properties": {
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "cmd": {
+            "type": "string",
+            "description": "Program to run, resolved on the guest's `PATH`."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Working directory; default is the agent's.",
+            "nullable": true
+          },
+          "env": {
+            "type": "object",
+            "description": "Extra environment, layered over the agent's.",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "max_output_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cap on captured bytes per stream (default [`DEFAULT_MAX_OUTPUT`]).",
+            "nullable": true,
+            "minimum": 0
+          },
+          "stdin": {
+            "type": "string",
+            "description": "Bytes written to the program's stdin before it is closed.",
+            "nullable": true
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wall-clock limit; the process group is killed when it elapses.",
+            "nullable": true,
+            "minimum": 0
+          }
+        }
+      },
+      "ExecResult": {
+        "type": "object",
+        "required": [
+          "stdout",
+          "stderr",
+          "timed_out",
+          "truncated",
+          "duration_ms"
+        ],
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "exit_code": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The process exit code, or `None` if it was killed by a signal.",
+            "nullable": true
+          },
+          "signal": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Signal number that terminated the process, when there was one.",
+            "nullable": true
+          },
+          "stderr": {
+            "type": "string",
+            "description": "Captured stderr, lossily decoded as UTF-8."
+          },
+          "stdout": {
+            "type": "string",
+            "description": "Captured stdout, lossily decoded as UTF-8."
+          },
+          "timed_out": {
+            "type": "boolean",
+            "description": "The timeout elapsed and the process group was killed."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "One of the captures hit `max_output_bytes`."
+          }
+        }
+      },
+      "FileContent": {
+        "type": "object",
+        "required": [
+          "path",
+          "size",
+          "content_b64",
+          "truncated"
+        ],
+        "properties": {
+          "content_b64": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total size of the file on disk.",
+            "minimum": 0
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        }
+      },
+      "FileKind": {
+        "type": "string",
+        "enum": [
+          "file",
+          "dir",
+          "symlink",
+          "other"
+        ]
+      },
+      "PolicyRequest": {
+        "type": "object",
+        "description": "Change a running VM's egress policy. Omitted fields are left unchanged.",
+        "properties": {
+          "allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "nullable": true
+          },
+          "egress": {
+            "type": "string",
+            "description": "`allow`, `proxy` or `deny`; anything else leaves the mode unchanged.",
+            "nullable": true
+          },
+          "principal": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "PortForward": {
+        "type": "object",
+        "description": "An ingress port forward from a host port to a port inside the VM.",
+        "required": [
+          "vm_port",
+          "proto"
+        ],
+        "properties": {
+          "host_port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Allocated by the control plane; ignored on create, reported on read.",
+            "minimum": 0
+          },
+          "proto": {
+            "type": "string",
+            "description": "`tcp` or `udp`."
+          },
+          "vm_port": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "Stats": {
+        "type": "object",
+        "description": "Host capacity.",
+        "required": [
+          "data_percent",
+          "metadata_percent",
+          "slots_used",
+          "slots_total",
+          "vms"
+        ],
+        "properties": {
+          "data_percent": {
+            "type": "number",
+            "format": "double",
+            "description": "Thin-pool data usage, percent."
+          },
+          "metadata_percent": {
+            "type": "number",
+            "format": "double",
+            "description": "Thin-pool metadata usage, percent."
+          },
+          "slots_total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "slots_used": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "vms": {
+            "type": "integer",
+            "description": "VM records, in any state.",
+            "minimum": 0
+          }
+        }
+      },
+      "TemplateRequest": {
+        "type": "object",
+        "description": "Register a template built by `isoctl bake`. Paths are host paths.",
+        "required": [
+          "name",
+          "rootfs_template",
+          "vcpus",
+          "mem_mib",
+          "kernel"
+        ],
+        "properties": {
+          "boot_args": {
+            "type": "string"
+          },
+          "kernel": {
+            "type": "string",
+            "description": "Uncompressed guest kernel."
+          },
+          "mem_mib": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "rootfs_template": {
+            "type": "string",
+            "description": "The LVM template volume, without the `tpl_` prefix."
+          },
+          "snapshot_mem": {
+            "type": "string",
+            "description": "Memory snapshot; with `snapshot_vmstate`, VMs resume warm.",
+            "nullable": true
+          },
+          "snapshot_vmstate": {
+            "type": "string",
+            "nullable": true
+          },
+          "vcpus": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "Vm": {
+        "type": "object",
+        "description": "A VM as the control plane sees it.",
+        "required": [
+          "id",
+          "template",
+          "state",
+          "egress",
+          "lifecycle",
+          "restart",
+          "labels",
+          "ingress",
+          "allow"
+        ],
+        "properties": {
+          "allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "egress": {
+            "type": "string",
+            "description": "`allow`, `proxy` or `deny`."
+          },
+          "id": {
+            "type": "string"
+          },
+          "ingress": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortForward"
+            }
+          },
+          "labels": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "lifecycle": {
+            "type": "string",
+            "description": "`ephemeral` or `durable`."
+          },
+          "principal": {
+            "type": "string",
+            "nullable": true
+          },
+          "restart": {
+            "type": "string",
+            "description": "`never`, `on_failure` or `always`."
+          },
+          "rootfs_device": {
+            "type": "string",
+            "nullable": true
+          },
+          "slot": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Placement slot; absent while a durable VM is stopped.",
+            "nullable": true,
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`creating`, `running`, `suspended`, `stopped` or `failed`."
+          },
+          "tap": {
+            "type": "string",
+            "nullable": true
+          },
+          "template": {
+            "type": "string"
+          }
+        }
+      },
+      "WriteFileRequest": {
+        "type": "object",
+        "description": "Write a file inside the guest: one of `content` (UTF-8 text) or\n`content_b64` (arbitrary bytes).",
+        "properties": {
+          "content": {
+            "type": "string",
+            "nullable": true
+          },
+          "content_b64": {
+            "type": "string",
+            "nullable": true
+          },
+          "mkdir": {
+            "type": "boolean",
+            "description": "Create missing parent directories."
+          },
+          "mode": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Permission bits to set, e.g. 493 for `0755`.",
+            "nullable": true,
+            "minimum": 0
+          }
+        }
+      },
+      "Written": {
+        "type": "object",
+        "description": "Bytes written.",
+        "required": [
+          "bytes"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "vms",
+      "description": "VM lifecycle, policy and port forwards"
+    },
+    {
+      "name": "guest",
+      "description": "Run programs and move files inside a VM through its agent"
+    },
+    {
+      "name": "templates",
+      "description": "Baked templates VMs are cloned from"
+    },
+    {
+      "name": "host",
+      "description": "Host capacity"
+    }
+  ]
+}

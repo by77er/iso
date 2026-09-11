@@ -2,7 +2,7 @@
 
 Firecracker microVM sandboxes for coding agents and other untrusted code, on one Linux host.
 
-Every VM gets its own kernel, its own network namespace, and a copy-on-write disk cut from a warm snapshot, so it boots in milliseconds. Egress is decided on the host, per VM: **deny** it, **allow** it, or **proxy** it through a transparent TLS-terminating proxy that enforces a domain allow-list and injects real credentials in flight. The guest only ever holds a placeholder key.
+Every VM gets its own kernel, its own network namespace, and a copy-on-write disk cut from a warm snapshot, so it boots in milliseconds. Egress is decided on the host, per VM: **deny** it, **allow** it, or **proxy** it through a transparent TLS-terminating proxy that enforces a domain allow-list and injects real credentials in flight. The guest only ever holds a placeholder key. A coding agent never has to run inside the VM: the host reaches a small agent in the guest over vsock, so `exec` and file access are admin API calls, and a harness outside the VM drives them as tools.
 
 ## Why
 
@@ -40,8 +40,11 @@ Not TLS, or no SNI: dropped. SNI not on the allow-list: reset. Request host that
 | `iso-firecracker` | Drives Firecracker over its API socket from inside the VM's netns. Snapshot and resume for warm starts. |
 | `iso-proxy` / `iso-ca` / `iso-secrets` | The `proxy` egress mode: `iso-proxyd` (data plane), `iso-cad` (sign-only CA), `iso-secretsd` (TOML-backed header store, hot-reloaded). |
 | `iso-dns-server` | Dual-horizon resolver on the services address: `metadata.iso.internal` locally, everything else forwarded. |
-| `iso-cli` | `isoctl bake`: build the NixOS image, install it onto a template volume, boot it once, snapshot it. |
-| `image/` | Nix flake for the guest: a stripped Firecracker kernel and a minimal NixOS rootfs with sshd and a `coder` user. |
+| `iso-guest-agent` / `iso-guest-proto` | The service inside the guest that runs programs and moves files for the host, and its wire protocol. |
+| `iso-admin-pki` | The admin API's own CA: server certificate and client certificates for mutual TLS. |
+| `iso-client` | Rust client for the admin API, generated from its OpenAPI document. |
+| `iso-cli` | `isoctl`: bake templates, issue admin client certificates, and drive VMs (`isoctl vm create`, `exec`, `cat`, `put`, …). |
+| `image/` | Nix flake for the guest: a stripped Firecracker kernel with vsock, and a lean NixOS rootfs with sshd, a `coder` user and the guest agent. |
 
 Design notes with the full reasoning: [`crates/iso-network-manager/DESIGN.md`](crates/iso-network-manager/DESIGN.md) and [`crates/iso-proxy/DESIGN.md`](crates/iso-proxy/DESIGN.md).
 
@@ -76,12 +79,27 @@ sudo ISO_STATE_DIR=$PWD/state ISO_VG=iso ISO_UPLINK=eth0 target/debug/iso-contro
 sudo target/debug/isoctl bake --name base --flake image --state $PWD/state --vg iso --uplink eth0 \
   | sudo curl -s --unix-socket state/control.sock -H 'content-type: application/json' -d @- http://x/templates
 
-# Boot a VM with no egress, then SSH in through its namespace.
-# Every guest is 172.20.0.1 inside its own netns; the netns is vm<slot in hex>.
+# Boot a VM with no egress and run something in it through the guest agent.
 sudo curl -s --unix-socket state/control.sock -H 'content-type: application/json' \
   -d '{"template":"base","egress":"deny","labels":{"name":"demo"}}' http://x/vms
-sudo curl -s --unix-socket state/control.sock http://x/vms
+sudo curl -s --unix-socket state/control.sock -H 'content-type: application/json' \
+  -d '{"cmd":"uname","args":["-a"]}' http://x/vms/<id>/exec
+
+# Or SSH in through its namespace: every guest is 172.20.0.1 inside its own
+# netns, and the netns is vm<slot in hex>.
 sudo ip netns exec vm0000 ssh -i state/keys/test_ed25519 coder@172.20.0.1
+```
+
+From another machine, or as a non-root user, use the TCP listener with a
+client certificate and the `isoctl vm` commands:
+
+```bash
+sudo target/debug/isoctl admin issue-client --name me --out ./creds   # ca.crt, me.crt, me.key
+export ISO_SERVER=https://<host ip>:7070 ISO_CREDS=./creds ISO_CLIENT=me
+id=$(target/debug/isoctl vm create --template base --name demo --quiet)
+target/debug/isoctl vm exec "$id" -- sh -c 'echo hello from $(hostname)'
+target/debug/isoctl vm put  "$id" /home/coder/hello.txt --content "hi"
+target/debug/isoctl vm rm   "$id"
 ```
 
 For `proxy` mode, start the three proxy daemons and bake the CA into the image so guests trust it:
@@ -116,11 +134,11 @@ sudo curl -s --unix-socket state/control.sock -H 'content-type: application/json
 
 Inside the guest, `curl https://api.github.com/user` just works. No token in the environment, no `gh auth login`.
 
-`scripts/iso-up.sh` brings the whole stack up idempotently and is safe to run on every boot.
+`scripts/iso-up.sh` brings the whole stack up idempotently and is safe to run on every boot. `ISO_JAILER=1` in its environment (or the daemon's) runs every VM under Firecracker's jailer.
 
 ## Admin API
 
-Served on `$ISO_STATE_DIR/control.sock` and, by default, TCP port 7070 on the host's primary IP (see caveats). JSON in, JSON out.
+Served on `$ISO_STATE_DIR/control.sock` (root only) and on TCP port 7070 of the host's primary IP with mutual TLS: the daemon keeps a CA of its own and `isoctl admin issue-client` mints certificates for it. The OpenAPI document is generated from the handlers and served at `/openapi.json`; `crates/iso-client` is generated from it, and `isoctl vm` wraps that. [docs/admin-api.md](docs/admin-api.md) has the details. JSON in, JSON out.
 
 | Endpoint | Effect |
 | --- | --- |
@@ -130,8 +148,11 @@ Served on `$ISO_STATE_DIR/control.sock` and, by default, TCP port 7070 on the ho
 | `DELETE /vms/{id}` | Destroy. |
 | `PATCH /vms/{id}/policy` | Change `egress`, `principal`, `allow` on a running VM. |
 | `POST /vms/{id}/forwards` | Open a host port to a VM port. The host port is allocated and returned. |
+| `POST /vms/{id}/exec` | Run a program inside the VM through the guest agent; output and exit status come back. |
+| `GET` / `PUT` / `DELETE /vms/{id}/files?path=`, `GET /vms/{id}/dir?path=` | Read, write, remove and list files inside the VM. |
 | `POST /templates` | Register a baked template. |
 | `GET /stats` | Pool and slot usage. |
+| `GET /openapi.json` | The API's OpenAPI 3.0 document. |
 
 Guests can ask `http://metadata.iso.internal/` who they are: their id, name, labels, and the external `host:port` for every forwarded port. A VM sees only its own record.
 
@@ -139,8 +160,9 @@ Guests can ask `http://metadata.iso.internal/` who they are: their id, name, lab
 
 This is a working prototype, not a hardened product.
 
-- The admin API is unauthenticated. Set `ISO_ADMIN_TCP=127.0.0.1:7070` or front it with something that authenticates. Anyone who reaches it controls every VM.
-- Firecracker runs as a direct child of root without the jailer.
+- Any client certificate from the admin CA is a full administrator: no roles, no per-VM ownership, no revocation short of replacing the CA.
+- The jailer is opt-in (`ISO_JAILER=1`); without it Firecracker runs as a direct child of root.
+- Templates baked before the guest agent existed have no vsock device, so `exec` and the file operations need a re-bake with the current image.
 - x86_64 only; the guest kernel config is Firecracker-specific.
 - `isoctl bake` drives the host directly rather than through the daemon, so bake on a quiet host.
 

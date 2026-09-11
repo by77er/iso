@@ -1,6 +1,10 @@
 //! axum admin API over the (transport-agnostic) control-plane core.
 //!
 //! Admin-only: host-global stats live here, never on a VM-facing surface.
+//!
+//! The OpenAPI document is generated from the handler and DTO annotations
+//! below ([`ApiDoc`]) and served at `GET /openapi.json`; `iso-openapi` prints
+//! it, and `crates/iso-client` is generated from it (`scripts/gen-client.sh`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,15 +17,23 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use iso_common::{
-    EgressMode, NetworkManager, PortForward, Protocol, SnapshotRef, StorageManager, VmId,
-    VmRuntime,
+    EgressMode, NetworkManager, Protocol, SnapshotRef, StorageManager, VmId, VmRuntime,
 };
 use iso_control_plane::types::{egress_parse, egress_str, TemplateDef};
 use iso_control_plane::{ControlPlane, CreateVm, Error as CpError, VmRecord};
 use iso_guest_proto::{AgentInfo, ClientError, DirEntry, ExecRequest, ExecResult, FileContent, GuestClient};
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 
 type Cp<N, S, R> = Arc<ControlPlane<N, S, R>>;
+
+/// The shape of every error response.
+#[derive(Serialize, ToSchema)]
+pub struct ErrorBody {
+    /// What went wrong.
+    pub error: String,
+}
+
 
 // ---- error mapping ----
 
@@ -72,142 +84,180 @@ const EXEC_SLACK: Duration = Duration::from_secs(15);
 
 // ---- DTOs ----
 
-#[derive(Serialize, Deserialize)]
-struct PortForwardDto {
-    /// Allocated by the control plane; omit on create, reported on read.
+/// An ingress port forward from a host port to a port inside the VM.
+#[derive(Serialize, Deserialize, ToSchema)]
+struct PortForward {
+    /// Allocated by the control plane; ignored on create, reported on read.
     #[serde(default)]
     host_port: u16,
     vm_port: u16,
+    /// `tcp` or `udp`.
     proto: String,
 }
 
-#[derive(Deserialize)]
-struct CreateReq {
+/// Create and boot a VM. Only `template` is required.
+#[derive(Deserialize, ToSchema)]
+struct CreateVmRequest {
+    /// A registered template name.
     template: String,
+    /// `allow`, `proxy` or `deny` (default). Unrecognized values mean `deny`.
     #[serde(default)]
     egress: String,
+    /// Ports to forward into the VM; host ports are allocated.
     #[serde(default)]
-    ingress: Vec<PortForwardDto>,
+    ingress: Vec<PortForward>,
+    /// Free-form labels; `name` is surfaced to the guest's metadata.
     #[serde(default)]
     labels: HashMap<String, String>,
+    /// `ephemeral` (default: deleted on stop) or `durable` (rootfs kept).
     #[serde(default)]
     lifecycle: String,
+    /// `never` (default), `on_failure` or `always`.
     #[serde(default)]
     restart: String,
+    /// Override the template's vCPU count (forces a cold boot).
     #[serde(default)]
     vcpus: Option<u32>,
+    /// Override the template's memory (forces a cold boot).
     #[serde(default)]
     mem_mib: Option<u32>,
+    /// Principal whose credentials the egress proxy injects.
     #[serde(default)]
     principal: Option<String>,
+    /// Domains routed through the egress proxy.
     #[serde(default)]
     allow: Vec<String>,
 }
 
-#[derive(Serialize)]
-struct IdResp {
+/// The id of a newly created VM.
+#[derive(Serialize, ToSchema)]
+struct CreatedVm {
     id: String,
 }
 
-/// Body for `POST /vms/{id}/forwards`: open a new ingress forward. The host
-/// port is allocated by the control plane and returned in the response.
-#[derive(Deserialize)]
-struct AddForwardReq {
+/// Open a new ingress forward. The host port is allocated by the control
+/// plane and returned in the response.
+#[derive(Deserialize, ToSchema)]
+struct AddForwardRequest {
     vm_port: u16,
-    /// `"tcp"` (default) or `"udp"`.
+    /// `tcp` (default) or `udp`.
     #[serde(default)]
     proto: String,
 }
 
-/// Query for `DELETE /vms/{id}/forwards/{host_port}`: which protocol's forward
-/// to remove (defaults to tcp, matching `AddForwardReq`).
-#[derive(Deserialize)]
+/// Which protocol's forward to remove (defaults to tcp).
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct ProtoQuery {
+    /// `tcp` (default) or `udp`.
     #[serde(default)]
     proto: Option<String>,
 }
 
-#[derive(Serialize)]
-struct VmResp {
+/// A VM as the control plane sees it.
+#[derive(Serialize, ToSchema)]
+struct Vm {
     id: String,
+    /// Placement slot; absent while a durable VM is stopped.
     slot: Option<u16>,
     template: String,
+    /// `creating`, `running`, `suspended`, `stopped` or `failed`.
     state: String,
+    /// `allow`, `proxy` or `deny`.
     egress: String,
+    /// `ephemeral` or `durable`.
     lifecycle: String,
+    /// `never`, `on_failure` or `always`.
     restart: String,
     labels: HashMap<String, String>,
-    ingress: Vec<PortForwardDto>,
+    ingress: Vec<PortForward>,
     tap: Option<String>,
     rootfs_device: Option<String>,
     principal: Option<String>,
     allow: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct PolicyReq {
+/// Change a running VM's egress policy. Omitted fields are left unchanged.
+#[derive(Deserialize, ToSchema)]
+struct PolicyRequest {
     #[serde(default)]
     principal: Option<String>,
     #[serde(default)]
     allow: Option<Vec<String>>,
-    /// `"allow" | "proxy" | "deny"`; invalid/absent leaves it unchanged.
+    /// `allow`, `proxy` or `deny`; anything else leaves the mode unchanged.
     #[serde(default)]
     egress: Option<String>,
 }
 
-/// Query for the guest file endpoints.
-#[derive(Deserialize)]
+/// Which path inside the guest a file operation targets.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct PathQuery {
+    /// Absolute path inside the guest.
     path: String,
+    /// Read at most this many bytes (default 16 MiB).
     #[serde(default)]
     max_bytes: Option<u64>,
+    /// Remove a directory and everything under it.
     #[serde(default)]
     recursive: bool,
 }
 
-/// Body for `PUT /vms/{id}/files`: one of `content` (UTF-8 text) or
+/// Write a file inside the guest: one of `content` (UTF-8 text) or
 /// `content_b64` (arbitrary bytes).
-#[derive(Deserialize)]
-struct WriteFileReq {
+#[derive(Deserialize, ToSchema)]
+struct WriteFileRequest {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
     content_b64: Option<String>,
+    /// Permission bits to set, e.g. 493 for `0755`.
     #[serde(default)]
     mode: Option<u32>,
+    /// Create missing parent directories.
     #[serde(default)]
     mkdir: bool,
 }
 
-#[derive(Serialize)]
-struct WrittenResp {
+/// Bytes written.
+#[derive(Serialize, ToSchema)]
+struct Written {
     bytes: u64,
 }
 
-#[derive(Serialize)]
-struct DirResp {
+/// A directory listing (not recursive).
+#[derive(Serialize, ToSchema)]
+struct DirListing {
     entries: Vec<DirEntry>,
 }
 
-#[derive(Serialize)]
-struct StatsResp {
+/// Host capacity.
+#[derive(Serialize, ToSchema)]
+struct Stats {
+    /// Thin-pool data usage, percent.
     data_percent: f64,
+    /// Thin-pool metadata usage, percent.
     metadata_percent: f64,
     slots_used: usize,
     slots_total: usize,
+    /// VM records, in any state.
     vms: usize,
 }
 
-#[derive(Deserialize)]
-struct TemplateReq {
+/// Register a template built by `isoctl bake`. Paths are host paths.
+#[derive(Deserialize, ToSchema)]
+struct TemplateRequest {
     name: String,
+    /// The LVM template volume, without the `tpl_` prefix.
     rootfs_template: String,
+    /// Memory snapshot; with `snapshot_vmstate`, VMs resume warm.
     #[serde(default)]
     snapshot_mem: Option<String>,
     #[serde(default)]
     snapshot_vmstate: Option<String>,
     vcpus: u32,
     mem_mib: u32,
+    /// Uncompressed guest kernel.
     kernel: String,
     #[serde(default)]
     boot_args: String,
@@ -249,14 +299,14 @@ fn restart_from(s: &str) -> iso_control_plane::RestartPolicy {
     }
 }
 
-fn to_req(r: CreateReq) -> CreateVm {
+fn to_req(r: CreateVmRequest) -> CreateVm {
     CreateVm {
         template: r.template,
         egress: egress_from(&r.egress),
         ingress: r
             .ingress
             .into_iter()
-            .map(|f| PortForward {
+            .map(|f| iso_common::PortForward {
                 host_port: 0, // control plane allocates
                 vm_port: f.vm_port,
                 proto: proto_from(&f.proto),
@@ -272,8 +322,8 @@ fn to_req(r: CreateReq) -> CreateVm {
     }
 }
 
-fn vm_resp(r: &VmRecord) -> VmResp {
-    VmResp {
+fn vm_resp(r: &VmRecord) -> Vm {
+    Vm {
         id: r.id.to_string(),
         slot: r.slot.map(|s| s.get()),
         template: r.template.clone(),
@@ -285,7 +335,7 @@ fn vm_resp(r: &VmRecord) -> VmResp {
         ingress: r
             .ingress
             .iter()
-            .map(|f| PortForwardDto {
+            .map(|f| PortForward {
                 host_port: f.host_port,
                 vm_port: f.vm_port,
                 proto: proto_to(f.proto),
@@ -300,20 +350,28 @@ fn vm_resp(r: &VmRecord) -> VmResp {
 
 // ---- handlers ----
 
+#[utoipa::path(post, path = "/vms", tag = "vms", request_body = CreateVmRequest,
+    responses(
+        (status = 200, description = "Created and booted", body = CreatedVm),
+        (status = 404, description = "Unknown template", body = ErrorBody),
+        (status = 409, description = "No free slot or port, or the pool is over its watermark", body = ErrorBody),
+    ))]
 async fn create<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
-    Json(req): Json<CreateReq>,
-) -> Result<Json<IdResp>, ApiError>
+    Json(req): Json<CreateVmRequest>,
+) -> Result<Json<CreatedVm>, ApiError>
 where
     N: NetworkManager + Send + Sync + 'static,
     S: StorageManager + Send + Sync + 'static,
     R: VmRuntime + Send + Sync + 'static,
 {
     let id = cp.create_vm(to_req(req)).await?;
-    Ok(Json(IdResp { id: id.to_string() }))
+    Ok(Json(CreatedVm { id: id.to_string() }))
 }
 
-async fn list<N, S, R>(State(cp): State<Cp<N, S, R>>) -> Result<Json<Vec<VmResp>>, ApiError>
+#[utoipa::path(get, path = "/vms", tag = "vms",
+    responses((status = 200, description = "Every VM record", body = Vec<Vm>)))]
+async fn list<N, S, R>(State(cp): State<Cp<N, S, R>>) -> Result<Json<Vec<Vm>>, ApiError>
 where
     N: NetworkManager + Send + Sync + 'static,
     S: StorageManager + Send + Sync + 'static,
@@ -322,10 +380,12 @@ where
     Ok(Json(cp.list_vms()?.iter().map(vm_resp).collect()))
 }
 
+#[utoipa::path(get, path = "/vms/{id}", tag = "vms", params(("id" = String, Path, description = "VM id, as a hyphenated UUID or 32 hex digits")),
+    responses((status = 200, description = "The VM", body = Vm), (status = 404, description = "Unknown VM", body = ErrorBody)))]
 async fn get_one<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
     Path(id): Path<String>,
-) -> Result<Json<VmResp>, ApiError>
+) -> Result<Json<Vm>, ApiError>
 where
     N: NetworkManager + Send + Sync + 'static,
     S: StorageManager + Send + Sync + 'static,
@@ -337,7 +397,13 @@ where
 }
 
 macro_rules! lifecycle_handler {
-    ($name:ident, $method:ident) => {
+    ($name:ident, $method:ident, $verb:ident, $path:literal, $desc:literal) => {
+        #[utoipa::path($verb, path = $path, tag = "vms", params(("id" = String, Path, description = "VM id, as a hyphenated UUID or 32 hex digits")),
+            responses(
+                (status = 204, description = $desc),
+                (status = 404, description = "Unknown VM", body = ErrorBody),
+                (status = 409, description = "Not valid in the VM's current state", body = ErrorBody),
+            ))]
         async fn $name<N, S, R>(
             State(cp): State<Cp<N, S, R>>,
             Path(id): Path<String>,
@@ -352,15 +418,17 @@ macro_rules! lifecycle_handler {
         }
     };
 }
-lifecycle_handler!(start, start_vm);
-lifecycle_handler!(stop, stop_vm);
-lifecycle_handler!(suspend, suspend_vm);
-lifecycle_handler!(halt, halt_vm);
-lifecycle_handler!(destroy, destroy_vm);
+lifecycle_handler!(start, start_vm, post, "/vms/{id}/start", "Booted a stopped durable VM, or resumed a suspended one");
+lifecycle_handler!(stop, stop_vm, post, "/vms/{id}/stop", "Shut down gracefully; an ephemeral VM is then deleted");
+lifecycle_handler!(suspend, suspend_vm, post, "/vms/{id}/suspend", "Paused and snapshotted in place");
+lifecycle_handler!(halt, halt_vm, post, "/vms/{id}/halt", "Killed; an ephemeral VM is then deleted");
+lifecycle_handler!(destroy, destroy_vm, delete, "/vms/{id}", "Destroyed with its storage and placement, whatever its lifecycle");
 
+#[utoipa::path(post, path = "/templates", tag = "templates", request_body = TemplateRequest,
+    responses((status = 201, description = "Registered (upsert by name)")))]
 async fn register_template<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
-    Json(t): Json<TemplateReq>,
+    Json(t): Json<TemplateRequest>,
 ) -> Result<StatusCode, ApiError>
 where
     N: NetworkManager + Send + Sync + 'static,
@@ -386,10 +454,13 @@ where
     Ok(StatusCode::CREATED)
 }
 
+#[utoipa::path(patch, path = "/vms/{id}/policy", tag = "vms", params(("id" = String, Path, description = "VM id, as a hyphenated UUID or 32 hex digits")),
+    request_body = PolicyRequest,
+    responses((status = 204, description = "Applied to new connections"), (status = 404, description = "Unknown VM", body = ErrorBody)))]
 async fn set_policy<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
     Path(id): Path<String>,
-    Json(req): Json<PolicyReq>,
+    Json(req): Json<PolicyRequest>,
 ) -> Result<StatusCode, ApiError>
 where
     N: iso_common::network::NetworkManager + Send + Sync + 'static,
@@ -402,11 +473,18 @@ where
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(post, path = "/vms/{id}/forwards", tag = "vms", params(("id" = String, Path, description = "VM id, as a hyphenated UUID or 32 hex digits")),
+    request_body = AddForwardRequest,
+    responses(
+        (status = 200, description = "The forward, with its allocated host port", body = PortForward),
+        (status = 404, description = "Unknown VM", body = ErrorBody),
+        (status = 409, description = "No free host port", body = ErrorBody),
+    ))]
 async fn add_forward<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
     Path(id): Path<String>,
-    Json(req): Json<AddForwardReq>,
-) -> Result<Json<PortForwardDto>, ApiError>
+    Json(req): Json<AddForwardRequest>,
+) -> Result<Json<PortForward>, ApiError>
 where
     N: NetworkManager + Send + Sync + 'static,
     S: StorageManager + Send + Sync + 'static,
@@ -415,13 +493,16 @@ where
     let fwd = cp
         .add_forward(parse_id(&id)?, req.vm_port, proto_from(&req.proto))
         .await?;
-    Ok(Json(PortForwardDto {
+    Ok(Json(PortForward {
         host_port: fwd.host_port,
         vm_port: fwd.vm_port,
         proto: proto_to(fwd.proto),
     }))
 }
 
+#[utoipa::path(delete, path = "/vms/{id}/forwards/{host_port}", tag = "vms",
+    params(("id" = String, Path, description = "VM id, as a hyphenated UUID or 32 hex digits"), ("host_port" = u16, Path, description = "The allocated host port"), ProtoQuery),
+    responses((status = 204, description = "Closed"), (status = 404, description = "Unknown VM or forward", body = ErrorBody)))]
 async fn remove_forward<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
     Path((id, host_port)): Path<(String, u16)>,
@@ -437,14 +518,15 @@ where
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn stats<N, S, R>(State(cp): State<Cp<N, S, R>>) -> Result<Json<StatsResp>, ApiError>
+#[utoipa::path(get, path = "/stats", tag = "host", responses((status = 200, description = "Host capacity", body = Stats)))]
+async fn stats<N, S, R>(State(cp): State<Cp<N, S, R>>) -> Result<Json<Stats>, ApiError>
 where
     N: NetworkManager + Send + Sync + 'static,
     S: StorageManager + Send + Sync + 'static,
     R: VmRuntime + Send + Sync + 'static,
 {
     let s = cp.stats().await?;
-    Ok(Json(StatsResp {
+    Ok(Json(Stats {
         data_percent: s.pool.data_percent,
         metadata_percent: s.pool.metadata_percent,
         slots_used: s.slots_used,
@@ -479,6 +561,12 @@ async fn bounded<T>(limit: Duration, f: impl std::future::Future<Output = Result
     }
 }
 
+#[utoipa::path(get, path = "/vms/{id}/agent", tag = "guest", params(("id" = String, Path, description = "VM id, as a hyphenated UUID or 32 hex digits")),
+    responses(
+        (status = 200, description = "The guest agent answered", body = AgentInfo),
+        (status = 409, description = "The VM is not running", body = ErrorBody),
+        (status = 502, description = "No agent reachable in the guest", body = ErrorBody),
+    ))]
 async fn agent_info<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
     Path(id): Path<String>,
@@ -492,7 +580,16 @@ where
     Ok(Json(bounded(GUEST_IO_TIMEOUT, g.ping()).await?))
 }
 
-async fn exec<N, S, R>(
+#[utoipa::path(post, path = "/vms/{id}/exec", tag = "guest", params(("id" = String, Path, description = "VM id, as a hyphenated UUID or 32 hex digits")),
+    request_body = ExecRequest,
+    responses(
+        (status = 200, description = "The program ran (its exit status is in the body)", body = ExecResult),
+        (status = 400, description = "The agent refused: bad program, cwd, or request", body = ErrorBody),
+        (status = 409, description = "The VM is not running", body = ErrorBody),
+        (status = 502, description = "No agent reachable in the guest", body = ErrorBody),
+        (status = 504, description = "The agent did not answer in time", body = ErrorBody),
+    ))]
+async fn guest_exec<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
     Path(id): Path<String>,
     Json(req): Json<ExecRequest>,
@@ -510,6 +607,13 @@ where
     Ok(Json(bounded(limit, g.exec(req)).await?))
 }
 
+#[utoipa::path(get, path = "/vms/{id}/files", tag = "guest", params(("id" = String, Path, description = "VM id, as a hyphenated UUID or 32 hex digits"), PathQuery),
+    responses(
+        (status = 200, description = "The file, base64", body = FileContent),
+        (status = 400, description = "No such file, or not a regular file", body = ErrorBody),
+        (status = 409, description = "The VM is not running", body = ErrorBody),
+        (status = 502, description = "No agent reachable in the guest", body = ErrorBody),
+    ))]
 async fn read_file<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
     Path(id): Path<String>,
@@ -524,12 +628,20 @@ where
     Ok(Json(bounded(GUEST_IO_TIMEOUT, g.read_file(&q.path, q.max_bytes)).await?))
 }
 
+#[utoipa::path(put, path = "/vms/{id}/files", tag = "guest", params(("id" = String, Path, description = "VM id, as a hyphenated UUID or 32 hex digits"), PathQuery),
+    request_body = WriteFileRequest,
+    responses(
+        (status = 200, description = "Written", body = Written),
+        (status = 400, description = "Bad content, or the agent could not write there", body = ErrorBody),
+        (status = 409, description = "The VM is not running", body = ErrorBody),
+        (status = 502, description = "No agent reachable in the guest", body = ErrorBody),
+    ))]
 async fn write_file<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
     Path(id): Path<String>,
     Query(q): Query<PathQuery>,
-    Json(req): Json<WriteFileReq>,
-) -> Result<Json<WrittenResp>, ApiError>
+    Json(req): Json<WriteFileRequest>,
+) -> Result<Json<Written>, ApiError>
 where
     N: NetworkManager + Send + Sync + 'static,
     S: StorageManager + Send + Sync + 'static,
@@ -544,9 +656,16 @@ where
     };
     let mut g = guest(&cp, &id).await?;
     let bytes = bounded(GUEST_IO_TIMEOUT, g.write_file(&q.path, content_b64, req.mode, req.mkdir)).await?;
-    Ok(Json(WrittenResp { bytes }))
+    Ok(Json(Written { bytes }))
 }
 
+#[utoipa::path(delete, path = "/vms/{id}/files", tag = "guest", params(("id" = String, Path, description = "VM id, as a hyphenated UUID or 32 hex digits"), PathQuery),
+    responses(
+        (status = 204, description = "Removed"),
+        (status = 400, description = "No such path, or a directory without recursive", body = ErrorBody),
+        (status = 409, description = "The VM is not running", body = ErrorBody),
+        (status = 502, description = "No agent reachable in the guest", body = ErrorBody),
+    ))]
 async fn remove_path<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
     Path(id): Path<String>,
@@ -562,11 +681,18 @@ where
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(get, path = "/vms/{id}/dir", tag = "guest", params(("id" = String, Path, description = "VM id, as a hyphenated UUID or 32 hex digits"), PathQuery),
+    responses(
+        (status = 200, description = "The entries, sorted by name", body = DirListing),
+        (status = 400, description = "No such directory", body = ErrorBody),
+        (status = 409, description = "The VM is not running", body = ErrorBody),
+        (status = 502, description = "No agent reachable in the guest", body = ErrorBody),
+    ))]
 async fn list_dir<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
     Path(id): Path<String>,
     Query(q): Query<PathQuery>,
-) -> Result<Json<DirResp>, ApiError>
+) -> Result<Json<DirListing>, ApiError>
 where
     N: NetworkManager + Send + Sync + 'static,
     S: StorageManager + Send + Sync + 'static,
@@ -574,7 +700,35 @@ where
 {
     let mut g = guest(&cp, &id).await?;
     let entries = bounded(GUEST_IO_TIMEOUT, g.list_dir(&q.path)).await?;
-    Ok(Json(DirResp { entries }))
+    Ok(Json(DirListing { entries }))
+}
+
+/// The admin API's OpenAPI document, derived from the handlers above.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "iso admin API",
+        description = "Create Firecracker microVMs, set their egress policy, and reach the agent inside them. \
+            Served on the daemon's unix socket (root only) and on its TCP listener, where a client \
+            certificate issued by the host's admin CA (`isoctl admin issue-client`) is required.",
+        license(name = "MIT"),
+    ),
+    paths(create, list, get_one, start, stop, suspend, halt, destroy, set_policy, add_forward, remove_forward,
+        register_template, stats, agent_info, guest_exec, read_file, write_file, remove_path, list_dir),
+    components(schemas(ErrorBody, PortForward, CreateVmRequest, CreatedVm, AddForwardRequest, Vm, PolicyRequest,
+        WriteFileRequest, Written, DirListing, Stats, TemplateRequest,
+        ExecRequest, ExecResult, AgentInfo, FileContent, DirEntry, iso_guest_proto::FileKind)),
+    tags(
+        (name = "vms", description = "VM lifecycle, policy and port forwards"),
+        (name = "guest", description = "Run programs and move files inside a VM through its agent"),
+        (name = "templates", description = "Baked templates VMs are cloned from"),
+        (name = "host", description = "Host capacity"),
+    )
+)]
+pub struct ApiDoc;
+
+async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
+    Json(ApiDoc::openapi())
 }
 
 /// Build the admin router over a control plane.
@@ -598,7 +752,7 @@ where
             delete(remove_forward::<N, S, R>),
         )
         .route("/vms/{id}/agent", get(agent_info::<N, S, R>))
-        .route("/vms/{id}/exec", post(exec::<N, S, R>))
+        .route("/vms/{id}/exec", post(guest_exec::<N, S, R>))
         .route(
             "/vms/{id}/files",
             get(read_file::<N, S, R>).put(write_file::<N, S, R>).delete(remove_path::<N, S, R>),
@@ -606,6 +760,7 @@ where
         .route("/vms/{id}/dir", get(list_dir::<N, S, R>))
         .route("/templates", post(register_template::<N, S, R>))
         .route("/stats", get(stats::<N, S, R>))
+        .route("/openapi.json", get(openapi_json))
         .with_state(cp)
 }
 
@@ -920,5 +1075,75 @@ mod guest_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT, "stopped vm has no guest channel");
+    }
+}
+
+#[cfg(test)]
+mod openapi_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Every `(method, path)` the router serves, read from this file's
+    /// `.route(...)` calls so the test needs no hand-kept list.
+    fn routes_in_source() -> BTreeSet<(String, String)> {
+        let src = include_str!("http.rs");
+        let mut out = BTreeSet::new();
+        for chunk in src.split(".route(").skip(1) {
+            let path = chunk.split('"').nth(1).unwrap_or_default().to_string();
+            let call = chunk.split(".route(").next().unwrap_or_default();
+            let call = call.split(".with_state").next().unwrap_or_default();
+            for verb in ["get", "post", "put", "patch", "delete"] {
+                if call.contains(&format!("{verb}(")) {
+                    out.insert((verb.to_uppercase(), path.clone()));
+                }
+            }
+        }
+        out.remove(&("GET".into(), "/openapi.json".into()));
+        out
+    }
+
+    #[test]
+    fn document_covers_exactly_the_routes_the_router_serves() {
+        let doc: serde_json::Value = serde_json::from_str(&ApiDoc::openapi().to_json().unwrap()).unwrap();
+        let mut documented = BTreeSet::new();
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            for verb in item.as_object().unwrap().keys() {
+                documented.insert((verb.to_uppercase(), path.clone()));
+            }
+        }
+        let served = routes_in_source();
+        let missing: Vec<_> = served.difference(&documented).collect();
+        let extra: Vec<_> = documented.difference(&served).collect();
+        assert!(missing.is_empty(), "routes without an OpenAPI operation: {missing:?}");
+        assert!(extra.is_empty(), "documented operations with no route: {extra:?}");
+        assert_eq!(served.len(), 19, "operation count; update when routes change on purpose");
+    }
+
+    #[test]
+    fn document_is_openapi_3_0_for_the_client_generator() {
+        let json = ApiDoc::openapi().to_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["openapi"].as_str().unwrap().starts_with("3.0"), "progenitor reads OpenAPI 3.0.x");
+        assert!(v["components"]["schemas"]["ExecRequest"].is_object());
+    }
+
+    /// The copy the client crate is generated from must match the code.
+    #[test]
+    fn checked_in_document_matches_the_code() {
+        let current: serde_json::Value = serde_json::from_str(&ApiDoc::openapi().to_json().unwrap()).unwrap();
+        let checked_in: serde_json::Value =
+            serde_json::from_str(include_str!("../../iso-client/openapi.json")).unwrap();
+        assert_eq!(checked_in, current, "crates/iso-client/openapi.json is stale: run scripts/gen-client.sh");
+    }
+
+    #[tokio::test]
+    async fn openapi_json_is_served() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let resp = tests::app().oneshot(Request::get("/openapi.json").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = tests::body_json(resp).await;
+        assert_eq!(v["info"]["title"], "iso admin API");
     }
 }

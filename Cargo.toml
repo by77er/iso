@@ -15,6 +15,7 @@ members = [
     "crates/iso-guest-proto",
     "crates/iso-guest-agent",
     "crates/iso-admin-pki",
+    "crates/iso-client",
 ]
 
 [workspace.package]

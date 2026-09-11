@@ -87,6 +87,7 @@ pub enum Request {
 
 /// `exec` parameters.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ExecRequest {
     /// Program to run, resolved on the guest's `PATH`.
     pub cmd: String,
@@ -153,6 +154,7 @@ pub enum ResponseBody {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AgentInfo {
     pub agent: String,
     pub version: String,
@@ -162,6 +164,7 @@ pub struct AgentInfo {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ExecResult {
     /// The process exit code, or `None` if it was killed by a signal.
     pub exit_code: Option<i32>,
@@ -180,6 +183,7 @@ pub struct ExecResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct FileContent {
     pub path: String,
     /// Total size of the file on disk.
@@ -189,6 +193,7 @@ pub struct FileContent {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct DirEntry {
     pub name: String,
     pub kind: FileKind,
@@ -198,6 +203,7 @@ pub struct DirEntry {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct FileStat {
     pub path: String,
     pub kind: FileKind,
@@ -210,6 +216,7 @@ pub struct FileStat {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FileKind {
     File,

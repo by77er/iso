@@ -9,6 +9,11 @@ description = "Wire protocol between the iso host and the guest agent, plus a ho
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.52.3", features = ["io-util"] }
+utoipa = { version = "4", optional = true }
+
+[features]
+# OpenAPI schemas for the types the admin API exposes; off inside the guest.
+openapi = ["dep:utoipa"]
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["io-util", "macros", "rt", "net"] }
