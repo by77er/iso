@@ -150,6 +150,15 @@ pi
 
 Without `ISO_SERVER` or credentials the extension leaves pi's tools local. `/iso` shows the VM, `ISO_KEEP=1` keeps it, `--no-iso` opts out for one run. `node contrib/pi/test/run.mjs` exercises the extension against a mock of the admin API.
 
+## Master web console
+
+[`iso-master`](contrib/master/README.md) is an agent-first Rust/Axum server with a
+React UI. Create an agent and chat with headless pi; the master places its microVM
+across multiple mTLS control planes, persists its session, and suspends/wakes its
+workspace on demand. Includes a two-plane demo, explicit recovery state machine,
+and authenticated operator console. This is a single-operator prototype, not a
+multi-tenant authorization layer or HA scheduler.
+
 ## Admin API
 
 Served on `$ISO_STATE_DIR/control.sock` (root only) and on TCP port 7070 of the host's primary IP with mutual TLS: the daemon keeps a CA of its own and `isoctl admin issue-client` mints certificates for it. The OpenAPI document is generated from the handlers and served at `/openapi.json`; `crates/iso-client` is generated from it, and `isoctl vm` wraps that. [docs/admin-api.md](docs/admin-api.md) has the details. JSON in, JSON out.

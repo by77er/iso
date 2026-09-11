@@ -102,6 +102,10 @@ impl Client {
             // Trust the admin CA and nothing else.
             .tls_certs_only([ca])
             .identity(identity)
+            // Admin traffic must not follow redirects or ambient web proxies.
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| SetupError::Tls(e.to_string()))?;
         Ok(Self::new_with_client(base_url.trim_end_matches('/'), http))

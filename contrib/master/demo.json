@@ -1,0 +1,14 @@
+{
+  "demo": true,
+  "pi_model": "demo/planner",
+  "pi_models": ["demo/planner", "demo/worker"],
+  "bind": "127.0.0.1:8080",
+  "public_origin": "http://127.0.0.1:8080",
+  "secure_cookie": false,
+  "data_dir": "state/master-demo",
+  "idle_seconds": 900,
+  "planes": [
+    { "id": "east", "server": "demo", "creds": "unused", "template": "debian" },
+    { "id": "west", "server": "demo", "creds": "unused", "template": "debian" }
+  ]
+}
