@@ -1,0 +1,40 @@
+{
+  "bind": "127.0.0.1:8080",
+  "public_origin": "https://agents.example.com",
+  "secure_cookie": true,
+  "data_dir": "state/master",
+  "ui_dir": "contrib/master/dist",
+  "pi_bin": "contrib/master/node_modules/.bin/pi",
+  "pi_extension": "contrib/master/pi/remote-tools.ts",
+  "pi_model": "anthropic/claude-sonnet-4-5",
+  "pi_env_file": "/etc/iso-master/provider-env.json",
+  "idle_seconds": 900,
+  "max_agents": 16,
+  "planes": [
+    {
+      "id": "east",
+      "server": "https://10.10.0.5:7070",
+      "creds": "/etc/iso-master/creds/east",
+      "client": "orchestrator",
+      "template": "debian",
+      "egress": "proxy",
+      "principal": "alice",
+      "allow": [
+        "github.com",
+        "api.github.com",
+        "deb.debian.org",
+        "security.debian.org"
+      ],
+      "max_vms": 32
+    },
+    {
+      "id": "west",
+      "server": "https://10.20.0.5:7070",
+      "creds": "/etc/iso-master/creds/west",
+      "client": "orchestrator",
+      "template": "debian",
+      "egress": "deny",
+      "max_vms": 32
+    }
+  ]
+}
