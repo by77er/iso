@@ -170,11 +170,14 @@ pub async fn run(v: Vm) -> R<()> {
     match v.cmd {
         VmCmd::List => {
             let vms = c.list().send().await?.into_inner();
-            #[allow(clippy::print_literal)]
-            println!("{:<36}  {:<9}  {:<12}  {:<6}  {}", "ID", "STATE", "TEMPLATE", "EGRESS", "NAME");
+            let columns = [("ID", 36), ("STATE", 9), ("TEMPLATE", 12), ("EGRESS", 6)];
+            let header: String = columns.iter().map(|(name, width)| format!("{name:<width$}  ")).collect();
+            println!("{header}NAME");
             for vm in vms {
                 let name = vm.labels.get("name").cloned().unwrap_or_default();
-                println!("{:<36}  {:<9}  {:<12}  {:<6}  {}", vm.id, vm.state, vm.template, vm.egress, name);
+                let cells = [(&vm.id, 36), (&vm.state, 9), (&vm.template, 12), (&vm.egress, 6)];
+                let row: String = cells.iter().map(|(value, width)| format!("{value:<width$}  ")).collect();
+                println!("{row}{name}");
             }
         }
         VmCmd::Get { id } => {
