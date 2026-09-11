@@ -44,7 +44,7 @@ Not TLS, or no SNI: dropped. SNI not on the allow-list: reset. Request host that
 | `iso-admin-pki` | The admin API's own CA: server certificate and client certificates for mutual TLS. |
 | `iso-client` | Rust client for the admin API, generated from its OpenAPI document. |
 | `iso-cli` | `isoctl`: bake templates, issue admin client certificates, and drive VMs (`isoctl vm create`, `exec`, `cat`, `put`, …). |
-| `image/` | The guest image, built by the repository's flake (`nix build .#toplevel`): a stripped Firecracker kernel with vsock, and a lean NixOS rootfs with sshd, a `coder` user and the guest agent. |
+| `image/` | The guest images. The flake builds a stripped Firecracker kernel with vsock and a lean NixOS rootfs (`nix build .#toplevel`); `image/debian/build-rootfs.sh` builds a stock Debian rootfs with `mmdebstrap` for agents that expect apt. Both run sshd, a `coder` user and the guest agent. |
 
 Design notes with the full reasoning: [`crates/iso-network-manager/DESIGN.md`](crates/iso-network-manager/DESIGN.md) and [`crates/iso-proxy/DESIGN.md`](crates/iso-proxy/DESIGN.md).
 
@@ -134,7 +134,9 @@ sudo curl -s --unix-socket state/control.sock -H 'content-type: application/json
 
 Inside the guest, `curl https://api.github.com/user` just works. No token in the environment, no `gh auth login`.
 
-`scripts/iso-up.sh` brings the whole stack up idempotently and is safe to run on every boot. `ISO_JAILER=1` in its environment (or the daemon's) runs every VM under Firecracker's jailer.
+Agents tend to expect a stock distribution. `isoctl bake --distro debian --name debian` bakes one instead of NixOS: a Debian (`--debian-suite`, default `trixie`) built by `mmdebstrap` on the flake's kernel, with the same user, sshd, resolver, proxy CA and guest agent, so `sudo apt install` works through the proxy once `deb.debian.org` and `security.debian.org` are on the VM's allow-list. It needs `mmdebstrap` on the host (`apt install mmdebstrap`).
+
+`scripts/iso-up.sh` brings the whole stack up idempotently and is safe to run on every boot; it registers every template `isoctl bake` left under `state/templates/`. `ISO_JAILER=1` in its environment (or the daemon's) runs every VM under Firecracker's jailer.
 
 ## Admin API
 

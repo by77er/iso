@@ -686,6 +686,121 @@ mod tests {
         panic!("guest agent in {vm} never answered: {last}");
     }
 
+    /// A stock Debian rootfs built by image/debian/build-rootfs.sh, packed
+    /// with `mkfs.ext4 -d`. Needs mmdebstrap, root, network, and the static
+    /// agent (`ISO_TEST_AGENT_STATIC`, or `nix build .#iso-guest-agent-static`).
+    fn make_debian_rootfs(path: &str, agent: &Path) -> bool {
+        if P::new("mmdebstrap").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: mmdebstrap not on PATH");
+            return false;
+        }
+        let stage = PathBuf::from(format!("{path}.stage"));
+        let _ = std::fs::remove_dir_all(&stage);
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../image/debian/build-rootfs.sh");
+        let ok = P::new("bash")
+            .arg(&script)
+            .env("ROOTFS_DIR", &stage)
+            .env("AGENT_BIN", agent)
+            .env("MODE", "root")
+            .env("SUITE", std::env::var("ISO_TEST_DEBIAN_SUITE").unwrap_or_else(|_| "trixie".into()))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "build-rootfs.sh failed");
+        let _ = std::fs::remove_file(path);
+        assert!(sh(&["truncate", "-s", "2G", path]));
+        assert!(sh(&["mkfs.ext4", "-F", "-q", "-d", stage.to_str().unwrap(), path]));
+        let _ = std::fs::remove_dir_all(&stage);
+        true
+    }
+
+    /// Boot a stock Debian guest on the flake's kernel, with systemd as init
+    /// and the agent as a unit, and use it the way an agent would: run apt,
+    /// read os-release, write a file. Self-skips unless root with a kernel,
+    /// mmdebstrap and the static agent.
+    #[tokio::test]
+    async fn live_debian_guest_runs_apt_through_the_agent() {
+        if !is_root() {
+            eprintln!("skipping live_debian_guest_runs_apt_through_the_agent: requires root + KVM");
+            return;
+        }
+        let Some(kernel) = find_kernel() else {
+            eprintln!("skipping: no firecracker vmlinux found (set ISO_TEST_KERNEL)");
+            return;
+        };
+        let Ok(agent) = std::env::var("ISO_TEST_AGENT_STATIC").map(PathBuf::from) else {
+            eprintln!("skipping: set ISO_TEST_AGENT_STATIC to a static iso-guest-agent (nix build .#iso-guest-agent-static)");
+            return;
+        };
+
+        let netns = "fcdebian";
+        let base = PathBuf::from("/var/tmp/iso-fc-debian");
+        let rootfs = "/var/tmp/iso-fc-debian/rootfs.ext4";
+        let cfg = Config {
+            bin: std::env::var("ISO_TEST_FC").unwrap_or_else(|_| "firecracker".into()).into(),
+            socket_dir: base.join("sock"),
+            state_dir: base.join("state"),
+            netns_dir: "/var/run/netns".into(),
+            boot_timeout: Duration::from_secs(10),
+            jailer: JailerConfig::from_env(&base),
+        };
+        let rt = FirecrackerRuntime::new(cfg.clone());
+        let vm = VmId::from_u128(0xdeb);
+        let _ = rt.destroy(vm).await;
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        setup_netns(netns, cfg.jailer.as_ref().map(|j| (j.uid, j.gid)));
+        if !make_debian_rootfs(rootfs, &agent) {
+            return;
+        }
+
+        let spec = InstanceSpec {
+            vm,
+            netns: netns.into(),
+            tap: "tap0".into(),
+            mac: MacAddr([0x02, 0, 0, 0, 0xde, 0xb1]),
+            rootfs_device: rootfs.into(),
+            vcpus: 2,
+            mem_mib: 1024,
+            kernel,
+            boot_args: "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/sbin/init".into(),
+            resume_from: None,
+            rootfs_backing: None,
+            vsock_cid: Some(3),
+        };
+        rt.create(&spec).await.expect("create");
+        rt.start(vm).await.expect("start");
+        let info = wait_agent(&rt, vm).await;
+        assert_eq!(info.hostname, "iso-guest");
+        assert_eq!(info.uid, 1000, "the unit runs the agent as coder");
+
+        let mut c = agent_client(&rt, vm).await.unwrap();
+        let run = |cmd: &str| iso_guest_proto::ExecRequest {
+            cmd: "sh".into(),
+            args: vec!["-c".into(), cmd.into()],
+            timeout_ms: Some(60_000),
+            ..Default::default()
+        };
+        let r = c.exec(run(". /etc/os-release; echo $ID; systemctl is-system-running || true; whoami")).await.unwrap();
+        assert_eq!(r.exit_code, Some(0), "{r:?}");
+        let out: Vec<&str> = r.stdout.lines().collect();
+        assert_eq!(out[0], "debian");
+        assert!(matches!(out[1], "running" | "degraded" | "starting"), "systemd state: {}", out[1]);
+        assert_eq!(out[2], "coder");
+        // apt itself works offline; installing needs egress this test has none of.
+        let r = c.exec(run("sudo -n apt-get --version | head -1 && test -f /etc/apt/sources.list && grep -c https /etc/apt/sources.list")).await.unwrap();
+        assert_eq!(r.exit_code, Some(0), "{r:?}");
+        assert!(r.stdout.starts_with("apt "), "{r:?}");
+        let r = c.exec(run("cat /etc/resolv.conf; test -f /etc/iso/AGENTS.md && echo notes")).await.unwrap();
+        assert!(r.stdout.contains("172.22.0.1") && r.stdout.contains("notes"), "{r:?}");
+        assert_eq!(c.write_file("/home/coder/hello.txt", "aGk=".into(), None, false).await.unwrap(), 2);
+        drop(c);
+
+        rt.destroy(vm).await.expect("destroy");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = sh(&["ip", "netns", "del", netns]);
+    }
+
     /// Boot a rootfs whose init is the guest agent, talk to it over vsock,
     /// snapshot, resume a clone under a different VM id, and talk to the clone:
     /// the relative `v.sock` path recorded in the snapshot must resolve to the

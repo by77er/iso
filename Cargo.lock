@@ -1187,6 +1187,7 @@ name = "iso-firecracker"
 version = "0.1.0"
 dependencies = [
  "iso-common",
+ "iso-guest-proto",
  "libc",
  "serde_json",
  "tokio",

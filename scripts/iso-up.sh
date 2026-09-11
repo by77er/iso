@@ -4,8 +4,7 @@
 #
 # Env: ISO_STATE_DIR (default <repo>/state), ISO_VG (default iso), ISO_UPLINK
 # (default: controld detects the default-route interface), ISO_BIN_DIR (default
-# <repo>/target/debug), ISO_TEMPLATES ("name:vcpus:mem_mib ...", default
-# "base:1:512").
+# <repo>/target/debug).
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,25 +34,15 @@ fi
 # TLS; remote clients get a certificate from `isoctl admin issue-client`.)
 api() { sudo -n curl -s --unix-socket "$SOCK" "$@"; }
 
-# --- register baked templates (idempotent upsert by name). Each entry in
-#     ISO_TEMPLATES is "name:vcpus:mem_mib"; vcpus/mem MUST match what
-#     `isoctl bake --name <name>` was run with, since a Firecracker snapshot
-#     only resumes with the same machine size. The rootfs LV is tpl_<name> and
-#     the snapshot is state/templates/<name>; entries that aren't baked yet are
-#     skipped. ---
-KERNEL="$(nix build "$REPO#kernel" --no-link --print-out-paths 2>/dev/null)/vmlinux"
-BOOTARGS="console=ttyS0 reboot=k panic=1 acpi=off quiet loglevel=3 root=/dev/vda rootfstype=ext4 rw ip=172.20.0.1::172.20.0.0:255.255.255.254::eth0:off init=/nix/var/nix/profiles/system/init"
-for spec in ${ISO_TEMPLATES:-base:1:512}; do
-  IFS=: read -r name vcpus mem <<<"$spec"
-  if [ -f "$STATE/templates/$name/vmstate" ]; then
-    code=$(api -o /dev/null -w '%{http_code}' \
-      -H 'content-type: application/json' \
-      -d "{\"name\":\"$name\",\"rootfs_template\":\"$name\",\"snapshot_mem\":\"$STATE/templates/$name/mem\",\"snapshot_vmstate\":\"$STATE/templates/$name/vmstate\",\"vcpus\":$vcpus,\"mem_mib\":$mem,\"kernel\":\"$KERNEL\",\"boot_args\":\"$BOOTARGS\"}" \
-      http://x/templates)
-    echo "[iso-up] template '$name' registered ($code)"
-  else
-    echo "[iso-up] template '$name' not baked yet (no $STATE/templates/$name/vmstate); skipping"
-  fi
+# --- register baked templates (idempotent upsert by name). `isoctl bake`
+#     leaves its registration beside each snapshot as
+#     state/templates/<name>/template.json, with the kernel, machine size and
+#     boot arguments the template was baked with. ---
+for reg in "$STATE"/templates/*/template.json; do
+  [ -f "$reg" ] || continue
+  name=$(basename "$(dirname "$reg")")
+  code=$(api -o /dev/null -w '%{http_code}' -H 'content-type: application/json' -d @"$reg" http://x/templates)
+  echo "[iso-up] template '$name' registered ($code)"
 done
 
 # --- egress proxy stack (root): CA minter, secret provider, MITM proxy.

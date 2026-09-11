@@ -68,6 +68,21 @@ struct Bake {
     /// Template name (rootfs LV `tpl_<name>` + snapshot dir).
     #[arg(long)]
     name: String,
+    /// What fills the rootfs: `nixos` (the flake's image) or `debian` (a stock
+    /// Debian built by image/debian/build-rootfs.sh with mmdebstrap; agents get
+    /// apt). Both boot the flake's kernel and run the guest agent.
+    #[arg(long, default_value = "nixos", value_parser = ["nixos", "debian"])]
+    distro: String,
+    /// Debian suite for `--distro debian`.
+    #[arg(long, default_value = "trixie")]
+    debian_suite: String,
+    /// Pin `--distro debian` to a snapshot.debian.org timestamp (e.g.
+    /// 20260901T000000Z) for reproducible bytes.
+    #[arg(long)]
+    debian_snapshot: Option<String>,
+    /// Extra Debian packages, comma-separated.
+    #[arg(long)]
+    debian_packages: Option<String>,
     /// The flake providing #kernel, #toplevel and #nixos-install-tools: this
     /// repository. Given as a plain path, so a git checkout contributes only
     /// its tracked files (a new module must be `git add`ed to be seen).
@@ -279,11 +294,20 @@ async fn bake(b: Bake) -> R<()> {
         return Err("bake must run as root (LVM, netns, KVM)".into());
     }
 
-    eprintln!("[bake] building image from flake {}", b.flake);
+    eprintln!("[bake] building {} image from flake {}", b.distro, b.flake);
     let kernel = PathBuf::from(nix_build(&b.flake, "kernel")?).join("vmlinux");
-    let toplevel = nix_build(&b.flake, "toplevel")?;
-    let nixos_install = format!("{}/bin/nixos-install", nix_build(&b.flake, "nixos-install-tools")?);
-    eprintln!("[bake] kernel={} toplevel={}", kernel.display(), toplevel);
+    let debian = b.distro == "debian";
+    // NixOS: the system closure and the installer. Debian: the static agent
+    // the rootfs script copies in.
+    let (toplevel, nixos_install, agent) = if debian {
+        let agent = format!("{}/bin/iso-guest-agent", nix_build(&b.flake, "iso-guest-agent-static")?);
+        (String::new(), String::new(), agent)
+    } else {
+        let toplevel = nix_build(&b.flake, "toplevel")?;
+        let nixos_install = format!("{}/bin/nixos-install", nix_build(&b.flake, "nixos-install-tools")?);
+        (toplevel, nixos_install, String::new())
+    };
+    eprintln!("[bake] kernel={}", kernel.display());
 
     // --- storage: backing pool + rootfs LV, install the system into it ---
     let scfg = iso_storage_manager::Config {
@@ -303,14 +327,18 @@ async fn bake(b: Bake) -> R<()> {
         eprintln!("[bake] --skip-install: re-using existing rootfs {}", dev.display());
     } else {
         storage.create_template(&b.name, &b.size).await?;
-        eprintln!("[bake] mkfs + nixos-install onto {}", dev.display());
+        eprintln!("[bake] mkfs + {} onto {}", if debian { "mmdebstrap" } else { "nixos-install" }, dev.display());
         run(&["mkfs.ext4", "-F", "-q", &dev.to_string_lossy()])?;
         let mnt = run_out(&["mktemp", "-d"])?;
         run(&["mount", &dev.to_string_lossy(), &mnt])?;
-        let install = run(&[
-            &nixos_install, "--root", &mnt, "--system", &toplevel,
-            "--no-bootloader", "--no-root-passwd", "--no-channel-copy",
-        ]);
+        let install = if debian {
+            debian_rootfs(&b, &mnt, &agent)
+        } else {
+            run(&[
+                &nixos_install, "--root", &mnt, "--system", &toplevel,
+                "--no-bootloader", "--no-root-passwd", "--no-channel-copy",
+            ])
+        };
         run(&["sync"]).ok();
         let _ = run(&["umount", "-R", &mnt]);
         install?;
@@ -362,10 +390,11 @@ async fn bake(b: Bake) -> R<()> {
     let builder = VmId::from_u128(0xba6e_0000_0000_0000_0000_0000_0000_0001);
     let inner_vm = ncfg.inner_vm;
     let gw = ncfg.inner_tap;
+    let init = if debian { "/sbin/init" } else { "/nix/var/nix/profiles/system/init" };
     let boot_args = format!(
         "console=ttyS0 reboot=k panic=1 acpi=off quiet loglevel=3 \
          root=/dev/vda rootfstype=ext4 rw ip={inner_vm}::{gw}:255.255.255.254::eth0:off \
-         init=/nix/var/nix/profiles/system/init"
+         init={init}"
     );
     let spec = InstanceSpec {
         vm: builder,
@@ -407,6 +436,11 @@ async fn bake(b: Bake) -> R<()> {
     // sanity: the SnapshotRef shape the control plane consumes.
     let _ = SnapshotRef { mem_file: snap_mem.clone(), vmstate: snap_vmstate.clone() };
 
+    // Keep the registration beside the snapshot: iso-up.sh posts it on boot.
+    let saved = b.state.join("templates").join(&b.name).join("template.json");
+    std::fs::write(&saved, serde_json::to_string_pretty(&reg)?)?;
+    eprintln!("[bake] registration saved to {}", saved.display());
+
     println!("{}", serde_json::to_string_pretty(&reg)?);
     eprintln!(
         "[bake] done. Register with:\n  curl -s --unix-socket {}/control.sock \
@@ -415,6 +449,44 @@ async fn bake(b: Bake) -> R<()> {
         serde_json::to_string_pretty(&reg)?
     );
     Ok(())
+}
+
+/// Fill a mounted volume with a stock Debian through image/debian/build-rootfs.sh,
+/// found next to the flake. The script needs mmdebstrap on PATH.
+fn debian_rootfs(b: &Bake, mnt: &str, agent: &str) -> R<()> {
+    let flake_abs = std::fs::canonicalize(&b.flake).unwrap_or_else(|_| PathBuf::from(&b.flake));
+    let script = flake_abs.join("image/debian/build-rootfs.sh");
+    if !script.exists() {
+        return Err(format!("{} not found (is --flake the repository?)", script.display()).into());
+    }
+    let mut cmd = Command::new("bash");
+    cmd.arg(&script)
+        .env("ROOTFS_DIR", mnt)
+        .env("AGENT_BIN", agent)
+        .env("SUITE", &b.debian_suite)
+        .env("MODE", "root");
+    let keys = flake_abs.join("image/keys/authorized_keys");
+    if keys.exists() {
+        cmd.env("AUTHORIZED_KEYS", &keys);
+    }
+    // Trust this host's egress-proxy CA when it exists, as the NixOS image does
+    // with image/ca.crt.
+    let ca = b.state.join("ca/ca.crt");
+    if ca.exists() {
+        cmd.env("CA_CERT", &ca);
+    }
+    if let Some(snap) = &b.debian_snapshot {
+        cmd.env("SNAPSHOT", snap);
+    }
+    if let Some(extra) = &b.debian_packages {
+        cmd.env("EXTRA_PACKAGES", extra);
+    }
+    let st = cmd.status()?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(format!("build-rootfs.sh failed ({st})").into())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

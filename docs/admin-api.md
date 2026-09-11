@@ -128,6 +128,25 @@ Semantics worth knowing:
 `iso-guest-agent --listen-tcp 127.0.0.1:5000` serves the same protocol over
 TCP for debugging outside a VM.
 
+### Guest flavors
+
+The host provides a kernel, a block device, a TAP, a vsock and boot
+arguments, and nothing about it depends on the userland inside. Two rootfs
+flavors ship, both with the `coder` user, sshd, the resolver, the proxy CA and
+the agent:
+
+| Flavor | Built by | Init | For |
+| --- | --- | --- | --- |
+| `nixos` (default) | the flake, `nix build .#toplevel` | NixOS stage 2 | reproducible, minimal, declarative |
+| `debian` | `image/debian/build-rootfs.sh` via `mmdebstrap`, at bake time | systemd | agents that expect apt and the usual file layout |
+
+`isoctl bake --distro debian --debian-suite trixie [--debian-snapshot 20260901T000000Z] [--debian-packages a,b]`
+builds the Debian one; apt mirrors are `https://` because the proxy passes only
+TLS, so a VM that should install packages needs `deb.debian.org` and
+`security.debian.org` on its allow-list. The static agent binary comes from
+`nix build .#iso-guest-agent-static`. `bake` saves every registration as
+`state/templates/<name>/template.json`, which `iso-up.sh` posts on boot.
+
 ## Running VMs under the jailer
 
 `ISO_JAILER=1` makes the daemon (and `isoctl bake`) launch every VM through
