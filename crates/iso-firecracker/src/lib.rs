@@ -306,7 +306,7 @@ impl FirecrackerRuntime {
         let mut last_err = String::from("socket not present yet");
         while Instant::now() < deadline {
             if socket.exists() {
-                match tokio::net::UnixStream::connect(&socket).await {
+                match client::connect(&socket).await {
                     Ok(_) => return Ok(()),
                     Err(e) => last_err = e.to_string(),
                 }
@@ -498,7 +498,7 @@ impl VmRuntime for FirecrackerRuntime {
     async fn guest_channel(&self, vm: VmId, port: u32) -> Result<OwnedFd> {
         let path = self.vsock_path(vm);
         let connect = async {
-            let mut s = tokio::net::UnixStream::connect(&path).await.map_err(|e| {
+            let mut s = client::connect(&path).await.map_err(|e| {
                 Error::Backend(format!(
                     "connect to vsock socket {}: {e} (a template baked without a vsock device has none)",
                     path.display()

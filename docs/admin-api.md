@@ -143,7 +143,9 @@ Firecracker sees is the same for every VM, which is what a snapshot needs.
 Requirements: the jail directory must not be on a `nodev` mount (`/tmp` is
 often a tmpfs mounted that way; the symptom is "Permission denied" opening
 `/dev/net/tun` or `/dev/kvm` inside the jail), and the `jailer` binary must
-match the Firecracker version. Templates baked without
+match the Firecracker version. Jail paths run long, past the 107-byte unix
+socket limit with most state directories; the daemon connects to a jailed
+VM's sockets through `/proc/self/fd`, so that limit does not apply to it. Templates baked without
 the jailer still resume under it; templates baked under it record only
 jail-relative paths. A VM's jail is removed on destroy.
 
