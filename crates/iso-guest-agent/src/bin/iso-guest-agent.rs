@@ -4,8 +4,17 @@
 
 use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
+/// The stderr macro panics when stderr is closed, and this process may be
+/// PID 1 of a bare test image with no console. Log on a best-effort basis.
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 fn usage() -> ! {
-    eprintln!("usage: iso-guest-agent [--port N] [--listen-tcp ADDR]");
+    log!("usage: iso-guest-agent [--port N] [--listen-tcp ADDR]");
     std::process::exit(2)
 }
 
@@ -27,17 +36,17 @@ async fn main() {
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("iso-guest-agent: bind {addr}: {e}");
+                log!("iso-guest-agent: bind {addr}: {e}");
                 std::process::exit(1);
             }
         };
-        eprintln!("iso-guest-agent: serving on tcp {addr}");
+        log!("iso-guest-agent: serving on tcp {addr}");
         loop {
             match listener.accept().await {
                 Ok((s, _)) => {
                     tokio::spawn(iso_guest_agent::serve_connection(s));
                 }
-                Err(e) => eprintln!("iso-guest-agent: accept: {e}"),
+                Err(e) => log!("iso-guest-agent: accept: {e}"),
             }
         }
     }
@@ -45,17 +54,17 @@ async fn main() {
     let listener = match VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("iso-guest-agent: bind vsock port {port}: {e}");
+            log!("iso-guest-agent: bind vsock port {port}: {e}");
             std::process::exit(1);
         }
     };
-    eprintln!("iso-guest-agent: serving on vsock port {port}");
+    log!("iso-guest-agent: serving on vsock port {port}");
     loop {
         match listener.accept().await {
             Ok((s, _)) => {
                 tokio::spawn(iso_guest_agent::serve_connection(s));
             }
-            Err(e) => eprintln!("iso-guest-agent: accept: {e}"),
+            Err(e) => log!("iso-guest-agent: accept: {e}"),
         }
     }
 }

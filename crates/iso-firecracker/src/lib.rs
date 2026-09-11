@@ -585,6 +585,182 @@ mod tests {
         assert!(sh(&["mkfs.ext4", "-F", "-q", path]));
     }
 
+    /// The guest agent binary: `ISO_TEST_AGENT`, or the workspace's debug build.
+    fn find_agent() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("ISO_TEST_AGENT") {
+            return Some(p.into());
+        }
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/iso-guest-agent");
+        p.exists().then_some(p)
+    }
+
+    /// An ext4 rootfs whose `/init` is the guest agent, with the shared
+    /// libraries it links and an `/etc/hostname`. Populated with
+    /// `mkfs.ext4 -d`, so it needs no mount. The kernel mounts devtmpfs on the
+    /// empty `/dev` before running init, which gives the agent a console.
+    fn make_agent_rootfs(path: &str, agent: &Path) {
+        let stage = PathBuf::from(format!("{path}.stage"));
+        let _ = std::fs::remove_dir_all(&stage);
+        for d in ["etc", "tmp", "dev", "proc", "sys", "lib64", "lib/x86_64-linux-gnu"] {
+            std::fs::create_dir_all(stage.join(d)).unwrap();
+        }
+        std::fs::copy(agent, stage.join("init")).expect("copy agent");
+        let libs = P::new("ldd").arg(agent).output().expect("ldd");
+        for line in String::from_utf8_lossy(&libs.stdout).lines() {
+            let lib = line.split_whitespace().find(|w| w.starts_with('/'));
+            if let Some(lib) = lib {
+                let dst = stage.join(lib.trim_start_matches('/'));
+                std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+                std::fs::copy(lib, &dst).unwrap_or_else(|e| panic!("copy {lib}: {e}"));
+            }
+        }
+        std::fs::write(stage.join("etc/hostname"), "fctest\n").unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(sh(&["truncate", "-s", "256M", path]));
+        assert!(sh(&["mkfs.ext4", "-F", "-q", "-d", stage.to_str().unwrap(), path]));
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    /// Open the guest agent through the VMM's channel.
+    async fn agent_client(
+        rt: &FirecrackerRuntime,
+        vm: VmId,
+    ) -> Result<iso_guest_proto::GuestClient<tokio::net::UnixStream>> {
+        let fd = rt.guest_channel(vm, iso_guest_proto::DEFAULT_PORT).await?;
+        let std = std::os::unix::net::UnixStream::from(fd);
+        std.set_nonblocking(true).map_err(be)?;
+        Ok(iso_guest_proto::GuestClient::new(tokio::net::UnixStream::from_std(std).map_err(be)?))
+    }
+
+    /// Poll until the agent inside `vm` answers a ping.
+    async fn wait_agent(rt: &FirecrackerRuntime, vm: VmId) -> iso_guest_proto::AgentInfo {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            match agent_client(rt, vm).await {
+                Ok(mut c) => match c.ping().await {
+                    Ok(info) => return info,
+                    Err(e) => last = e.to_string(),
+                },
+                Err(e) => last = e.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        panic!("guest agent in {vm} never answered: {last}");
+    }
+
+    /// Boot a rootfs whose init is the guest agent, talk to it over vsock,
+    /// snapshot, resume a clone under a different VM id, and talk to the clone:
+    /// the relative `v.sock` path recorded in the snapshot must resolve to the
+    /// clone's own socket. `ISO_JAILER=1` runs the same flow under the jailer.
+    /// Self-skips unless root with a guest kernel and a built agent.
+    #[tokio::test]
+    async fn live_guest_agent_over_vsock_survives_snapshot_clone() {
+        if !is_root() {
+            eprintln!("skipping live_guest_agent_over_vsock_survives_snapshot_clone: requires root + KVM");
+            return;
+        }
+        let Some(kernel) = find_kernel() else {
+            eprintln!("skipping: no firecracker vmlinux found (set ISO_TEST_KERNEL)");
+            return;
+        };
+        let Some(agent) = find_agent() else {
+            eprintln!("skipping: no guest agent binary (cargo build -p iso-guest-agent, or set ISO_TEST_AGENT)");
+            return;
+        };
+
+        let netns = "fcvsock";
+        let rootfs = "/tmp/iso-fc-vsock.ext4";
+        let rootfs2 = "/tmp/iso-fc-vsock-clone.ext4";
+        let base = PathBuf::from("/tmp/iso-fc-vsock");
+        let _ = std::fs::remove_dir_all(&base);
+        setup_netns(netns);
+        make_agent_rootfs(rootfs, &agent);
+
+        let cfg = Config {
+            bin: std::env::var("ISO_TEST_FC").unwrap_or_else(|_| "firecracker".into()).into(),
+            socket_dir: base.join("sock"),
+            state_dir: base.join("state"),
+            netns_dir: "/var/run/netns".into(),
+            boot_timeout: Duration::from_secs(10),
+            jailer: JailerConfig::from_env(&base),
+        };
+        eprintln!("jailer: {}", cfg.jailer.is_some());
+        let rt = FirecrackerRuntime::new(cfg.clone());
+
+        // --- fresh boot with a vsock device ---
+        let vm1 = VmId::from_u128(0xa1);
+        let spec = InstanceSpec {
+            vm: vm1,
+            netns: netns.into(),
+            tap: "tap0".into(),
+            mac: MacAddr([0x02, 0, 0, 0, 0, 0xa1]),
+            rootfs_device: rootfs.into(),
+            vcpus: 1,
+            mem_mib: 256,
+            kernel: kernel.clone(),
+            boot_args: "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init".into(),
+            resume_from: None,
+            rootfs_backing: None,
+            vsock_cid: Some(3),
+        };
+        rt.create(&spec).await.expect("create vm1");
+        rt.start(vm1).await.expect("start vm1");
+        let info = wait_agent(&rt, vm1).await;
+        assert_eq!(info.hostname, "fctest");
+        assert_eq!(info.agent, "iso-guest-agent");
+
+        // --- files through the agent ---
+        {
+            let mut c = agent_client(&rt, vm1).await.unwrap();
+            assert_eq!(c.write_file("/tmp/hello", "aGk=".into(), Some(0o600), false).await.unwrap(), 2);
+            let f = c.read_file("/tmp/hello", None).await.unwrap();
+            assert_eq!(f.content_b64, "aGk=");
+            let names: Vec<String> = c.list_dir("/").await.unwrap().into_iter().map(|e| e.name).collect();
+            assert!(names.contains(&"init".to_string()), "{names:?}");
+            // closed before the snapshot: Firecracker wants no live vsock connections then.
+        }
+
+        // --- snapshot, keep it, drop vm1 ---
+        rt.suspend(vm1).await.expect("suspend vm1");
+        let snap = rt.snapshot_dir(vm1);
+        let tpl = base.join("tpl");
+        std::fs::create_dir_all(&tpl).unwrap();
+        std::fs::copy(snap.join("mem"), tpl.join("mem")).expect("copy mem");
+        std::fs::copy(snap.join("vmstate"), tpl.join("vmstate")).expect("copy vmstate");
+        rt.destroy(vm1).await.expect("destroy vm1");
+        assert_eq!(rt.status(vm1).await.unwrap(), VmStatus::Absent);
+
+        // --- a clone: its own rootfs copy behind the baked path, its own v.sock ---
+        std::fs::copy(rootfs, rootfs2).unwrap();
+        let vm2 = VmId::from_u128(0xa2);
+        let clone = InstanceSpec {
+            vm: vm2,
+            rootfs_device: rootfs2.into(),
+            rootfs_backing: Some(rootfs.into()),
+            resume_from: Some(SnapshotRef { mem_file: tpl.join("mem"), vmstate: tpl.join("vmstate") }),
+            ..spec.clone()
+        };
+        rt.create(&clone).await.expect("create vm2 (load snapshot)");
+        rt.start(vm2).await.expect("resume vm2");
+        let info2 = wait_agent(&rt, vm2).await;
+        assert_eq!(info2.hostname, "fctest");
+        assert!(rt.vsock_path(vm2).exists(), "the resumed VM re-bound its vsock under its own directory");
+        {
+            // the clone still has the file the template wrote, and writes go to its own copy
+            let mut c = agent_client(&rt, vm2).await.unwrap();
+            assert_eq!(c.read_file("/tmp/hello", None).await.unwrap().content_b64, "aGk=");
+            c.write_file("/tmp/clone-only", "eA==".into(), None, false).await.unwrap();
+        }
+        rt.destroy(vm2).await.expect("destroy vm2");
+
+        // cleanup
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(rootfs);
+        let _ = std::fs::remove_file(rootfs2);
+        let _ = sh(&["ip", "netns", "del", netns]);
+    }
+
     /// Full lifecycle against real Firecracker + KVM: fresh boot, suspend +
     /// snapshot, then resume a *fresh clone* from that snapshot reusing the
     /// constant TAP. Self-skips unless root with a guest kernel available.

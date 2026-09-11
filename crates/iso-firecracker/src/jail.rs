@@ -239,8 +239,19 @@ pub fn materialize(plan: &JailPlan, jail: &JailerConfig, rootfs_device: &Path) -
     for (src, dst) in &plan.snapshot {
         link_or_cache(src, dst, &cache)?;
     }
+    let is_block = std::fs::metadata(rootfs_device)
+        .map(|m| m.file_type().is_block_device())
+        .map_err(|e| be(&format!("stat {}", rootfs_device.display()), e))?;
     for node in &plan.rootfs_nodes {
-        mknod_like(node, rootfs_device, jail.uid, jail.gid)?;
+        if is_block {
+            mknod_like(node, rootfs_device, jail.uid, jail.gid)?;
+        } else {
+            // A file-backed rootfs (tests, ad hoc images): link it in and let
+            // the jailed VMM write it. A hard link shares the inode, so this
+            // changes the source file's owner too.
+            link_or_cache(rootfs_device, node, &cache)?;
+            chown(node, jail.uid, jail.gid)?;
+        }
     }
     Ok(())
 }
