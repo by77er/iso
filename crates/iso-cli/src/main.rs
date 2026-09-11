@@ -30,6 +30,32 @@ struct Cli {
 enum Cmd {
     /// Build a warm template: bake the rootfs, boot it once, snapshot it.
     Bake(Bake),
+    /// The admin API's certificate authority: issue client certificates.
+    Admin(Admin),
+}
+
+#[derive(Parser)]
+struct Admin {
+    /// Directory holding the admin CA (the daemon's `ISO_ADMIN_TLS_DIR`).
+    #[arg(long, default_value = "/var/lib/iso/admin-pki")]
+    pki_dir: PathBuf,
+    #[command(subcommand)]
+    cmd: AdminCmd,
+}
+
+#[derive(Subcommand)]
+enum AdminCmd {
+    /// Mint a client certificate signed by the admin CA and write
+    /// `<name>.crt`, `<name>.key` and `ca.crt` into `--out`.
+    IssueClient {
+        /// Common name of the client, e.g. `orchestrator` or `alice@laptop`.
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
+    },
+    /// Print the admin CA certificate (PEM).
+    Ca,
 }
 
 #[derive(Parser)]
@@ -196,6 +222,47 @@ fn seed_repos(dev: &str, specs: &[String]) -> R<()> {
 async fn main() -> R<()> {
     match Cli::parse().cmd {
         Cmd::Bake(b) => bake(b).await,
+        Cmd::Admin(a) => admin(a),
+    }
+}
+
+fn admin(a: Admin) -> R<()> {
+    // Loading with no SANs never reissues an existing server certificate; a
+    // missing CA is generated here exactly as the daemon would generate it.
+    let pki = iso_admin_pki::AdminPki::load_or_generate(&a.pki_dir, &[])?;
+    match a.cmd {
+        AdminCmd::Ca => {
+            print!("{}", pki.ca_cert_pem());
+            Ok(())
+        }
+        AdminCmd::IssueClient { name, out } => {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let id = pki.issue_client(&name)?;
+            std::fs::create_dir_all(&out)?;
+            let crt = out.join(format!("{name}.crt"));
+            let key = out.join(format!("{name}.key"));
+            let ca = out.join("ca.crt");
+            std::fs::write(&crt, &id.cert_pem)?;
+            let _ = std::fs::remove_file(&key);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&key)?
+                .write_all(id.key_pem.as_bytes())?;
+            std::fs::write(&ca, pki.ca_cert_pem())?;
+            eprintln!(
+                "issued {name}: {} {} (CA: {})\n  curl --cert {} --key {} --cacert {} https://<host>:7070/vms",
+                crt.display(),
+                key.display(),
+                ca.display(),
+                crt.display(),
+                key.display(),
+                ca.display()
+            );
+            Ok(())
+        }
     }
 }
 

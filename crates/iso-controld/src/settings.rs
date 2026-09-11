@@ -13,6 +13,13 @@ pub struct Settings {
     pub control_sock: PathBuf,
     /// Admin API TCP listener (for a remote orchestrator's HTTP client).
     pub control_tcp: std::net::SocketAddr,
+    /// Where the admin CA and server identity live (`ISO_ADMIN_TLS_DIR`).
+    pub admin_tls_dir: PathBuf,
+    /// Serve the TCP listener as plain HTTP with no authentication
+    /// (`ISO_ADMIN_INSECURE=1`). For a lab host on a private network only.
+    pub admin_insecure: bool,
+    /// Extra names for the server certificate (`ISO_ADMIN_SANS`, comma-separated).
+    pub admin_extra_sans: Vec<String>,
 }
 
 /// The host's primary IPv4 (source IP toward the internet) — used for the
@@ -53,6 +60,9 @@ fn env(key: &str) -> Option<String> {
 ///   `ISO_IMAGE_SIZE_GIB` (default `100`) tune the rest.
 /// - `ISO_FIRECRACKER_BIN` (default `firecracker`); `ISO_JAILER=1` runs every
 ///   VM under `jailer`, see [`iso_firecracker::JailerConfig::from_env`].
+/// - `ISO_ADMIN_TCP` (default `<primary ip>:7070`), `ISO_ADMIN_TLS_DIR`
+///   (default `<state>/admin-pki`), `ISO_ADMIN_SANS`, and `ISO_ADMIN_INSECURE=1`
+///   to serve plain HTTP on TCP.
 pub fn from_env() -> Settings {
     let state = PathBuf::from(env("ISO_STATE_DIR").unwrap_or_else(|| "/var/lib/iso".into()));
     let vg = env("ISO_VG").unwrap_or_else(|| "iso".into());
@@ -87,9 +97,17 @@ pub fn from_env() -> Settings {
             ..Default::default()
         },
         control_sock: state.join("control.sock"),
+        admin_tls_dir: env("ISO_ADMIN_TLS_DIR").map(PathBuf::from).unwrap_or_else(|| state.join("admin-pki")),
+        admin_insecure: env("ISO_ADMIN_INSECURE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false),
+        admin_extra_sans: env("ISO_ADMIN_SANS")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default(),
         // Bind the admin API on the host's reachable IP so a co-located *or*
         // remote orchestrator can use it (and derive the same address for ssh).
-        // Unauthenticated for now — front it appropriately.
+        // Authenticated with client certificates from the admin CA unless
+        // ISO_ADMIN_INSECURE says otherwise.
         control_tcp: env("ISO_ADMIN_TCP")
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| {

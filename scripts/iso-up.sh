@@ -31,10 +31,9 @@ else
 fi
 [ -S "$SOCK" ] || { echo "[iso-up] controld admin socket missing; see $STATE/controld.log"; exit 1; }
 
-# Admin API over TCP (the unix socket is root-owned; the TCP listener is bound on
-# the host's reachable IP).
-HOST_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+')"
-ADMIN="http://${HOST_IP}:7070"
+# Admin API over the root-only unix socket. (The TCP listener speaks mutual
+# TLS; remote clients get a certificate from `isoctl admin issue-client`.)
+api() { sudo -n curl -s --unix-socket "$SOCK" "$@"; }
 
 # --- register baked templates (idempotent upsert by name). Each entry in
 #     ISO_TEMPLATES is "name:vcpus:mem_mib"; vcpus/mem MUST match what
@@ -47,11 +46,11 @@ BOOTARGS="console=ttyS0 reboot=k panic=1 acpi=off quiet loglevel=3 root=/dev/vda
 for spec in ${ISO_TEMPLATES:-base:1:512}; do
   IFS=: read -r name vcpus mem <<<"$spec"
   if [ -f "$STATE/templates/$name/vmstate" ]; then
-    code=$(curl -s -o /dev/null -w '%{http_code}' \
+    code=$(api -o /dev/null -w '%{http_code}' \
       -H 'content-type: application/json' \
       -d "{\"name\":\"$name\",\"rootfs_template\":\"$name\",\"snapshot_mem\":\"$STATE/templates/$name/mem\",\"snapshot_vmstate\":\"$STATE/templates/$name/vmstate\",\"vcpus\":$vcpus,\"mem_mib\":$mem,\"kernel\":\"$KERNEL\",\"boot_args\":\"$BOOTARGS\"}" \
-      "$ADMIN/templates")
-    echo "[iso-up] template '$name' registered ($code) via $ADMIN"
+      http://x/templates)
+    echo "[iso-up] template '$name' registered ($code)"
   else
     echo "[iso-up] template '$name' not baked yet (no $STATE/templates/$name/vmstate); skipping"
   fi

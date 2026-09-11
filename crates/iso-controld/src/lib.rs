@@ -5,3 +5,4 @@ pub mod http;
 pub mod identify;
 pub mod metadata;
 pub mod settings;
+pub mod tls;

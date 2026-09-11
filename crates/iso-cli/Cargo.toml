@@ -14,6 +14,7 @@ iso-control-plane = { path = "../iso-control-plane" }
 iso-network-manager = { path = "../iso-network-manager" }
 iso-storage-manager = { path = "../iso-storage-manager" }
 iso-firecracker = { path = "../iso-firecracker" }
+iso-admin-pki = { path = "../iso-admin-pki" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

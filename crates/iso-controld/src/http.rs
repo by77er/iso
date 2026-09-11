@@ -610,7 +610,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -713,7 +713,7 @@ mod tests {
         }
     }
 
-    pub(super) fn app() -> Router {
+    pub(crate) fn app() -> Router {
         let cfg = Config {
             db_path: ":memory:".into(),
             default_vcpus: 1,

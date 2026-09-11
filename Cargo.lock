@@ -1053,6 +1053,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "iso-admin-pki"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "rcgen",
+ "rustls-pki-types",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
 name = "iso-ca"
 version = "0.1.0"
 dependencies = [
@@ -1071,6 +1082,7 @@ name = "iso-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "iso-admin-pki",
  "iso-common",
  "iso-control-plane",
  "iso-firecracker",
@@ -1107,6 +1119,7 @@ dependencies = [
  "base64",
  "hyper",
  "hyper-util",
+ "iso-admin-pki",
  "iso-common",
  "iso-control-plane",
  "iso-dns-server",
@@ -1116,9 +1129,12 @@ dependencies = [
  "iso-network-manager",
  "iso-storage-manager",
  "libc",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tower",
 ]
 

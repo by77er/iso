@@ -14,7 +14,7 @@ use iso_common::runtime::VmRuntime;
 use iso_common::storage::StorageManager;
 use iso_common::EgressMode;
 use iso_control_plane::ControlPlane;
-use iso_controld::{http, identify, metadata, settings};
+use iso_controld::{http, identify, metadata, settings, tls};
 use iso_firecracker::FirecrackerRuntime;
 use iso_storage_manager::command::SystemRunner;
 
@@ -44,9 +44,13 @@ where
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let s = settings::from_env();
     let control_sock = s.control_sock.clone();
     let control_tcp = s.control_tcp;
+    let admin_tls_dir = s.admin_tls_dir.clone();
+    let admin_insecure = s.admin_insecure;
+    let admin_extra_sans = s.admin_extra_sans.clone();
     // The host's reachable IPv4 (where VM forwarded ports are exposed) — handed
     // to the metadata server so guests can learn their own external endpoint.
     let host_addr = s.network.host_addr;
@@ -117,20 +121,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = std::fs::remove_file(&control_sock);
     let unix = tokio::net::UnixListener::bind(&control_sock)?;
-    eprintln!("iso-controld: admin API on {} and {control_tcp}", control_sock.display());
+    // Root only: the socket carries no authentication of its own.
+    let _ = std::fs::set_permissions(&control_sock, std::os::unix::fs::PermissionsExt::from_mode(0o600));
 
-    // TCP admin listener for a remote orchestrator's HTTP client.
+    // TCP admin listener for a remote orchestrator's HTTP client: mutual TLS
+    // with the admin CA, unless explicitly told to serve plain HTTP.
     let tcp_cp = cp.clone();
-    tokio::spawn(async move {
-        match tokio::net::TcpListener::bind(control_tcp).await {
-            Ok(l) => {
+    let tcp_listener = tokio::net::TcpListener::bind(control_tcp).await;
+    match (tcp_listener, admin_insecure) {
+        (Err(e), _) => eprintln!("iso-controld: tcp admin bind {control_tcp} failed: {e}"),
+        (Ok(l), true) => {
+            eprintln!("iso-controld: admin API on {} and PLAIN HTTP {control_tcp} (ISO_ADMIN_INSECURE)", control_sock.display());
+            tokio::spawn(async move {
                 if let Err(e) = axum::serve(l, http::router(tcp_cp)).await {
                     eprintln!("iso-controld: tcp admin exited: {e}");
                 }
-            }
-            Err(e) => eprintln!("iso-controld: tcp admin bind {control_tcp} failed: {e}"),
+            });
         }
-    });
+        (Ok(l), false) => {
+            let sans = tls::server_sans(control_tcp, &admin_extra_sans);
+            let pki = iso_admin_pki::AdminPki::load_or_generate(&admin_tls_dir, &sans)?;
+            let acceptor = tls::acceptor(&pki).map_err(|e| e.to_string())?;
+            eprintln!(
+                "iso-controld: admin API on {} and https://{control_tcp} (client certs from {})",
+                control_sock.display(),
+                admin_tls_dir.join("ca.crt").display()
+            );
+            tokio::spawn(tls::serve(l, acceptor, http::router(tcp_cp)));
+        }
+    }
 
     axum::serve(unix, http::router(cp)).await?;
     Ok(())
