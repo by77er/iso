@@ -325,8 +325,10 @@ async fn bake(b: Bake) -> R<()> {
     }
 
     // --- network: transient netns/veth/tap for the builder ---
+    let jailer = iso_firecracker::JailerConfig::from_env(&b.state);
     let ncfg = iso_network_manager::Config {
         uplink: b.uplink.clone(),
+        tap_owner: jailer.as_ref().map(|j| (j.uid, j.gid)),
         ..Default::default()
     };
     let net = iso_network_manager::Manager::new(ncfg.clone());
@@ -351,7 +353,7 @@ async fn bake(b: Bake) -> R<()> {
         bin: std::env::var("ISO_FIRECRACKER_BIN").map(PathBuf::from).unwrap_or_else(|_| "firecracker".into()),
         socket_dir: b.state.join("fc/sock"),
         state_dir: b.state.join("fc/state"),
-        jailer: iso_firecracker::JailerConfig::from_env(&b.state),
+        jailer,
         ..Default::default()
     };
     let rt = iso_firecracker::FirecrackerRuntime::new(fcfg.clone());

@@ -266,23 +266,21 @@ pub fn teardown(plan_jail_dir: &Path) {
     let _ = std::fs::remove_dir_all(plan_jail_dir);
 }
 
-/// Resolve a binary name to an absolute path (searching `PATH` for a bare
-/// name), as the jailer requires for `--exec-file`.
+/// Resolve a binary name to the canonical absolute path of the file
+/// (searching `PATH` for a bare name, following symlinks). The jailer
+/// canonicalizes `--exec-file` itself and names the jail after the *target*,
+/// so every jail path here must be derived from the same resolved name.
 pub fn resolve_bin(bin: &Path) -> Result<PathBuf> {
-    if bin.is_absolute() {
-        return Ok(bin.to_path_buf());
-    }
-    if bin.components().count() > 1 {
-        return std::fs::canonicalize(bin).map_err(|e| be(&format!("resolve {}", bin.display()), e));
-    }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(bin);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    Err(Error::Backend(format!("jail: {} not found on PATH", bin.display())))
+    let found = if bin.components().count() > 1 {
+        bin.to_path_buf()
+    } else {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(bin))
+            .find(|candidate| candidate.is_file())
+            .ok_or_else(|| Error::Backend(format!("jail: {} not found on PATH", bin.display())))?
+    };
+    std::fs::canonicalize(&found).map_err(|e| be(&format!("resolve {}", found.display()), e))
 }
 
 #[cfg(test)]

@@ -82,6 +82,10 @@ struct ApiPaths {
 
 pub struct FirecrackerRuntime {
     cfg: Config,
+    /// `cfg.bin` resolved to the canonical file, which is what the jailer
+    /// names jails after (it follows symlinks). Falls back to `cfg.bin` when
+    /// resolution fails; spawning then reports why.
+    fc_bin: PathBuf,
     /// Children spawned this process lifetime (for reaping). Re-adopted VMs
     /// after a restart aren't here; they're handled via pidfile + socket.
     children: Mutex<HashMap<VmId, Child>>,
@@ -89,15 +93,17 @@ pub struct FirecrackerRuntime {
 
 impl FirecrackerRuntime {
     pub fn new(cfg: Config) -> Self {
+        let fc_bin = jail::resolve_bin(&cfg.bin).unwrap_or_else(|_| cfg.bin.clone());
         Self {
             cfg,
+            fc_bin,
             children: Mutex::new(HashMap::new()),
         }
     }
 
     /// The jail root for `vm`, when jailing is on.
     fn jail_root(&self, vm: VmId) -> Option<PathBuf> {
-        self.cfg.jailer.as_ref().map(|j| j.jail_dir(&self.cfg.bin, vm).join("root"))
+        self.cfg.jailer.as_ref().map(|j| j.jail_dir(&self.fc_bin, vm).join("root"))
     }
 
     fn socket(&self, vm: VmId) -> PathBuf {
@@ -139,6 +145,9 @@ impl FirecrackerRuntime {
         std::fs::create_dir_all(&self.cfg.state_dir).map_err(be)?;
         let fc = jail::resolve_bin(&self.cfg.bin)?;
         let plan = jail::plan(jailer, &fc, &self.cfg.netns_dir.join(&spec.netns), spec);
+        if plan.root != self.jail_root(spec.vm).expect("jailer is configured") {
+            return Err(Error::Backend("jail path changed since the runtime was built".into()));
+        }
         jail::teardown(&plan.jail_dir);
         jail::materialize(&plan, jailer, &spec.rootfs_device)?;
 
@@ -458,7 +467,7 @@ impl VmRuntime for FirecrackerRuntime {
         let _ = std::fs::remove_file(self.pidfile(vm));
         let _ = std::fs::remove_dir_all(self.snap_dir(vm));
         if let Some(j) = &self.cfg.jailer {
-            jail::teardown(&j.jail_dir(&self.cfg.bin, vm));
+            jail::teardown(&j.jail_dir(&self.fc_bin, vm));
         }
         Ok(())
     }
@@ -571,10 +580,18 @@ mod tests {
         None
     }
 
-    fn setup_netns(name: &str) {
+    /// A netns with a TAP. `owner` is the jail uid/gid: attaching to a TAP
+    /// without CAP_NET_ADMIN is only allowed to its owner, and a jailed
+    /// Firecracker has neither the capability nor root.
+    fn setup_netns(name: &str, owner: Option<(u32, u32)>) {
         let _ = sh(&["ip", "netns", "del", name]);
         assert!(sh(&["ip", "netns", "add", name]));
-        assert!(sh(&["ip", "netns", "exec", name, "ip", "tuntap", "add", "dev", "tap0", "mode", "tap"]));
+        let (uid, gid) = owner.map(|(u, g)| (u.to_string(), g.to_string())).unwrap_or_default();
+        let mut add = vec!["ip", "netns", "exec", name, "ip", "tuntap", "add", "dev", "tap0", "mode", "tap"];
+        if owner.is_some() {
+            add.extend(["user", uid.as_str(), "group", gid.as_str()]);
+        }
+        assert!(sh(&add));
         assert!(sh(&["ip", "netns", "exec", name, "ip", "link", "set", "tap0", "up"]));
         let _ = sh(&["ip", "netns", "exec", name, "ip", "link", "set", "lo", "up"]);
     }
@@ -673,10 +690,6 @@ mod tests {
         let rootfs = "/tmp/iso-fc-vsock.ext4";
         let rootfs2 = "/tmp/iso-fc-vsock-clone.ext4";
         let base = PathBuf::from("/tmp/iso-fc-vsock");
-        let _ = std::fs::remove_dir_all(&base);
-        setup_netns(netns);
-        make_agent_rootfs(rootfs, &agent);
-
         let cfg = Config {
             bin: std::env::var("ISO_TEST_FC").unwrap_or_else(|_| "firecracker".into()).into(),
             socket_dir: base.join("sock"),
@@ -687,9 +700,17 @@ mod tests {
         };
         eprintln!("jailer: {}", cfg.jailer.is_some());
         let rt = FirecrackerRuntime::new(cfg.clone());
+        let vm1 = VmId::from_u128(0xa1);
+        let vm2 = VmId::from_u128(0xa2);
+        // A previous run that panicked left its VMs running: their pidfiles are
+        // still in `base`, so destroy by id before wiping it.
+        let _ = rt.destroy(vm1).await;
+        let _ = rt.destroy(vm2).await;
+        let _ = std::fs::remove_dir_all(&base);
+        setup_netns(netns, cfg.jailer.as_ref().map(|j| (j.uid, j.gid)));
+        make_agent_rootfs(rootfs, &agent);
 
         // --- fresh boot with a vsock device ---
-        let vm1 = VmId::from_u128(0xa1);
         let spec = InstanceSpec {
             vm: vm1,
             netns: netns.into(),
@@ -733,7 +754,6 @@ mod tests {
 
         // --- a clone: its own rootfs copy behind the baked path, its own v.sock ---
         std::fs::copy(rootfs, rootfs2).unwrap();
-        let vm2 = VmId::from_u128(0xa2);
         let clone = InstanceSpec {
             vm: vm2,
             rootfs_device: rootfs2.into(),
@@ -779,7 +799,7 @@ mod tests {
         let rootfs = "/tmp/iso-fc-test.ext4";
         let base = PathBuf::from("/tmp/iso-fc-test");
         let _ = std::fs::remove_dir_all(&base);
-        setup_netns(netns);
+        setup_netns(netns, None);
         make_rootfs(rootfs);
 
         let cfg = Config {

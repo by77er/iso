@@ -32,6 +32,10 @@ pub struct Config {
     /// the netns is isolated, so an identical name in each makes the Firecracker
     /// snapshot's frozen network config valid for every clone without override.
     pub tap_name: String,
+    /// Owner (uid, gid) set on each TAP. A VMM that runs without
+    /// CAP_NET_ADMIN — Firecracker under the jailer — can only attach to a TAP
+    /// it owns, so this is the jail identity when jailing is on.
+    pub tap_owner: Option<(u32, u32)>,
 }
 
 impl Default for Config {
@@ -46,6 +50,7 @@ impl Default for Config {
             host_addr: None,
             mac: MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
             tap_name: "tap0".to_string(),
+            tap_owner: None,
         }
     }
 }

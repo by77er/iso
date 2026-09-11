@@ -107,6 +107,8 @@ fn write_sysctl(key: &str, val: &str) -> Result<()> {
 
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 const TUNSETPERSIST: libc::c_ulong = 0x4004_54cb;
+const TUNSETOWNER: libc::c_ulong = 0x4004_54cc;
+const TUNSETGROUP: libc::c_ulong = 0x4004_54ce;
 const IFF_TAP: libc::c_short = 0x0002;
 const IFF_NO_PI: libc::c_short = 0x1000;
 
@@ -117,8 +119,9 @@ struct IfReq {
     _pad: [u8; 22],
 }
 
-/// Create a persistent TAP in the *current* network namespace.
-fn create_tap(name: &str) -> Result<()> {
+/// Create a persistent TAP in the *current* network namespace, owned by
+/// `owner` when given (so an unprivileged VMM can attach to it).
+fn create_tap(name: &str, owner: Option<(u32, u32)>) -> Result<()> {
     if name.len() >= libc::IFNAMSIZ {
         return Err(Error::Backend(format!("tap name too long: {name}")));
     }
@@ -144,6 +147,20 @@ fn create_tap(name: &str) -> Result<()> {
                 "TUNSETIFF {name}: {}",
                 std::io::Error::last_os_error()
             )));
+        }
+        if let Some((uid, gid)) = owner {
+            if unsafe { libc::ioctl(fd, TUNSETOWNER, uid as libc::c_int) } < 0 {
+                return Err(Error::Backend(format!(
+                    "TUNSETOWNER {name}: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if unsafe { libc::ioctl(fd, TUNSETGROUP, gid as libc::c_int) } < 0 {
+                return Err(Error::Backend(format!(
+                    "TUNSETGROUP {name}: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
         }
         if unsafe { libc::ioctl(fd, TUNSETPERSIST, 1) } < 0 {
             return Err(Error::Backend(format!(
@@ -212,7 +229,7 @@ pub fn reapply(plan: &Plan) -> Result<()> {
 
 /// Converge a slot to `plan`: create/ensure the netns, veth, addressing, TAP,
 /// routes, sysctls, and both nftables tables. Idempotent. Requires root.
-pub fn converge(plan: &Plan, _cfg: &Config) -> Result<()> {
+pub fn converge(plan: &Plan, cfg: &Config) -> Result<()> {
     let fx = &plan.fixture;
     let ns = NetNs::new(&fx.netns)
         .or_else(|_| NetNs::get(&fx.netns))
@@ -263,7 +280,7 @@ pub fn converge(plan: &Plan, _cfg: &Config) -> Result<()> {
             addr_and_up(&handle, &fx.veth_netns, fx.vp_ip, 31).await?;
             set_up(&handle, "lo").await?;
 
-            create_tap(&fx.tap)?;
+            create_tap(&fx.tap, cfg.tap_owner)?;
             addr_and_up(&handle, &fx.tap, inner_tap, 31).await?;
 
             for r in &routes {

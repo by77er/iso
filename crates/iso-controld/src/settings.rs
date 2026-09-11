@@ -73,6 +73,7 @@ pub fn from_env() -> Settings {
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
 
+    let jailer = iso_firecracker::JailerConfig::from_env(&state);
     Settings {
         control: iso_control_plane::Config {
             db_path: state.join("control.db"),
@@ -81,6 +82,8 @@ pub fn from_env() -> Settings {
         network: iso_network_manager::Config {
             uplink,
             host_addr: primary_ipv4(),
+            // A jailed VMM can only attach to a TAP it owns.
+            tap_owner: jailer.as_ref().map(|j| (j.uid, j.gid)),
             ..Default::default()
         },
         storage: iso_storage_manager::Config {
@@ -93,7 +96,7 @@ pub fn from_env() -> Settings {
             bin: env("ISO_FIRECRACKER_BIN").map(PathBuf::from).unwrap_or_else(|| "firecracker".into()),
             socket_dir: state.join("fc/sock"),
             state_dir: state.join("fc/state"),
-            jailer: iso_firecracker::JailerConfig::from_env(&state),
+            jailer,
             ..Default::default()
         },
         control_sock: state.join("control.sock"),
