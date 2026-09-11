@@ -30,6 +30,11 @@
         EXT4_FS = yes;
         IP_PNP = lib.mkForce yes;
 
+        # ---- vsock: the host reaches the guest agent through it ----
+        VSOCKETS = yes;
+        VIRTIO_VSOCKETS = yes;
+        VIRTIO_VSOCKETS_COMMON = yes;
+
         # ---- VM reset path (reboot=k pulses i8042) ----
         SERIO = yes;
         SERIO_I8042 = yes;

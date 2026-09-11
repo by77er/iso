@@ -1,7 +1,9 @@
-# iso base rootfs userspace: a lean image that boots to sshd with a key-only
-# `coder` user (uid 1000, passwordless sudo) and a minimal toolbelt — enough to
-# log in and exercise networking. Extend `environment.systemPackages` for richer
-# templates.
+# iso base rootfs userspace: a lean image for running agents. It boots to
+# sshd with a key-only `coder` user (uid 1000, passwordless sudo), the iso
+# guest agent on vsock (see guest-agent.nix), and a minimal toolbelt. Nothing in
+# it is specific to one coding agent: the host drives the guest through the
+# admin API's exec and file endpoints, and whatever tooling a workload needs is
+# added per template through `environment.systemPackages`.
 { config
 , lib
 , pkgs
@@ -16,11 +18,11 @@ let
     (lib.filter (l: l != "" && !lib.hasPrefix "#" l))
   ];
 
-  # pi reads `AGENTS.md` from its config dir (~/.pi/agent) as global, always-on
-  # system-prompt context. Bake a note there so the agent knows the egress proxy
-  # injects credentials for it — same idea as the ANTHROPIC_API_KEY placeholder.
-  piAgentNotes = pkgs.writeText "pi-global-agents.md" ''
-    # Global agent notes
+  # Facts an agent working inside the VM should know: the egress proxy injects
+  # credentials, and the metadata service says who the VM is. Installed at
+  # /etc/iso/AGENTS.md; point your agent's global-instructions file at it.
+  agentNotes = pkgs.writeText "iso-agents.md" ''
+    # Notes for agents running in this VM
 
     ## Outbound network & credentials
 
@@ -68,10 +70,10 @@ in
     lib.optionals (builtins.pathExists ../ca.crt) [ ../ca.crt ];
   environment.variables.NODE_EXTRA_CA_CERTS = "/etc/ssl/certs/ca-bundle.crt";
 
-  # pi / the Anthropic SDK refuse to start without an API key in the env, and
-  # they send it as the `x-api-key` header. The egress proxy OVERRIDES that
-  # header with the real key (from the host secret store), so this is a
-  # non-secret placeholder — the real key never lives in the guest.
+  # SDKs refuse to start without an API key in the environment and send it as
+  # the `x-api-key` header. The egress proxy OVERRIDES that header with the real
+  # key (from the host secret store), so this is a non-secret placeholder — the
+  # real key never lives in the guest.
   environment.variables.ANTHROPIC_API_KEY = "iso-proxy-injects-the-real-key";
 
   services.openssh = {
@@ -106,14 +108,7 @@ in
     direnv
   ];
 
-  # Seed pi's global system-prompt context (`piAgentNotes`) into the coder
-  # home before the snapshot, so every warm-resumed clone carries it. Owned by
-  # coder so pi can keep writing its other config (settings.json, auth.json).
-  systemd.tmpfiles.rules = [
-    "d /home/coder/.pi 0755 coder users -"
-    "d /home/coder/.pi/agent 0755 coder users -"
-    "C /home/coder/.pi/agent/AGENTS.md 0644 coder users - ${piAgentNotes}"
-  ];
+  environment.etc."iso/AGENTS.md".source = agentNotes;
 
   environment.variables.EDITOR = "vim";
   time.timeZone = "UTC";

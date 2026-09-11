@@ -1,5 +1,5 @@
 {
-  description = "iso — NixOS Firecracker microVM base image (kernel + rootfs)";
+  description = "iso — NixOS Firecracker microVM base image for agents (kernel + rootfs + guest agent)";
 
   inputs = {
     # Userspace / rootfs: current.
@@ -45,6 +45,7 @@
         modules = [
           ./modules/firecracker.nix
           ./modules/base.nix
+          ./modules/guest-agent.nix
           { boot.kernelPackages = kernelSystem.config.boot.kernelPackages; }
         ];
       };
