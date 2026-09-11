@@ -83,6 +83,18 @@ struct Bake {
     /// Extra Debian packages, comma-separated.
     #[arg(long)]
     debian_packages: Option<String>,
+    /// Use this uncompressed guest kernel instead of building `#kernel` from
+    /// the flake (for hosts without Nix, or to keep Nix out of a root shell).
+    #[arg(long)]
+    kernel: Option<PathBuf>,
+    /// With `--distro debian`, use this static guest agent instead of building
+    /// `#iso-guest-agent-static`.
+    #[arg(long)]
+    agent_bin: Option<PathBuf>,
+    /// With `--distro debian`, the ssh public keys baked in for the coder user
+    /// (default: <flake>/image/keys/authorized_keys).
+    #[arg(long)]
+    authorized_keys: Option<PathBuf>,
     /// The flake providing #kernel, #toplevel and #nixos-install-tools: this
     /// repository. Given as a plain path, so a git checkout contributes only
     /// its tracked files (a new module must be `git add`ed to be seen).
@@ -295,12 +307,18 @@ async fn bake(b: Bake) -> R<()> {
     }
 
     eprintln!("[bake] building {} image from flake {}", b.distro, b.flake);
-    let kernel = PathBuf::from(nix_build(&b.flake, "kernel")?).join("vmlinux");
+    let kernel = match &b.kernel {
+        Some(k) => k.clone(),
+        None => PathBuf::from(nix_build(&b.flake, "kernel")?).join("vmlinux"),
+    };
     let debian = b.distro == "debian";
     // NixOS: the system closure and the installer. Debian: the static agent
     // the rootfs script copies in.
     let (toplevel, nixos_install, agent) = if debian {
-        let agent = format!("{}/bin/iso-guest-agent", nix_build(&b.flake, "iso-guest-agent-static")?);
+        let agent = match &b.agent_bin {
+            Some(a) => a.to_string_lossy().into_owned(),
+            None => format!("{}/bin/iso-guest-agent", nix_build(&b.flake, "iso-guest-agent-static")?),
+        };
         (String::new(), String::new(), agent)
     } else {
         let toplevel = nix_build(&b.flake, "toplevel")?;
@@ -359,6 +377,10 @@ async fn bake(b: Bake) -> R<()> {
     let ncfg = iso_network_manager::Config {
         uplink: b.uplink.clone(),
         tap_owner: jailer.as_ref().map(|j| (j.uid, j.gid)),
+        veth_net: std::env::var("ISO_VETH_NET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(iso_network_manager::Config::default().veth_net),
         ..Default::default()
     };
     let net = iso_network_manager::Manager::new(ncfg.clone());
@@ -465,7 +487,7 @@ fn debian_rootfs(b: &Bake, mnt: &str, agent: &str) -> R<()> {
         .env("AGENT_BIN", agent)
         .env("SUITE", &b.debian_suite)
         .env("MODE", "root");
-    let keys = flake_abs.join("image/keys/authorized_keys");
+    let keys = b.authorized_keys.clone().unwrap_or_else(|| flake_abs.join("image/keys/authorized_keys"));
     if keys.exists() {
         cmd.env("AUTHORIZED_KEYS", &keys);
     }

@@ -136,7 +136,19 @@ Inside the guest, `curl https://api.github.com/user` just works. No token in the
 
 Agents tend to expect a stock distribution. `isoctl bake --distro debian --name debian` bakes one instead of NixOS: a Debian (`--debian-suite`, default `trixie`) built by `mmdebstrap` on the flake's kernel, with the same user, sshd, resolver, proxy CA and guest agent, so `sudo apt install` works through the proxy once `deb.debian.org` and `security.debian.org` are on the VM's allow-list. It needs `mmdebstrap` on the host (`apt install mmdebstrap`).
 
-`scripts/iso-up.sh` brings the whole stack up idempotently and is safe to run on every boot; it registers every template `isoctl bake` left under `state/templates/`. `ISO_JAILER=1` in its environment (or the daemon's) runs every VM under Firecracker's jailer.
+On a fresh development machine, `sudo scripts/dev-up.sh` does all of the above: host packages, a jailed control plane on a loop-file pool under `./state`, an admin client certificate in `~/.iso/creds`, and a baked Debian template. `scripts/iso-up.sh` brings the whole stack up idempotently and is safe to run on every boot; it registers every template `isoctl bake` left under `state/templates/`. `ISO_JAILER=1` in its environment (or the daemon's) runs every VM under Firecracker's jailer.
+
+## Using it from pi
+
+`contrib/pi/iso.ts` is an extension for the [pi](https://github.com/badlogic/pi-mono) coding agent that moves its default tools (`read`, `write`, `edit`, `bash`, `ls`, `find`, `grep`, and `!` commands) into a fresh VM: pi stays on your machine, every tool call goes through the admin API to the guest agent, and the VM is destroyed when the session ends. Symlink it into `~/.pi/agent/extensions/`, then:
+
+```bash
+export ISO_SERVER=https://<host>:7070 ISO_CREDS=~/.iso/creds ISO_CLIENT=<name>
+export ISO_TEMPLATE=debian ISO_EGRESS=proxy ISO_PRINCIPAL=alice ISO_ALLOW=api.github.com,github.com
+pi
+```
+
+Without `ISO_SERVER` or credentials the extension leaves pi's tools local. `/iso` shows the VM, `ISO_KEEP=1` keeps it, `--no-iso` opts out for one run. `node contrib/pi/test/run.mjs` exercises the extension against a mock of the admin API.
 
 ## Admin API
 

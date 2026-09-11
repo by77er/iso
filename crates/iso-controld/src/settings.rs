@@ -60,6 +60,7 @@ fn env(key: &str) -> Option<String> {
 ///   `ISO_IMAGE_SIZE_GIB` (default `100`) tune the rest.
 /// - `ISO_FIRECRACKER_BIN` (default `firecracker`); `ISO_JAILER=1` runs every
 ///   VM under `jailer`, see [`iso_firecracker::JailerConfig::from_env`].
+/// - `ISO_VETH_NET` (default `172.21.0.0`): base of the /16 used for veth pairs.
 /// - `ISO_ADMIN_TCP` (default `<primary ip>:7070`), `ISO_ADMIN_TLS_DIR`
 ///   (default `<state>/admin-pki`), `ISO_ADMIN_SANS`, and `ISO_ADMIN_INSECURE=1`
 ///   to serve plain HTTP on TCP.
@@ -84,6 +85,11 @@ pub fn from_env() -> Settings {
             host_addr: primary_ipv4(),
             // A jailed VMM can only attach to a TAP it owns.
             tap_owner: jailer.as_ref().map(|j| (j.uid, j.gid)),
+            // The /16 the per-slot veth pairs are carved from; move it when the
+            // host's own network already uses 172.21.0.0/16.
+            veth_net: env("ISO_VETH_NET")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(iso_network_manager::Config::default().veth_net),
             ..Default::default()
         },
         storage: iso_storage_manager::Config {

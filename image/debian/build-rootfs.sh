@@ -40,7 +40,7 @@ command -v mmdebstrap >/dev/null || { echo "build-rootfs: mmdebstrap not found o
 
 # The base set: an init, a shell, ssh, sudo, TLS roots, and the tools an agent
 # reaches for first. Everything else is a `sudo apt install` away.
-PACKAGES="systemd,systemd-sysv,udev,dbus,openssh-server,sudo,ca-certificates,curl,wget,git,gnupg,less,vim,nano,procps,psmisc,iproute2,iputils-ping,netbase,locales,file,xz-utils,unzip,build-essential,python3,python3-venv,python3-pip,jq"
+PACKAGES="systemd,systemd-sysv,udev,dbus,openssh-server,sudo,ca-certificates,curl,wget,git,gnupg,less,vim,nano,procps,psmisc,iproute2,iputils-ping,netbase,locales,file,xz-utils,unzip,build-essential,python3,python3-venv,python3-pip,jq,ripgrep,fd-find"
 if [ -n "${EXTRA_PACKAGES:-}" ]; then
   PACKAGES="$PACKAGES,$EXTRA_PACKAGES"
 fi
@@ -168,6 +168,9 @@ cat > "$R/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf" <<'GET
 ExecStart=
 ExecStart=-/sbin/agetty --autologin root --keep-baud 115200,57600,38400,9600 - $TERM
 GETTY
+
+# --- Debian names fd's binary fdfind; agents (and pi's find tool) expect fd ---
+ln -sf /usr/bin/fdfind "$R/usr/local/bin/fd"
 
 # --- trim what a microVM never uses ---
 rm -rf "$R/var/cache/apt/archives/"*.deb "$R/var/lib/apt/lists/"* 2>/dev/null || true

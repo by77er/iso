@@ -102,10 +102,13 @@ in
     vim
     less
     procps
-    # dev toolbelt
+    file
+    # dev toolbelt, including what agents' search tools shell out to
     git
     gh
     direnv
+    ripgrep
+    fd
   ];
 
   environment.etc."iso/AGENTS.md".source = agentNotes;
