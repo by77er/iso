@@ -687,9 +687,12 @@ mod tests {
         };
 
         let netns = "fcvsock";
-        let rootfs = "/tmp/iso-fc-vsock.ext4";
-        let rootfs2 = "/tmp/iso-fc-vsock-clone.ext4";
-        let base = PathBuf::from("/tmp/iso-fc-vsock");
+        // /var/tmp, not /tmp: a jail needs device nodes, and /tmp is often a
+        // tmpfs mounted nodev, where opening one fails with EACCES. Keeping the
+        // rootfs images beside the jail also lets them be hard-linked in.
+        let base = PathBuf::from("/var/tmp/iso-fc-vsock");
+        let rootfs = "/var/tmp/iso-fc-vsock/rootfs.ext4";
+        let rootfs2 = "/var/tmp/iso-fc-vsock/rootfs-clone.ext4";
         let cfg = Config {
             bin: std::env::var("ISO_TEST_FC").unwrap_or_else(|_| "firecracker".into()).into(),
             socket_dir: base.join("sock"),
@@ -707,6 +710,7 @@ mod tests {
         let _ = rt.destroy(vm1).await;
         let _ = rt.destroy(vm2).await;
         let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
         setup_netns(netns, cfg.jailer.as_ref().map(|j| (j.uid, j.gid)));
         make_agent_rootfs(rootfs, &agent);
 
@@ -776,8 +780,6 @@ mod tests {
 
         // cleanup
         let _ = std::fs::remove_dir_all(&base);
-        let _ = std::fs::remove_file(rootfs);
-        let _ = std::fs::remove_file(rootfs2);
         let _ = sh(&["ip", "netns", "del", netns]);
     }
 

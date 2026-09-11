@@ -140,8 +140,10 @@ the kernel and snapshot are hard links (or a per-host cached copy when the
 source is on another filesystem, as the Nix store is), and every path
 Firecracker sees is the same for every VM, which is what a snapshot needs.
 
-Requirements: the jail directory must not be on a `nodev` mount, and the
-`jailer` binary must match the Firecracker version. Templates baked without
+Requirements: the jail directory must not be on a `nodev` mount (`/tmp` is
+often a tmpfs mounted that way; the symptom is "Permission denied" opening
+`/dev/net/tun` or `/dev/kvm` inside the jail), and the `jailer` binary must
+match the Firecracker version. Templates baked without
 the jailer still resume under it; templates baked under it record only
 jail-relative paths. A VM's jail is removed on destroy.
 
