@@ -1,0 +1,14 @@
+[package]
+name = "iso-guest-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire protocol between the iso host and the guest agent, plus a host-side client"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.52.3", features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["io-util", "macros", "rt", "net"] }

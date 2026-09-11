@@ -17,13 +17,16 @@ iso-firecracker = { path = "../iso-firecracker" }
 axum = "0.8.9"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 hyper-util = { version = "0.1.20", features = ["server", "server-auto", "tokio", "service"] }
 hyper = { version = "1.10.1", features = ["server", "http1"] }
 tower = { version = "0.5", features = ["util"] }
 iso-dns-server = { version = "0.1.0", path = "../iso-dns-server" }
+iso-guest-proto = { path = "../iso-guest-proto" }
+base64 = "0.22"
 
 [dev-dependencies]
+iso-guest-agent = { path = "../iso-guest-agent" }
 libc = "0.2.186"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tower = { version = "0.5", features = ["util"] }

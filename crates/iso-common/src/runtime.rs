@@ -6,6 +6,7 @@
 //! crate, not here.
 
 use std::future::Future;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use crate::error::Result;
@@ -49,6 +50,12 @@ pub struct InstanceSpec {
     /// a private mount namespace — otherwise every clone would write the shared
     /// template. `None` for a fresh boot, where `rootfs_device` is used directly.
     pub rootfs_backing: Option<PathBuf>,
+    /// Attach a vsock device with this guest CID, so the host can open
+    /// [`VmRuntime::guest_channel`]s to an agent inside the VM. Only consulted on
+    /// a fresh boot: a snapshot carries (or lacks) the device it was taken with.
+    /// CIDs need not be unique across VMs — the host side of a Firecracker vsock
+    /// is a per-VM socket, and clones of one snapshot share their CID anyway.
+    pub vsock_cid: Option<u32>,
 }
 
 /// Observed instance state from the VMM's perspective. Polled by the supervisor.
@@ -93,4 +100,13 @@ pub trait VmRuntime {
 
     /// Current observed status.
     fn status(&self, vm: VmId) -> impl Future<Output = Result<VmStatus>> + Send;
+
+    /// Open a stream to `port` on the guest's vsock, for talking to an agent
+    /// inside the VM. Returns a connected stream socket; the caller wraps it in
+    /// whatever async I/O type it likes. Backends that cannot reach into the
+    /// guest keep the default, which reports that.
+    fn guest_channel(&self, vm: VmId, port: u32) -> impl Future<Output = Result<OwnedFd>> + Send {
+        let _ = (vm, port);
+        async { Err(crate::error::Error::Backend("this VMM backend has no guest channel".into())) }
+    }
 }

@@ -20,6 +20,11 @@ pub struct Config {
     pub slot_capacity: usize,
     /// Host-port range `[start, end)` for ingress forwards.
     pub forward_ports: (u16, u16),
+    /// Guest CID for the vsock device attached to fresh boots (`None` attaches
+    /// no vsock). The guest agent is reached through it.
+    pub vsock_cid: Option<u32>,
+    /// The vsock port the guest agent listens on.
+    pub guest_agent_port: u32,
 }
 
 impl Default for Config {
@@ -32,6 +37,8 @@ impl Default for Config {
             graceful_stop: Duration::from_secs(30),
             slot_capacity: SlotId::MAX as usize + 1,
             forward_ports: (20000, 30000),
+            vsock_cid: Some(3),
+            guest_agent_port: 5000,
         }
     }
 }

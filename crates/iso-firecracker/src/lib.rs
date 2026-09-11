@@ -9,6 +9,7 @@
 mod client;
 
 use std::collections::HashMap;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,15 @@ use std::time::{Duration, Instant};
 
 use iso_common::{Error, InstanceSpec, Result, VmId, VmRuntime, VmStatus};
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// The vsock unix socket, relative to the VMM's working directory. Relative on
+/// purpose: a snapshot records the path, so every clone resumed from it must
+/// resolve the same string to its *own* socket, which a per-VM cwd provides.
+pub const VSOCK_UDS: &str = "v.sock";
+
+/// How long a guest-channel `CONNECT` may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn be<E: std::fmt::Display>(e: E) -> Error {
     Error::Backend(e.to_string())
@@ -71,8 +81,21 @@ impl FirecrackerRuntime {
     fn pidfile(&self, vm: VmId) -> PathBuf {
         self.cfg.state_dir.join(format!("{vm}.pid"))
     }
+    /// The VM's own directory: the VMM's working directory (so relative paths
+    /// in its API, like the vsock socket, land here) and where `suspend` writes
+    /// its snapshot.
     fn snap_dir(&self, vm: VmId) -> PathBuf {
         self.cfg.state_dir.join(vm.to_string())
+    }
+
+    /// Where a snapshot taken by [`VmRuntime::suspend`] lands: `mem` and
+    /// `vmstate` files in this directory.
+    pub fn snapshot_dir(&self, vm: VmId) -> PathBuf {
+        self.snap_dir(vm)
+    }
+
+    fn vsock_path(&self, vm: VmId) -> PathBuf {
+        self.snap_dir(vm).join(VSOCK_UDS)
     }
 
     fn pid_of(&self, vm: VmId) -> Option<i32> {
@@ -113,8 +136,11 @@ impl FirecrackerRuntime {
     fn spawn(&self, vm: VmId, netns: &str, rootfs_bind: Option<(&Path, &Path)>) -> Result<()> {
         std::fs::create_dir_all(&self.cfg.socket_dir).map_err(be)?;
         std::fs::create_dir_all(&self.cfg.state_dir).map_err(be)?;
+        let vm_dir = self.snap_dir(vm);
+        std::fs::create_dir_all(&vm_dir).map_err(be)?;
         let socket = self.socket(vm);
         let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(self.vsock_path(vm));
 
         let ns_path = self.cfg.netns_dir.join(netns);
         let cpath = std::ffi::CString::new(ns_path.as_os_str().as_bytes()).map_err(be)?;
@@ -138,7 +164,10 @@ impl FirecrackerRuntime {
         };
 
         let mut cmd = Command::new(&self.cfg.bin);
-        cmd.arg("--api-sock").arg(&socket).stdin(Stdio::null());
+        cmd.arg("--api-sock")
+            .arg(&socket)
+            .current_dir(&vm_dir)
+            .stdin(Stdio::null());
         if let Ok(log) = std::fs::File::create(self.cfg.state_dir.join(format!("{vm}.log")))
             && let Ok(log2) = log.try_clone()
         {
@@ -273,6 +302,12 @@ impl VmRuntime for FirecrackerRuntime {
             )
             .await?;
         }
+        if let Some(cid) = spec.vsock_cid {
+            // Relative path: resolved against the VMM's cwd (this VM's dir), and
+            // recorded as-is in any snapshot so clones get their own socket.
+            client::put(&socket, "/vsock", json!({ "guest_cid": cid, "uds_path": VSOCK_UDS }))
+                .await?;
+        }
         Ok(())
     }
 
@@ -335,6 +370,48 @@ impl VmRuntime for FirecrackerRuntime {
         let _ = std::fs::remove_file(self.pidfile(vm));
         let _ = std::fs::remove_dir_all(self.snap_dir(vm));
         Ok(())
+    }
+
+    /// Firecracker's host-initiated vsock handshake: connect to the VM's vsock
+    /// unix socket, write `CONNECT <port>\n`, and read the `OK <port>\n` line;
+    /// the stream is then the raw guest connection.
+    async fn guest_channel(&self, vm: VmId, port: u32) -> Result<OwnedFd> {
+        let path = self.vsock_path(vm);
+        let connect = async {
+            let mut s = tokio::net::UnixStream::connect(&path).await.map_err(|e| {
+                Error::Backend(format!(
+                    "connect to vsock socket {}: {e} (a template baked without a vsock device has none)",
+                    path.display()
+                ))
+            })?;
+            s.write_all(format!("CONNECT {port}\n").as_bytes()).await.map_err(be)?;
+            let mut line = Vec::with_capacity(16);
+            let mut b = [0u8; 1];
+            loop {
+                if s.read(&mut b).await.map_err(be)? == 0 {
+                    return Err(Error::Backend(format!(
+                        "vsock CONNECT {port} refused: nothing is listening on that guest port"
+                    )));
+                }
+                if b[0] == b'\n' {
+                    break;
+                }
+                line.push(b[0]);
+                if line.len() > 32 {
+                    return Err(Error::Backend("malformed vsock CONNECT reply".into()));
+                }
+            }
+            let reply = String::from_utf8_lossy(&line);
+            if !reply.starts_with("OK ") {
+                return Err(Error::Backend(format!("vsock CONNECT {port} failed: {reply}")));
+            }
+            let std = s.into_std().map_err(be)?;
+            std.set_nonblocking(false).map_err(be)?;
+            Ok(OwnedFd::from(std))
+        };
+        tokio::time::timeout(CONNECT_TIMEOUT, connect)
+            .await
+            .map_err(|_| Error::Backend(format!("vsock CONNECT {port} timed out")))?
     }
 
     async fn status(&self, vm: VmId) -> Result<VmStatus> {
@@ -461,6 +538,7 @@ mod tests {
             boot_args: "console=ttyS0 reboot=k pci=off".into(),
             resume_from: None,
             rootfs_backing: None,
+            vsock_cid: None,
         };
         rt.create(&spec).await.expect("create vm1");
         rt.start(vm1).await.expect("start vm1");

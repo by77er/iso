@@ -285,6 +285,7 @@ where
             boot_args: tpl.boot_args.clone(),
             resume_from,
             rootfs_backing,
+            vsock_cid: self.cfg.vsock_cid,
         };
         self.runtime.create(&spec).await?;
         self.runtime.start(rec.id).await?;
@@ -647,6 +648,22 @@ where
         *self.services.lock().unwrap()
     }
 
+    /// Open a raw stream to a vsock `port` inside a running VM — by default the
+    /// guest agent's. The VMM hands back a connected socket; the caller speaks
+    /// the guest protocol over it. Refused unless the VM is `Running`.
+    pub async fn guest_channel(&self, id: VmId, port: Option<u32>) -> Result<std::os::fd::OwnedFd> {
+        let rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
+        if rec.state != VmState::Running {
+            return Err(Error::InvalidState {
+                vm: id,
+                state: rec.state.as_str(),
+                op: "open a guest channel to",
+            });
+        }
+        let port = port.unwrap_or(self.cfg.guest_agent_port);
+        Ok(self.runtime.guest_channel(id, port).await?)
+    }
+
     /// Aggregate host stats (admin-only; never exposed to guests).
     pub async fn stats(&self) -> Result<Stats> {
         let pool = self.storage.pool_stats().await?;
@@ -830,6 +847,8 @@ mod tests {
                 graceful_stop: Duration::from_secs(30),
                 slot_capacity,
                 forward_ports: (20000, 20010),
+                vsock_cid: Some(3),
+                guest_agent_port: 5000,
             },
             PoolStats {
                 data_percent: pool,

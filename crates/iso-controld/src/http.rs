@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -17,6 +18,7 @@ use iso_common::{
 };
 use iso_control_plane::types::{egress_parse, egress_str, TemplateDef};
 use iso_control_plane::{ControlPlane, CreateVm, Error as CpError, VmRecord};
+use iso_guest_proto::{AgentInfo, ClientError, DirEntry, ExecRequest, ExecResult, FileContent, GuestClient};
 use serde::{Deserialize, Serialize};
 
 type Cp<N, S, R> = Arc<ControlPlane<N, S, R>>;
@@ -50,6 +52,23 @@ impl From<CpError> for ApiError {
 fn parse_id(s: &str) -> Result<VmId, ApiError> {
     VmId::parse(s).ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "invalid vm id".into()))
 }
+
+impl From<ClientError> for ApiError {
+    fn from(e: ClientError) -> Self {
+        // The agent refusing an operation (a missing path, a bad program) is
+        // the caller's problem; not reaching the agent at all is the host's.
+        let code = match &e {
+            ClientError::Agent(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::BAD_GATEWAY,
+        };
+        ApiError(code, e.to_string())
+    }
+}
+
+/// Bound on one guest file operation, and the slack added to an `exec`'s own
+/// timeout so a wedged agent can't hold the request forever.
+const GUEST_IO_TIMEOUT: Duration = Duration::from_secs(60);
+const EXEC_SLACK: Duration = Duration::from_secs(15);
 
 // ---- DTOs ----
 
@@ -134,6 +153,40 @@ struct PolicyReq {
     /// `"allow" | "proxy" | "deny"`; invalid/absent leaves it unchanged.
     #[serde(default)]
     egress: Option<String>,
+}
+
+/// Query for the guest file endpoints.
+#[derive(Deserialize)]
+struct PathQuery {
+    path: String,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    #[serde(default)]
+    recursive: bool,
+}
+
+/// Body for `PUT /vms/{id}/files`: one of `content` (UTF-8 text) or
+/// `content_b64` (arbitrary bytes).
+#[derive(Deserialize)]
+struct WriteFileReq {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    content_b64: Option<String>,
+    #[serde(default)]
+    mode: Option<u32>,
+    #[serde(default)]
+    mkdir: bool,
+}
+
+#[derive(Serialize)]
+struct WrittenResp {
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct DirResp {
+    entries: Vec<DirEntry>,
 }
 
 #[derive(Serialize)]
@@ -400,6 +453,130 @@ where
     }))
 }
 
+// ---- guest agent (exec and files inside the VM) ----
+
+/// Open the guest agent inside `id` over the VMM's channel.
+async fn guest<N, S, R>(
+    cp: &Cp<N, S, R>,
+    id: &str,
+) -> Result<GuestClient<tokio::net::UnixStream>, ApiError>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    let fd = cp.guest_channel(parse_id(id)?, None).await?;
+    let std = std::os::unix::net::UnixStream::from(fd);
+    let io = |e: std::io::Error| ApiError(StatusCode::BAD_GATEWAY, format!("guest channel: {e}"));
+    std.set_nonblocking(true).map_err(io)?;
+    Ok(GuestClient::new(tokio::net::UnixStream::from_std(std).map_err(io)?))
+}
+
+async fn bounded<T>(limit: Duration, f: impl std::future::Future<Output = Result<T, ClientError>>) -> Result<T, ApiError> {
+    match tokio::time::timeout(limit, f).await {
+        Ok(r) => Ok(r?),
+        Err(_) => Err(ApiError(StatusCode::GATEWAY_TIMEOUT, "guest agent did not answer in time".into())),
+    }
+}
+
+async fn agent_info<N, S, R>(
+    State(cp): State<Cp<N, S, R>>,
+    Path(id): Path<String>,
+) -> Result<Json<AgentInfo>, ApiError>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    let mut g = guest(&cp, &id).await?;
+    Ok(Json(bounded(GUEST_IO_TIMEOUT, g.ping()).await?))
+}
+
+async fn exec<N, S, R>(
+    State(cp): State<Cp<N, S, R>>,
+    Path(id): Path<String>,
+    Json(req): Json<ExecRequest>,
+) -> Result<Json<ExecResult>, ApiError>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    if req.cmd.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "cmd is required".into()));
+    }
+    let limit = Duration::from_millis(req.timeout_ms.unwrap_or(iso_guest_proto::DEFAULT_EXEC_TIMEOUT_MS)) + EXEC_SLACK;
+    let mut g = guest(&cp, &id).await?;
+    Ok(Json(bounded(limit, g.exec(req)).await?))
+}
+
+async fn read_file<N, S, R>(
+    State(cp): State<Cp<N, S, R>>,
+    Path(id): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<FileContent>, ApiError>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    let mut g = guest(&cp, &id).await?;
+    Ok(Json(bounded(GUEST_IO_TIMEOUT, g.read_file(&q.path, q.max_bytes)).await?))
+}
+
+async fn write_file<N, S, R>(
+    State(cp): State<Cp<N, S, R>>,
+    Path(id): Path<String>,
+    Query(q): Query<PathQuery>,
+    Json(req): Json<WriteFileReq>,
+) -> Result<Json<WrittenResp>, ApiError>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    use base64::Engine as _;
+    let content_b64 = match (req.content, req.content_b64) {
+        (Some(text), None) => base64::engine::general_purpose::STANDARD.encode(text.as_bytes()),
+        (None, Some(b64)) => b64,
+        (None, None) => return Err(ApiError(StatusCode::BAD_REQUEST, "one of content or content_b64 is required".into())),
+        (Some(_), Some(_)) => return Err(ApiError(StatusCode::BAD_REQUEST, "give content or content_b64, not both".into())),
+    };
+    let mut g = guest(&cp, &id).await?;
+    let bytes = bounded(GUEST_IO_TIMEOUT, g.write_file(&q.path, content_b64, req.mode, req.mkdir)).await?;
+    Ok(Json(WrittenResp { bytes }))
+}
+
+async fn remove_path<N, S, R>(
+    State(cp): State<Cp<N, S, R>>,
+    Path(id): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> Result<StatusCode, ApiError>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    let mut g = guest(&cp, &id).await?;
+    bounded(GUEST_IO_TIMEOUT, g.remove(&q.path, q.recursive)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_dir<N, S, R>(
+    State(cp): State<Cp<N, S, R>>,
+    Path(id): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<DirResp>, ApiError>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    let mut g = guest(&cp, &id).await?;
+    let entries = bounded(GUEST_IO_TIMEOUT, g.list_dir(&q.path)).await?;
+    Ok(Json(DirResp { entries }))
+}
+
 /// Build the admin router over a control plane.
 pub fn router<N, S, R>(cp: Cp<N, S, R>) -> Router
 where
@@ -420,6 +597,13 @@ where
             "/vms/{id}/forwards/{host_port}",
             delete(remove_forward::<N, S, R>),
         )
+        .route("/vms/{id}/agent", get(agent_info::<N, S, R>))
+        .route("/vms/{id}/exec", post(exec::<N, S, R>))
+        .route(
+            "/vms/{id}/files",
+            get(read_file::<N, S, R>).put(write_file::<N, S, R>).delete(remove_path::<N, S, R>),
+        )
+        .route("/vms/{id}/dir", get(list_dir::<N, S, R>))
         .route("/templates", post(register_template::<N, S, R>))
         .route("/stats", get(stats::<N, S, R>))
         .with_state(cp)
@@ -518,9 +702,18 @@ mod tests {
         async fn status(&self, vm: VmId) -> IRes<VmStatus> {
             Ok(self.0.lock().unwrap().get(&vm).copied().unwrap_or(VmStatus::Absent))
         }
+        /// The real guest agent on the far end of a socketpair: the handlers
+        /// under test speak to it exactly as they would to a VM.
+        async fn guest_channel(&self, _vm: VmId, _port: u32) -> IRes<std::os::fd::OwnedFd> {
+            let (host, guest) = std::os::unix::net::UnixStream::pair().map_err(|e| iso_common::Error::Backend(e.to_string()))?;
+            guest.set_nonblocking(true).unwrap();
+            let guest = tokio::net::UnixStream::from_std(guest).unwrap();
+            tokio::spawn(iso_guest_agent::serve_connection(guest));
+            Ok(std::os::fd::OwnedFd::from(host))
+        }
     }
 
-    fn app() -> Router {
+    pub(super) fn app() -> Router {
         let cfg = Config {
             db_path: ":memory:".into(),
             default_vcpus: 1,
@@ -529,6 +722,8 @@ mod tests {
             graceful_stop: Duration::from_secs(1),
             slot_capacity: 8,
             forward_ports: (20000, 30000),
+            vsock_cid: Some(3),
+            guest_agent_port: 5000,
         };
         let cp = Arc::new(
             ControlPlane::new(cfg, MNet, MStore, MRun(Mutex::new(Default::default()))).unwrap(),
@@ -546,12 +741,12 @@ mod tests {
         router(cp)
     }
 
-    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    pub(super) async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     }
 
-    fn post(path: &str, json: serde_json::Value) -> Request<Body> {
+    pub(super) fn post(path: &str, json: serde_json::Value) -> Request<Body> {
         Request::builder()
             .method("POST")
             .uri(path)
@@ -611,5 +806,119 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod guest_tests {
+    use super::tests::{app, body_json, post};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn create_vm(app: &axum::Router, lifecycle: &str) -> String {
+        let resp = app
+            .clone()
+            .oneshot(post("/vms", serde_json::json!({ "template": "base", "lifecycle": lifecycle })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn exec_runs_a_program_in_the_guest() {
+        let app = app();
+        let id = create_vm(&app, "ephemeral").await;
+        let resp = app
+            .clone()
+            .oneshot(post(
+                &format!("/vms/{id}/exec"),
+                serde_json::json!({ "cmd": "sh", "args": ["-c", "printf hello; echo oops >&2; exit 4"] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["exit_code"], 4);
+        assert_eq!(v["stdout"], "hello");
+        assert_eq!(v["stderr"], "oops\n");
+        assert_eq!(v["timed_out"], false);
+    }
+
+    #[tokio::test]
+    async fn files_round_trip_through_the_guest() {
+        let app = app();
+        let id = create_vm(&app, "ephemeral").await;
+        let dir = std::env::temp_dir().join(format!("iso-http-guest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("notes/todo.md");
+        let path = file.to_str().unwrap();
+
+        let put = Request::builder()
+            .method("PUT")
+            .uri(format!("/vms/{id}/files?path={path}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({ "content": "# hi\n", "mkdir": true }).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(put).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["bytes"], 5);
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get(format!("/vms/{id}/files?path={path}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["size"], 5);
+        assert_eq!(v["content_b64"], "IyBoaQo=");
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get(format!("/vms/{id}/dir?path={}", dir.join("notes").display())).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["entries"][0]["name"], "todo.md");
+
+        let resp = app
+            .clone()
+            .oneshot(Request::delete(format!("/vms/{id}/files?path={}&recursive=true", dir.display())).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(!dir.exists());
+
+        // The agent's own refusal is the caller's error, not the host's.
+        let resp = app
+            .clone()
+            .oneshot(Request::get(format!("/vms/{id}/files?path={}", dir.join("gone").display())).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn agent_endpoints_need_a_running_vm() {
+        let app = app();
+        let id = create_vm(&app, "durable").await;
+        let resp = app
+            .clone()
+            .oneshot(Request::get(format!("/vms/{id}/agent")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["agent"], "iso-guest-agent");
+
+        let resp = app.clone().oneshot(post(&format!("/vms/{id}/stop"), serde_json::json!({}))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app
+            .clone()
+            .oneshot(post(&format!("/vms/{id}/exec"), serde_json::json!({ "cmd": "true" })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "stopped vm has no guest channel");
     }
 }

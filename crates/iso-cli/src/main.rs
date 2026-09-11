@@ -87,6 +87,11 @@ struct Bake {
     /// SSH key for `--provision` (default: <state>/keys/test_ed25519).
     #[arg(long)]
     ssh_key: Option<PathBuf>,
+    /// Guest CID of the vsock device baked into the template, which is what the
+    /// host's guest channel (exec, file access) rides on. Must match the
+    /// control plane's `vsock_cid`.
+    #[arg(long, default_value_t = 3)]
+    vsock_cid: u32,
 }
 
 fn run(args: &[&str]) -> R<()> {
@@ -292,6 +297,7 @@ async fn bake(b: Bake) -> R<()> {
         boot_args: boot_args.clone(),
         resume_from: None,
         rootfs_backing: None,
+        vsock_cid: Some(b.vsock_cid),
     };
 
     let ssh_key = b

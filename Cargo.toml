@@ -12,6 +12,8 @@ members = [
     "crates/iso-firecracker",
     "crates/iso-controld",
     "crates/iso-cli",
+    "crates/iso-guest-proto",
+    "crates/iso-guest-agent",
 ]
 
 [workspace.package]

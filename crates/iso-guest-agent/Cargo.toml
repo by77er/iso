@@ -1,0 +1,24 @@
+[package]
+name = "iso-guest-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The in-guest agent: serves exec and file operations to the host over vsock"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "iso-guest-agent"
+path = "src/bin/iso-guest-agent.rs"
+
+[dependencies]
+iso-guest-proto = { path = "../iso-guest-proto" }
+base64 = "0.22"
+libc = "0.2"
+serde_json = "1"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "fs"] }
+tokio-vsock = "0.7"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "fs"] }
