@@ -51,6 +51,8 @@ fn env(key: &str) -> Option<String> {
 ///   and the admin socket.
 /// - `ISO_VG` (default `iso`), `ISO_UPLINK` (default: detected), and
 ///   `ISO_IMAGE_SIZE_GIB` (default `100`) tune the rest.
+/// - `ISO_FIRECRACKER_BIN` (default `firecracker`); `ISO_JAILER=1` runs every
+///   VM under `jailer`, see [`iso_firecracker::JailerConfig::from_env`].
 pub fn from_env() -> Settings {
     let state = PathBuf::from(env("ISO_STATE_DIR").unwrap_or_else(|| "/var/lib/iso".into()));
     let vg = env("ISO_VG").unwrap_or_else(|| "iso".into());
@@ -78,8 +80,10 @@ pub fn from_env() -> Settings {
             ..Default::default()
         },
         firecracker: iso_firecracker::Config {
+            bin: env("ISO_FIRECRACKER_BIN").map(PathBuf::from).unwrap_or_else(|| "firecracker".into()),
             socket_dir: state.join("fc/sock"),
             state_dir: state.join("fc/state"),
+            jailer: iso_firecracker::JailerConfig::from_env(&state),
             ..Default::default()
         },
         control_sock: state.join("control.sock"),

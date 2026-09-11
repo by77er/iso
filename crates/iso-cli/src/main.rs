@@ -271,9 +271,14 @@ async fn bake(b: Bake) -> R<()> {
     let fixture = net.apply(slot, &policy).await?;
 
     // --- runtime: boot the builder VM directly on the rootfs LV ---
+    // Honors ISO_JAILER / ISO_FIRECRACKER_BIN like the daemon, so a jailed host
+    // bakes jailed: the snapshot then records the jail-relative `/rootfs` and
+    // `v.sock` paths every clone resolves to its own resources.
     let fcfg = iso_firecracker::Config {
+        bin: std::env::var("ISO_FIRECRACKER_BIN").map(PathBuf::from).unwrap_or_else(|_| "firecracker".into()),
         socket_dir: b.state.join("fc/sock"),
         state_dir: b.state.join("fc/state"),
+        jailer: iso_firecracker::JailerConfig::from_env(&b.state),
         ..Default::default()
     };
     let rt = iso_firecracker::FirecrackerRuntime::new(fcfg.clone());
@@ -421,7 +426,7 @@ async fn bake_inner(
 
     // copy the snapshot to a stable, template-scoped location that survives the
     // builder's teardown.
-    let src = state.join("fc/state").join(builder.to_string());
+    let src = rt.snapshot_dir(builder);
     let dst = state.join("templates").join(name);
     std::fs::create_dir_all(&dst)?;
     let mem = dst.join("mem");

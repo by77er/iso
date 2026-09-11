@@ -5,8 +5,15 @@
 //! over its API unix socket. Socket/pid/snapshot paths derive deterministically
 //! from `(config, VmId)`, so the control plane re-adopts instances after a
 //! restart via [`VmRuntime::status`].
+//!
+//! With [`Config::jailer`] set, the process is Firecracker's `jailer` instead:
+//! a chroot per VM, an unprivileged uid, the netns joined by the jailer. See
+//! [`jail`] for the layout.
 
 mod client;
+pub mod jail;
+
+pub use jail::JailerConfig;
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -46,6 +53,9 @@ pub struct Config {
     pub netns_dir: PathBuf,
     /// How long to wait for the API socket to appear after spawn.
     pub boot_timeout: Duration,
+    /// Run every VM under `jailer` with these settings; `None` runs
+    /// `firecracker` directly as the daemon's own user.
+    pub jailer: Option<JailerConfig>,
 }
 
 impl Default for Config {
@@ -56,8 +66,18 @@ impl Default for Config {
             state_dir: PathBuf::from("/var/lib/iso/fc"),
             netns_dir: PathBuf::from("/var/run/netns"),
             boot_timeout: Duration::from_secs(10),
+            jailer: None,
         }
     }
+}
+
+/// What Firecracker's API is told about a VM's files: host paths when it runs
+/// directly, jail-relative constants when it runs jailed.
+struct ApiPaths {
+    kernel: String,
+    rootfs: String,
+    snapshot_mem: String,
+    snapshot_vmstate: String,
 }
 
 pub struct FirecrackerRuntime {
@@ -75,8 +95,16 @@ impl FirecrackerRuntime {
         }
     }
 
+    /// The jail root for `vm`, when jailing is on.
+    fn jail_root(&self, vm: VmId) -> Option<PathBuf> {
+        self.cfg.jailer.as_ref().map(|j| j.jail_dir(&self.cfg.bin, vm).join("root"))
+    }
+
     fn socket(&self, vm: VmId) -> PathBuf {
-        self.cfg.socket_dir.join(format!("{vm}.sock"))
+        match self.jail_root(vm) {
+            Some(root) => root.join("run/firecracker.socket"),
+            None => self.cfg.socket_dir.join(format!("{vm}.sock")),
+        }
     }
     fn pidfile(&self, vm: VmId) -> PathBuf {
         self.cfg.state_dir.join(format!("{vm}.pid"))
@@ -89,13 +117,57 @@ impl FirecrackerRuntime {
     }
 
     /// Where a snapshot taken by [`VmRuntime::suspend`] lands: `mem` and
-    /// `vmstate` files in this directory.
+    /// `vmstate` files in this directory (inside the jail when jailed).
     pub fn snapshot_dir(&self, vm: VmId) -> PathBuf {
-        self.snap_dir(vm)
+        match self.jail_root(vm) {
+            Some(root) => root.join("snapshot"),
+            None => self.snap_dir(vm),
+        }
     }
 
     fn vsock_path(&self, vm: VmId) -> PathBuf {
-        self.snap_dir(vm).join(VSOCK_UDS)
+        match self.jail_root(vm) {
+            Some(root) => root.join(VSOCK_UDS),
+            None => self.snap_dir(vm).join(VSOCK_UDS),
+        }
+    }
+
+    /// Spawn the VM through `jailer`: build the jail on disk, then run the
+    /// jailer (which joins the netns, drops privileges and execs Firecracker
+    /// in place, so the child pid is the VMM's). Returns the API-side paths.
+    fn spawn_jailed(&self, jailer: &JailerConfig, spec: &InstanceSpec) -> Result<ApiPaths> {
+        std::fs::create_dir_all(&self.cfg.state_dir).map_err(be)?;
+        let fc = jail::resolve_bin(&self.cfg.bin)?;
+        let plan = jail::plan(jailer, &fc, &self.cfg.netns_dir.join(&spec.netns), spec);
+        jail::teardown(&plan.jail_dir);
+        jail::materialize(&plan, jailer, &spec.rootfs_device)?;
+
+        let mut cmd = Command::new(&jailer.bin);
+        cmd.args(&plan.args)
+            .arg("--")
+            .arg("--api-sock")
+            .arg(jail::GUEST_API_SOCKET)
+            .stdin(Stdio::null());
+        if let Ok(log) = std::fs::File::create(self.cfg.state_dir.join(format!("{}.log", spec.vm)))
+            && let Ok(log2) = log.try_clone()
+        {
+            cmd.stdout(log).stderr(log2);
+        }
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().map_err(|e| Error::Backend(format!("spawn {}: {e}", jailer.bin.display())))?;
+        std::fs::write(self.pidfile(spec.vm), child.id().to_string()).map_err(be)?;
+        self.children.lock().unwrap().insert(spec.vm, child);
+        Ok(ApiPaths {
+            kernel: jail::GUEST_KERNEL.into(),
+            rootfs: jail::GUEST_ROOTFS.into(),
+            snapshot_mem: jail::GUEST_SNAPSHOT_MEM.into(),
+            snapshot_vmstate: jail::GUEST_SNAPSHOT_VMSTATE.into(),
+        })
     }
 
     fn pid_of(&self, vm: VmId) -> Option<i32> {
@@ -237,25 +309,37 @@ impl FirecrackerRuntime {
 
 impl VmRuntime for FirecrackerRuntime {
     async fn create(&self, spec: &InstanceSpec) -> Result<()> {
-        // On resume, redirect the snapshot's baked rootfs path to this VM's CoW
-        // device (see `spawn`); a fresh boot attaches `rootfs_device` directly.
-        let rootfs_bind = spec
-            .rootfs_backing
-            .as_deref()
-            .map(|baked| (spec.rootfs_device.as_path(), baked));
-        self.spawn(spec.vm, &spec.netns, rootfs_bind)?;
+        let paths = match &self.cfg.jailer {
+            Some(jailer) => self.spawn_jailed(jailer, spec)?,
+            None => {
+                // On resume, redirect the snapshot's baked rootfs path to this
+                // VM's CoW device (see `spawn`); a fresh boot attaches
+                // `rootfs_device` directly.
+                let rootfs_bind = spec
+                    .rootfs_backing
+                    .as_deref()
+                    .map(|baked| (spec.rootfs_device.as_path(), baked));
+                self.spawn(spec.vm, &spec.netns, rootfs_bind)?;
+                ApiPaths {
+                    kernel: spec.kernel.to_string_lossy().into_owned(),
+                    rootfs: spec.rootfs_device.to_string_lossy().into_owned(),
+                    snapshot_mem: spec.resume_from.as_ref().map(|s| s.mem_file.to_string_lossy().into_owned()).unwrap_or_default(),
+                    snapshot_vmstate: spec.resume_from.as_ref().map(|s| s.vmstate.to_string_lossy().into_owned()).unwrap_or_default(),
+                }
+            }
+        };
         self.wait_socket(spec.vm).await?;
         let socket = self.socket(spec.vm);
 
-        if let Some(snap) = &spec.resume_from {
+        if spec.resume_from.is_some() {
             // Load (paused). The TAP name is constant across netns, so the
             // snapshot's frozen network config is valid here without override.
             client::put(
                 &socket,
                 "/snapshot/load",
                 json!({
-                    "snapshot_path": snap.vmstate.to_string_lossy(),
-                    "mem_backend": { "backend_type": "File", "backend_path": snap.mem_file.to_string_lossy() },
+                    "snapshot_path": paths.snapshot_vmstate,
+                    "mem_backend": { "backend_type": "File", "backend_path": paths.snapshot_mem },
                     "enable_diff_snapshots": false,
                     "resume_vm": false,
                 }),
@@ -273,7 +357,7 @@ impl VmRuntime for FirecrackerRuntime {
         client::put(
             &socket,
             "/boot-source",
-            json!({ "kernel_image_path": spec.kernel.to_string_lossy(), "boot_args": spec.boot_args }),
+            json!({ "kernel_image_path": paths.kernel, "boot_args": spec.boot_args }),
         )
         .await?;
         client::put(
@@ -281,7 +365,7 @@ impl VmRuntime for FirecrackerRuntime {
             "/drives/rootfs",
             json!({
                 "drive_id": "rootfs",
-                "path_on_host": spec.rootfs_device.to_string_lossy(),
+                "path_on_host": paths.rootfs,
                 "is_root_device": true,
                 "is_read_only": false,
                 // Honor guest flush/FUA so ext4 journaling is actually durable.
@@ -324,16 +408,20 @@ impl VmRuntime for FirecrackerRuntime {
     async fn suspend(&self, vm: VmId) -> Result<()> {
         let socket = self.socket(vm);
         client::patch(&socket, "/vm", json!({ "state": "Paused" })).await?;
-        let dir = self.snap_dir(vm);
-        std::fs::create_dir_all(&dir).map_err(be)?;
+        let (vmstate, mem) = if self.jail_root(vm).is_some() {
+            (jail::GUEST_SNAPSHOT_VMSTATE.to_string(), jail::GUEST_SNAPSHOT_MEM.to_string())
+        } else {
+            let dir = self.snap_dir(vm);
+            std::fs::create_dir_all(&dir).map_err(be)?;
+            (
+                dir.join("vmstate").to_string_lossy().into_owned(),
+                dir.join("mem").to_string_lossy().into_owned(),
+            )
+        };
         client::put(
             &socket,
             "/snapshot/create",
-            json!({
-                "snapshot_type": "Full",
-                "snapshot_path": dir.join("vmstate").to_string_lossy(),
-                "mem_file_path": dir.join("mem").to_string_lossy(),
-            }),
+            json!({ "snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": mem }),
         )
         .await
     }
@@ -369,6 +457,9 @@ impl VmRuntime for FirecrackerRuntime {
         let _ = std::fs::remove_file(self.socket(vm));
         let _ = std::fs::remove_file(self.pidfile(vm));
         let _ = std::fs::remove_dir_all(self.snap_dir(vm));
+        if let Some(j) = &self.cfg.jailer {
+            jail::teardown(&j.jail_dir(&self.cfg.bin, vm));
+        }
         Ok(())
     }
 
@@ -521,6 +612,7 @@ mod tests {
             state_dir: base.join("state"),
             netns_dir: "/var/run/netns".into(),
             boot_timeout: Duration::from_secs(10),
+            jailer: None,
         };
         let rt = FirecrackerRuntime::new(cfg.clone());
 
