@@ -312,7 +312,23 @@ impl FirecrackerRuntime {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        Err(Error::Backend("timed out waiting for firecracker API socket".into()))
+        // Say what was waited for: with the jailer the path depends on how the
+        // jailer named the jail, which is the first thing to check.
+        let mut listing = String::new();
+        if let Some(root) = self.jail_root(vm) {
+            match std::fs::read_dir(&root) {
+                Ok(rd) => {
+                    let names: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+                    listing = format!("; jail root {} holds {names:?}", root.display());
+                }
+                Err(e) => listing = format!("; jail root {} unreadable: {e}", root.display()),
+            }
+        }
+        Err(Error::Backend(format!(
+            "timed out waiting for firecracker API socket {} (exists: {}){listing}",
+            socket.display(),
+            socket.exists()
+        )))
     }
 }
 
