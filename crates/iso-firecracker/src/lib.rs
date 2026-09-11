@@ -303,9 +303,13 @@ impl FirecrackerRuntime {
     async fn wait_socket(&self, vm: VmId) -> Result<()> {
         let socket = self.socket(vm);
         let deadline = Instant::now() + self.cfg.boot_timeout;
+        let mut last_err = String::from("socket not present yet");
         while Instant::now() < deadline {
-            if socket.exists() && tokio::net::UnixStream::connect(&socket).await.is_ok() {
-                return Ok(());
+            if socket.exists() {
+                match tokio::net::UnixStream::connect(&socket).await {
+                    Ok(_) => return Ok(()),
+                    Err(e) => last_err = e.to_string(),
+                }
             }
             if !self.pid_alive(vm) {
                 return Err(Error::Backend("firecracker exited before its API socket was ready".into()));
@@ -325,7 +329,7 @@ impl FirecrackerRuntime {
             }
         }
         Err(Error::Backend(format!(
-            "timed out waiting for firecracker API socket {} (exists: {}){listing}",
+            "timed out waiting for firecracker API socket {} (exists: {}; last connect error: {last_err}){listing}",
             socket.display(),
             socket.exists()
         )))
