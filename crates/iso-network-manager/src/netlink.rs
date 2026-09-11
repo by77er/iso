@@ -43,8 +43,8 @@ fn ignore_exists<T>(res: std::result::Result<T, rtnetlink::Error>) -> Result<()>
 async fn link_index(handle: &Handle, name: &str) -> Result<Option<u32>> {
     let mut links = handle.link().get().match_name(name.to_string()).execute();
     match links.try_next().await {
-        Ok(Some(link)) => Ok(Some(link.header.index)),
-        Ok(None) => Ok(None),
+        Ok(Some(link)) => return Ok(Some(link.header.index)),
+        Ok(None) => {}
         Err(e) => {
             if let rtnetlink::Error::NetlinkError(ref msg) = e {
                 let code = msg.code.map(|c| c.get());
@@ -52,9 +52,20 @@ async fn link_index(handle: &Handle, name: &str) -> Result<Option<u32>> {
                     return Ok(None);
                 }
             }
-            Err(be(e))
+            return Err(be(e));
         }
     }
+    // A filtered GETLINK came back empty. Not every kernel honours the name
+    // filter (WSL2's did not for its built-in dummy0), so confirm with a dump
+    // before concluding the link is absent: creating one that exists fails.
+    use rtnetlink::packet_route::link::LinkAttribute;
+    let mut all = handle.link().get().execute();
+    while let Some(link) = all.try_next().await.map_err(be)? {
+        if link.attributes.iter().any(|a| matches!(a, LinkAttribute::IfName(n) if n == name)) {
+            return Ok(Some(link.header.index));
+        }
+    }
+    Ok(None)
 }
 
 /// Add `ip/prefix` to a link (by name) and bring it up. Idempotent.
@@ -199,14 +210,14 @@ pub fn host_init(cfg: &Config) -> Result<()> {
         let (conn, handle, _) = new_connection().map_err(be)?;
         tokio::spawn(conn);
         if link_index(&handle, "dummy0").await?.is_none() {
-            handle
-                .link()
-                .add(LinkDummy::new("dummy0").build())
-                .execute()
-                .await
-                .map_err(be)?;
+            // Idempotent: a dummy0 that appeared between the lookup and here
+            // (or that the lookup missed) is what we wanted anyway.
+            ignore_exists(handle.link().add(LinkDummy::new("dummy0").build()).execute().await)
+                .map_err(|e| Error::Backend(format!("host init: create dummy0: {e}")))?;
         }
-        addr_and_up(&handle, "dummy0", services, 32).await
+        addr_and_up(&handle, "dummy0", services, 32)
+            .await
+            .map_err(|e| Error::Backend(format!("host init: {services}/32 on dummy0: {e}")))
     })
 }
 

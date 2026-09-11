@@ -67,6 +67,8 @@ export interface IsoConfig {
 	server: string;
 	insecure: boolean;
 	creds?: IsoCredentials;
+	/** Why credentials could not be loaded, when they were configured but unreadable. */
+	credsError?: string;
 	template: string;
 	egress: string;
 	principal?: string;
@@ -87,6 +89,7 @@ const truthy = (v: string | undefined) => v !== undefined && ["1", "true", "yes"
 export function configFromEnv(): IsoConfig {
 	const insecure = truthy(env("ISO_INSECURE"));
 	let creds: IsoCredentials | undefined;
+	let credsError: string | undefined;
 	if (!insecure) {
 		const dir = env("ISO_CREDS");
 		const name = env("ISO_CLIENT") ?? "admin";
@@ -94,13 +97,20 @@ export function configFromEnv(): IsoConfig {
 		const cert = env("ISO_CLIENT_CERT") ?? (dir ? join(dir, `${name}.crt`) : undefined);
 		const key = env("ISO_CLIENT_KEY") ?? (dir ? join(dir, `${name}.key`) : undefined);
 		if (ca && cert && key) {
-			creds = { ca: readFileSync(ca, "utf8"), cert: readFileSync(cert, "utf8"), key: readFileSync(key, "utf8") };
+			try {
+				creds = { ca: readFileSync(ca, "utf8"), cert: readFileSync(cert, "utf8"), key: readFileSync(key, "utf8") };
+			} catch (e) {
+				// Configured but not there (yet): say so and stay local, rather
+				// than fail the extension at load.
+				credsError = `${(e as Error).message}; run \`isoctl admin issue-client --name ${name} --out ${dir ?? "<dir>"}\` on the iso host`;
+			}
 		}
 	}
 	return {
 		server: (env("ISO_SERVER") ?? "https://127.0.0.1:7070").replace(/\/+$/, ""),
 		insecure,
 		creds,
+		credsError,
 		template: env("ISO_TEMPLATE") ?? "base",
 		egress: env("ISO_EGRESS") ?? "proxy",
 		principal: env("ISO_PRINCIPAL"),
@@ -622,9 +632,19 @@ export default function (pi: ExtensionAPI) {
 		cfg = configFromEnv();
 		// Nothing configured on this machine: stay local rather than fail the
 		// first tool call. ISO_SERVER or ISO_CREDS (or ISO_INSECURE) turns it on.
+		if (cfg.credsError) {
+			disabled = true;
+			ctx.ui?.notify?.(`iso: credentials unreadable, tools stay local (${cfg.credsError})`, "warning");
+			return;
+		}
 		if (!env("ISO_SERVER") && !cfg.creds && !cfg.insecure) {
 			disabled = true;
 			ctx.ui?.notify?.("iso: not configured (set ISO_SERVER and ISO_CREDS); tools stay local", "info");
+			return;
+		}
+		if (!cfg.creds && !cfg.insecure) {
+			disabled = true;
+			ctx.ui?.notify?.("iso: ISO_SERVER is set but no credentials (ISO_CREDS + ISO_CLIENT, or ISO_INSECURE=1); tools stay local", "warning");
 			return;
 		}
 		const flag = (k: string) => pi.getFlag(k) as string | undefined;
