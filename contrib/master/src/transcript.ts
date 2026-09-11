@@ -1,3 +1,11 @@
+import type { Session } from "./api";
+
+export type SwarmSource = {
+  id: string;
+  name: string;
+  role: "planner" | "worker";
+  relationship: "parent" | "child";
+};
 export type Event = {
   seq: number;
   type: string;
@@ -9,10 +17,12 @@ export type Event = {
   args?: unknown;
   result?: unknown;
   isError?: boolean;
+  source?: SwarmSource;
 };
 export type Item = {
+  outgoing?: boolean;
   key: number;
-  kind: "user" | "assistant" | "tool" | "notice";
+  kind: "user" | "assistant" | "tool" | "notice" | "swarm";
   text: string;
   streaming?: boolean;
   toolId?: string;
@@ -20,11 +30,20 @@ export type Item = {
   args?: unknown;
   result?: unknown;
   isError?: boolean;
+  source?: SwarmSource;
 };
 export function reduceEvents(items: Item[], events: Event[]): Item[] {
   const result = items.map((i) => ({ ...i }));
   for (const e of events) {
     switch (e.type) {
+      case "swarm_message":
+        result.push({
+          key: e.seq,
+          kind: "swarm",
+          text: e.text || "",
+          source: e.source,
+        });
+        break;
       case "assistant_start":
         result.push({
           key: e.seq,
@@ -99,4 +118,64 @@ export function reduceEvents(items: Item[], events: Event[]): Item[] {
     }
   }
   return result;
+}
+
+export type TranscriptEntry =
+  Item | { kind: "tools"; key: number; items: Item[] };
+
+export function presentSwarmSends(
+  items: Item[],
+  session: Session,
+  sessions: Session[],
+): Item[] {
+  return items.map((item) => {
+    if (item.kind !== "tool" || item.name !== "swarm_send" || !session.swarm)
+      return item;
+    const args = item.args as
+      { recipient?: unknown; message?: unknown } | undefined;
+    if (typeof args?.recipient !== "string" || typeof args.message !== "string")
+      return item;
+    const recipient = sessions.find((node) => node.id === args.recipient);
+    const relationship =
+      session.swarm.parent === args.recipient
+        ? "parent"
+        : recipient?.swarm?.parent === session.id &&
+            recipient.swarm.root === session.swarm.root
+          ? "child"
+          : undefined;
+    if (!relationship) return item;
+    return {
+      ...item,
+      kind: "swarm",
+      outgoing: true,
+      text: args.message,
+      source: {
+        id: args.recipient,
+        name: recipient?.name || args.recipient,
+        role: recipient?.swarm?.role || "planner",
+        relationship,
+      },
+    };
+  });
+}
+
+export function groupTranscript(items: Item[]): TranscriptEntry[] {
+  const entries: TranscriptEntry[] = [];
+  items.forEach((item, index) => {
+    // Tool-only assistant turns should not leave an empty avatar row.
+    if (
+      item.kind === "assistant" &&
+      !item.text.trim() &&
+      (!item.streaming ||
+        items[index + 1]?.kind === "tool" ||
+        items[index + 1]?.outgoing)
+    )
+      return;
+    if (item.kind === "tool") {
+      const last = entries.at(-1);
+      if (last?.kind === "tools") last.items.push(item);
+      else entries.push({ kind: "tools", key: item.key, items: [item] });
+    } else entries.push(item);
+  });
+  return entries;
 }

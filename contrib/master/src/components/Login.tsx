@@ -1,7 +1,8 @@
 import React, { useState } from "react";
-import { ShieldCheck, LoaderCircle } from "lucide-react";
+import { LoaderCircle } from "lucide-react";
 import { api, type User } from "../api";
 import { Brand, ErrorBanner } from "./shared";
+import ThemePicker from "./ThemePicker";
 
 export default function Login({ onLogin }: { onLogin: (u: User) => void }) {
   const [username, setUsername] = useState("admin"),
@@ -25,7 +26,6 @@ export default function Login({ onLogin }: { onLogin: (u: User) => void }) {
     <main className="login-screen">
       <div className="login-card">
         <Brand />
-        <div className="eyebrow">YOUR PRIVATE AGENT WORKSPACE</div>
         <h1>Good work starts here.</h1>
         <p>Give your agent a task. We’ll take care of the workspace.</p>
         <form onSubmit={submit}>
@@ -53,10 +53,7 @@ export default function Login({ onLogin }: { onLogin: (u: User) => void }) {
             {busy ? <LoaderCircle className="spin" size={16} /> : null}Sign in
           </button>
         </form>
-        <small>
-          <ShieldCheck size={15} /> Isolated execution. Persistent
-          conversations.
-        </small>
+        <ThemePicker />
       </div>
     </main>
   );

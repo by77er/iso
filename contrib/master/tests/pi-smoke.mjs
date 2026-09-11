@@ -5,10 +5,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import https from "node:https";
+import http from "node:http";
 import { once } from "node:events";
 
 const dir = mkdtempSync(join(tmpdir(), "iso-pi-smoke-"));
-let child, server;
+let child, server, swarmServer;
 try {
   execFileSync(
     "openssl",
@@ -99,6 +100,53 @@ try {
     content: "test",
   });
   assert.equal(calls.at(-1).body.content, "test");
+  // Real pi supplies a host cwd as the fifth argument to extension tools.
+  const hostContext = { cwd: "/master/session-not-in-guest" };
+  await tools[3].execute(
+    "bash-cwd",
+    { command: "pwd", timeout: 10 },
+    undefined,
+    undefined,
+    hostContext,
+  );
+  assert.equal(calls.at(-1).body.cwd, "/home/coder");
+  assert.equal(calls.at(-1).body.timeout_ms, 10000);
+  await tools[0].execute(
+    "read-cwd",
+    { path: "test.txt" },
+    undefined,
+    undefined,
+    hostContext,
+  );
+  assert.equal(
+    new URL(calls.at(-1).url, "https://localhost").searchParams.get("path"),
+    "/home/coder/test.txt",
+  );
+  await tools[1].execute(
+    "write-cwd",
+    { path: "test.txt", content: "test" },
+    undefined,
+    undefined,
+    hostContext,
+  );
+  assert.equal(
+    new URL(calls.at(-1).url, "https://localhost").searchParams.get("path"),
+    "/home/coder/test.txt",
+  );
+  await tools[2].execute(
+    "edit-cwd",
+    {
+      path: "test.txt",
+      edits: [{ oldText: "remote file", newText: "updated file" }],
+    },
+    undefined,
+    undefined,
+    hostContext,
+  );
+  assert.equal(
+    new URL(calls.at(-1).url, "https://localhost").searchParams.get("path"),
+    "/home/coder/test.txt",
+  );
   delete process.env.MASTER_REMOTE;
   assert.throws(() =>
     extension({
@@ -107,10 +155,100 @@ try {
     }),
   );
 
+  const swarmCalls = [];
+  swarmServer = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      assert.equal(req.headers.authorization, "Bearer test");
+      assert.equal(req.url, "/worker");
+      swarmCalls.push(JSON.parse(body));
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+  swarmServer.listen(join(dir, "swarm.sock"));
+  await once(swarmServer, "listening");
+  process.env.MASTER_REMOTE = JSON.stringify(config);
+  process.env.MASTER_SWARM = JSON.stringify({
+    session: "planner",
+    role: "planner",
+    parent: null,
+    task: "Plan",
+    socket: join(dir, "swarm.sock"),
+    token: "test",
+  });
+  const plannerTools = [],
+    handlers = new Map();
+  extension({
+    registerTool: (tool) => plannerTools.push(tool),
+    on: (event, handler) => handlers.set(event, handler),
+  });
+  assert.deepEqual(
+    plannerTools.map((tool) => tool.name),
+    ["read", "list", "swarm_status", "swarm_send", "swarm_spawn"],
+  );
+  await plannerTools
+    .find((tool) => tool.name === "swarm_spawn")
+    .execute("spawn", { name: "Child", role: "worker", task: "Implement" });
+  assert.deepEqual(swarmCalls.at(-1), {
+    action: "spawn",
+    name: "Child",
+    role: "worker",
+    task: "Implement",
+  });
+  await plannerTools
+    .find((tool) => tool.name === "swarm_send")
+    .execute("send", { recipient: "child", message: "Update" });
+  assert.deepEqual(swarmCalls.at(-1), {
+    action: "send",
+    recipient: "child",
+    message: "Update",
+  });
+  await plannerTools
+    .find((tool) => tool.name === "swarm_status")
+    .execute("status", {});
+  assert.deepEqual(swarmCalls.at(-1), { action: "status" });
+  assert.throws(
+    () =>
+      handlers.get("user_bash")().operations.exec("touch forbidden", "/", {}),
+    /Planners cannot execute/,
+  );
+  await plannerTools[0].execute(
+    "planner-read",
+    { path: "test.txt" },
+    undefined,
+    undefined,
+    hostContext,
+  );
+  assert.equal(
+    new URL(calls.at(-1).url, "https://localhost").searchParams.get("path"),
+    "/home/coder/test.txt",
+  );
+  process.env.MASTER_SWARM = JSON.stringify({
+    session: "worker",
+    role: "worker",
+    parent: "planner",
+    task: "Work",
+    socket: "/unused",
+    token: "test",
+  });
+  const workerTools = [];
+  extension({ registerTool: (tool) => workerTools.push(tool), on: () => {} });
+  assert.deepEqual(
+    workerTools.map((tool) => tool.name),
+    ["read", "write", "edit", "bash", "swarm_status", "swarm_send"],
+  );
+  delete process.env.MASTER_SWARM;
+  delete process.env.MASTER_REMOTE;
+
   const events = [];
   child = spawn(
-    resolve("node_modules/.bin/pi"),
+    process.execPath,
     [
+      resolve("node_modules/.bin/pi"),
       "--mode",
       "rpc",
       "--no-builtin-tools",
@@ -134,6 +272,18 @@ try {
         PI_OFFLINE: "1",
         PI_TELEMETRY: "0",
         MASTER_REMOTE: JSON.stringify(config),
+        ...(process.env.ISO_TEST_PLANNER
+          ? {
+              MASTER_SWARM: JSON.stringify({
+                session: "planner",
+                role: "planner",
+                parent: null,
+                task: "Plan",
+                socket: "/unused",
+                token: "test",
+              }),
+            }
+          : {}),
       },
       stdio: ["pipe", "pipe", "pipe"],
     },
@@ -177,9 +327,17 @@ try {
     }) + "\n",
   );
   const result = await wait((e) => e.id === "shell" && e.type === "response");
-  assert.equal(result.success, true);
-  assert.match(result.data.output, /remote-only\u2028result/);
-  assert.equal(calls.at(-1).body.args[1], "echo isolation-check");
+  if (process.env.ISO_TEST_PLANNER) {
+    assert.ok(result.success === false || result.data?.exitCode !== 0);
+    assert.match(JSON.stringify(result), /Planners cannot execute/);
+    assert.ok(
+      !calls.some((call) => call.body?.args?.[1] === "echo isolation-check"),
+    );
+  } else {
+    assert.equal(result.success, true);
+    assert.match(result.data.output, /remote-only\u2028result/);
+    assert.equal(calls.at(-1).body.args[1], "echo isolation-check");
+  }
   console.log(
     "PASS: real pi RPC readiness, mTLS guest routing, read/write, Unicode framing, fail-closed configuration",
   );
@@ -191,6 +349,10 @@ try {
   if (server) {
     server.closeAllConnections();
     await new Promise((r) => server.close(r));
+  }
+  if (swarmServer) {
+    swarmServer.closeAllConnections();
+    await new Promise((resolve) => swarmServer.close(resolve));
   }
   rmSync(dir, { recursive: true, force: true });
 }

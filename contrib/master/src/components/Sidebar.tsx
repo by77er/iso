@@ -5,9 +5,13 @@ import {
   Server,
   ChevronRight,
   LogOut,
+  Archive,
+  GitBranch,
+  Box,
 } from "lucide-react";
 import type { Session, User } from "../api";
 import { Brand, phaseLabel } from "./shared";
+import ThemePicker from "./ThemePicker";
 
 export default function Sidebar({
   sessions,
@@ -29,36 +33,91 @@ export default function Sidebar({
   logout: () => void;
 }) {
   const [archived, setArchived] = useState(false);
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const visible = sessions.filter(
+    (session) => archived || session.phase !== "closed",
+  );
+  function node(session: Session): React.ReactNode {
+    const children = visible
+      .filter((child) => child.swarm?.parent === session.id)
+      .sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
+    const expanded = !collapsed.has(session.id);
+    return (
+      <li key={session.id}>
+        <div className="sidebar-tree-row">
+          {children.length ? (
+            <button
+              className="tree-toggle"
+              aria-label={`${expanded ? "Collapse" : "Expand"} ${session.name}`}
+              aria-expanded={expanded}
+              onClick={() =>
+                setCollapsed((old) => {
+                  const next = new Set(old);
+                  if (next.has(session.id)) next.delete(session.id);
+                  else next.add(session.id);
+                  return next;
+                })
+              }
+            >
+              <ChevronRight size={14} />
+            </button>
+          ) : (
+            <span className="tree-toggle-space" />
+          )}
+          <button
+            className={`session-link ${selected === session.id && view === "chat" ? "selected" : ""}`}
+            onClick={() => select(session.id)}
+            title={session.name}
+            aria-current={
+              selected === session.id && view === "chat" ? "page" : undefined
+            }
+          >
+            {session.swarm ? (
+              session.swarm.role === "planner" ? (
+                <GitBranch size={17} />
+              ) : (
+                <Box size={17} />
+              )
+            ) : (
+              <MessageSquare size={17} />
+            )}
+            <span>
+              <strong>{session.name}</strong>
+              <small>
+                {session.swarm ? `${session.swarm.role} · ` : ""}
+                {phaseLabel[session.phase]}
+              </small>
+            </span>
+            <i className={`status-dot ${session.phase}`} />
+          </button>
+        </div>
+        {!!children.length && expanded && <ul>{children.map(node)}</ul>}
+      </li>
+    );
+  }
   return (
     <aside className="sidebar">
       <Brand />
       <button className="new-agent" onClick={newAgent}>
         <Plus size={18} />
-        New agent<span>+</span>
+        New agent
       </button>
       <div className="sidebar-section">
-        <span>YOUR AGENTS</span>
-        <button onClick={() => setArchived(!archived)}>
+        <button aria-pressed={archived} onClick={() => setArchived(!archived)}>
+          <Archive size={16} />
           {archived ? "Hide closed" : "Show closed"}
         </button>
       </div>
       <nav className="session-nav" aria-label="Agent sessions">
-        {sessions
-          .filter((s) => archived || s.phase !== "closed")
-          .map((s) => (
-            <button
-              key={s.id}
-              className={`session-link ${selected === s.id && view === "chat" ? "selected" : ""}`}
-              onClick={() => select(s.id)}
-            >
-              <MessageSquare size={17} />
-              <span>
-                <strong>{s.name}</strong>
-                <small>{phaseLabel[s.phase]}</small>
-              </span>
-              <i className={`status-dot ${s.phase}`} />
-            </button>
-          ))}
+        <ul className="sidebar-tree" aria-label="Agents and swarms">
+          {visible
+            .filter(
+              (session) =>
+                !session.swarm?.parent ||
+                !visible.some((parent) => parent.id === session.swarm?.parent),
+            )
+            .map(node)}
+        </ul>
         {!sessions.length && (
           <p className="sidebar-empty">
             Your agents will appear here.
@@ -68,6 +127,7 @@ export default function Sidebar({
         )}
       </nav>
       <div className="sidebar-bottom">
+        <ThemePicker />
         <button
           className={view === "fleet" ? "selected" : ""}
           onClick={() => setView(view === "fleet" ? "chat" : "fleet")}

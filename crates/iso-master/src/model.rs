@@ -59,6 +59,37 @@ pub struct Session {
     pub created_at: u64,
     pub last_active: u64,
     pub error: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub swarm: Option<Swarm>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    Planner,
+    Worker,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Swarm {
+    pub root: String,
+    pub parent: Option<String>,
+    pub role: Role,
+    pub depth: usize,
+    pub planner_model: String,
+    pub worker_model: String,
+    pub task: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CreateOptions {
+    pub model: Option<String>,
+    pub swarm: bool,
+    pub planner_model: Option<String>,
+    pub worker_model: Option<String>,
 }
 
 #[cfg(test)]

@@ -5,6 +5,8 @@ import { spawn } from "node:child_process";
 const directory = mkdtempSync(join(tmpdir(), "iso-master-browser-"));
 const config = {
   demo: true,
+  pi_model: "demo/planner",
+  pi_models: ["demo/planner", "demo/worker"],
   bind: "127.0.0.1:8791",
   public_origin: "http://127.0.0.1:8791",
   secure_cookie: false,

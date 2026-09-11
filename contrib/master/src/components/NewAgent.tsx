@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from "react";
-import { Box, X, Moon, Plus, LoaderCircle } from "lucide-react";
-import { api, type Session } from "../api";
+import { Box, X, Plus, LoaderCircle } from "lucide-react";
+import { api, type Session, type ModelCatalog } from "../api";
+import ModelSelect from "./ModelSelect";
 import { ErrorBanner } from "./shared";
 
 export default function NewAgent({
@@ -14,8 +15,29 @@ export default function NewAgent({
     [name, setName] = useState(""),
     [busy, setBusy] = useState(false),
     [error, setError] = useState("");
+  const [models, setModels] = useState<string[]>([]),
+    [model, setModel] = useState(""),
+    [swarm, setSwarm] = useState(false),
+    [plannerModel, setPlannerModel] = useState(""),
+    [workerModel, setWorkerModel] = useState("");
   useEffect(() => {
     ref.current?.showModal();
+    let stopped = false;
+    api<ModelCatalog>("/models")
+      .then((catalog) => {
+        if (stopped) return;
+        setModels(catalog.models);
+        const initial = catalog.default || catalog.models[0] || "";
+        setModel(initial);
+        setPlannerModel(initial);
+        setWorkerModel(initial);
+      })
+      .catch((error) => {
+        if (!stopped) setError(error.message);
+      });
+    return () => {
+      stopped = true;
+    };
   }, []);
   async function create(e: React.FormEvent) {
     e.preventDefault();
@@ -24,6 +46,10 @@ export default function NewAgent({
       onCreated(
         await api<Session>("/sessions", "POST", {
           name: name.trim() || "New agent",
+          model: model || null,
+          swarm,
+          planner_model: plannerModel || null,
+          worker_model: workerModel || null,
         }),
       );
     } catch (e) {
@@ -50,10 +76,11 @@ export default function NewAgent({
           <X size={20} />
         </button>
       </div>
-      <h2>Create an agent</h2>
+      <h2>{swarm ? "Create a swarm" : "Create an agent"}</h2>
       <p>
-        A dedicated workspace, automatically placed on an available control
-        plane. No infrastructure setup needed.
+        {swarm
+          ? "A read-only planner coordinates a tree of sub-planners and workers, each with its own workspace."
+          : "Choose a model and give your agent a dedicated workspace."}
       </p>
       <form onSubmit={create}>
         <label>
@@ -67,8 +94,50 @@ export default function NewAgent({
             disabled={busy}
           />
         </label>
+        <label className="swarm-toggle">
+          <input
+            type="checkbox"
+            checked={swarm}
+            onChange={(event) => setSwarm(event.target.checked)}
+            disabled={busy}
+          />
+          <span>Swarm mode</span>
+        </label>
+        {swarm ? (
+          <>
+            <ModelSelect
+              label="Planner model"
+              models={models}
+              value={plannerModel}
+              onChange={setPlannerModel}
+              disabled={busy}
+            />
+            <ModelSelect
+              label="Worker model"
+              models={models}
+              value={workerModel}
+              onChange={setWorkerModel}
+              disabled={busy}
+            />
+            <p className="muted">
+              Planners can inspect and delegate. Workers can run commands and
+              change files.
+            </p>
+          </>
+        ) : (
+          <ModelSelect
+            label="Model"
+            models={models}
+            value={model}
+            onChange={setModel}
+            disabled={busy}
+          />
+        )}
         <ErrorBanner error={error} clear={() => setError("")} />
-        <button className="primary wide" disabled={busy}>
+        <button
+          className="primary wide"
+          disabled={busy || (swarm && (!plannerModel || !workerModel))}
+        >
           {busy ? (
             <>
               <LoaderCircle size={16} className="spin" />
@@ -77,15 +146,11 @@ export default function NewAgent({
           ) : (
             <>
               <Plus size={17} />
-              Create agent
+              {swarm ? "Create swarm" : "Create agent"}
             </>
           )}
         </button>
       </form>
-      <div className="dialog-note">
-        <Moon size={15} />
-        Sleeps when idle. Resumes when you return.
-      </div>
     </dialog>
   );
 }

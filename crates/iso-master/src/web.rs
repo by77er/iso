@@ -1,8 +1,11 @@
-use crate::{engine::Engine, model::Session};
+use crate::{
+    engine::Engine,
+    model::{CreateOptions, Role, Session},
+};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -181,9 +184,114 @@ async fn sessions(State(web): State<Web>) -> Api<Vec<Session>> {
 #[derive(Deserialize)]
 struct New {
     name: String,
+    #[serde(flatten)]
+    options: CreateOptions,
 }
 async fn create(State(web): State<Web>, Json(data): Json<New>) -> Api<Session> {
-    Ok(Json(web.engine.create(&data.name).await?))
+    Ok(Json(
+        web.engine.create_options(&data.name, data.options).await?,
+    ))
+}
+async fn models(State(web): State<Web>) -> Json<Value> {
+    Json(json!({"models":web.engine.cfg.models(),"default":web.engine.cfg.pi_model}))
+}
+#[derive(Deserialize)]
+struct ModelChoice {
+    model: String,
+}
+async fn set_model(
+    State(web): State<Web>,
+    Path(id): Path<Uuid>,
+    Json(data): Json<ModelChoice>,
+) -> Api<Session> {
+    Ok(Json(
+        web.engine.set_model(&id.to_string(), &data.model).await?,
+    ))
+}
+async fn swarm(State(web): State<Web>, Path(id): Path<Uuid>) -> Api<Value> {
+    let id = id.to_string();
+    Ok(Json(
+        json!({"nodes":web.engine.tree(&id)?,"messages":web.engine.store.mailbox(&id)?}),
+    ))
+}
+#[derive(Deserialize)]
+struct Child {
+    name: String,
+    role: Role,
+    task: String,
+}
+async fn child(
+    State(web): State<Web>,
+    Path(id): Path<Uuid>,
+    Json(data): Json<Child>,
+) -> Api<Session> {
+    Ok(Json(
+        web.engine
+            .spawn_child(&id.to_string(), &data.name, data.role, &data.task)
+            .await?,
+    ))
+}
+#[derive(Deserialize)]
+struct WorkerRequest {
+    action: String,
+    #[serde(default)]
+    name: String,
+    role: Option<Role>,
+    #[serde(default)]
+    task: String,
+    #[serde(default)]
+    recipient: String,
+    #[serde(default)]
+    message: String,
+}
+async fn worker(
+    State(web): State<Web>,
+    headers: HeaderMap,
+    Json(data): Json<WorkerRequest>,
+) -> Api<Value> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let id = web
+        .engine
+        .worker_identity(token)
+        .map_err(|_| ApiError(StatusCode::UNAUTHORIZED, "Invalid worker identity".into()))?;
+    let value = match data.action.as_str() {
+        "spawn" => json!(
+            web.engine
+                .spawn_child(
+                    &id,
+                    &data.name,
+                    data.role.ok_or_else(|| ApiError(
+                        StatusCode::BAD_REQUEST,
+                        "Role is required".into()
+                    ))?,
+                    &data.task
+                )
+                .await?
+        ),
+        "send" => {
+            json!({"id":web.engine.send_message(&id, &data.recipient, &data.message)?,"status":"pending"})
+        }
+        "status" => {
+            json!({"self":id,"nodes":web.engine.tree(&id)?,"messages":web.engine.store.mailbox(&id)?})
+        }
+        _ => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "Unknown swarm action".into(),
+            ));
+        }
+    };
+    Ok(Json(value))
+}
+pub fn worker_router(web: Web) -> Router {
+    Router::new()
+        .route("/worker", post(worker))
+        .layer(DefaultBodyLimit::max(128 * 1024))
+        .with_state(web)
 }
 #[derive(Deserialize)]
 struct Cursor {
@@ -250,9 +358,13 @@ pub fn router(web: Web) -> Router {
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
+        .route("/api/models", get(models))
         .route("/api/sessions", get(sessions).post(create))
         .route("/api/sessions/{id}", delete(close))
         .route("/api/sessions/{id}/events", get(events))
+        .route("/api/sessions/{id}/model", post(set_model))
+        .route("/api/sessions/{id}/swarm", get(swarm))
+        .route("/api/sessions/{id}/children", post(child))
         .route("/api/sessions/{id}/prompt", post(prompt))
         .route("/api/sessions/{id}/actions/{action}", post(action))
         .route("/api/fleet", get(fleet))
@@ -294,10 +406,28 @@ mod tests {
             ..Config::default()
         };
         let store = Arc::new(Store::open(&dir.path().join("db")).unwrap());
-        let app = router(Web {
+        let web = Web {
             engine: Engine::new(cfg, store).unwrap(),
             auth: Arc::new(Auth::new("admin".into(), "test-password-long".into()).unwrap()),
-        });
+        };
+        let worker = worker_router(web.clone());
+        for authorization in ["", "Bearer invalid"] {
+            let response = worker
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/worker")
+                        .header("content-type", "application/json")
+                        .header("authorization", authorization)
+                        .body(Body::from(r#"{"action":"status"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let app = router(web);
         let req = || {
             Request::builder()
                 .method("POST")

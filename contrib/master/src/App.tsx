@@ -98,7 +98,13 @@ export default function App() {
         {view === "fleet" ? (
           <Fleet />
         ) : selected ? (
-          <Chat key={selected} id={selected} onUpdate={update} />
+          <Chat
+            sessions={sessions}
+            key={selected}
+            id={selected}
+            onUpdate={update}
+            select={select}
+          />
         ) : (
           <Welcome create={() => setCreating(true)} />
         )}

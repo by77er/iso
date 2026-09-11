@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    model::{Phase, Session, now},
+    model::{CreateOptions, Phase, Role, Session, Swarm, now},
     pi::Pi,
     plane::Plane,
     store::Store,
@@ -23,6 +23,8 @@ pub struct Engine {
     locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
     placement: Mutex<()>,
     launch_gate: Mutex<()>,
+    worker_tokens: StdMutex<HashMap<String, String>>,
+    swarm_gate: Mutex<()>,
 }
 impl Engine {
     pub fn new(cfg: Config, store: Arc<Store>) -> Result<Arc<Self>> {
@@ -40,6 +42,8 @@ impl Engine {
             locks: Default::default(),
             placement: Default::default(),
             launch_gate: Default::default(),
+            worker_tokens: Default::default(),
+            swarm_gate: Default::default(),
         }))
     }
     fn lock(&self, id: &str) -> Arc<Mutex<()>> {
@@ -64,7 +68,53 @@ impl Engine {
             }
         })).await
     }
+    #[cfg(test)]
     pub async fn create(&self, name: &str) -> Result<Session> {
+        self.create_options(name, CreateOptions::default()).await
+    }
+    pub async fn create_options(&self, name: &str, options: CreateOptions) -> Result<Session> {
+        let model = options.model.or_else(|| self.cfg.pi_model.clone());
+        self.validate_model(model.as_deref())?;
+        let swarm = if options.swarm {
+            let planner_model = options
+                .planner_model
+                .or_else(|| model.clone())
+                .context("Select a planner model")?;
+            let worker_model = options
+                .worker_model
+                .or_else(|| model.clone())
+                .context("Select a worker model")?;
+            self.validate_model(Some(&planner_model))?;
+            self.validate_model(Some(&worker_model))?;
+            Some(Swarm {
+                root: String::new(),
+                parent: None,
+                role: Role::Planner,
+                depth: 0,
+                planner_model,
+                worker_model,
+                task: String::new(),
+            })
+        } else {
+            None
+        };
+        self.create_node(name, model, swarm).await
+    }
+    fn validate_model(&self, model: Option<&str>) -> Result<()> {
+        if let Some(model) = model {
+            ensure!(
+                self.cfg.models().iter().any(|m| m == model),
+                "Model is not enabled on this master"
+            );
+        }
+        Ok(())
+    }
+    async fn create_node(
+        &self,
+        name: &str,
+        model: Option<String>,
+        mut swarm: Option<Swarm>,
+    ) -> Result<Session> {
         ensure!(
             !name.trim().is_empty() && name.len() <= 120,
             "Name must be 1–120 bytes"
@@ -90,6 +140,21 @@ impl Engine {
             .first()
             .context("No available control plane with capacity")?;
         let id = uuid::Uuid::new_v4().to_string();
+        if let Some(s) = &mut swarm
+            && s.root.is_empty()
+        {
+            s.root = id.clone();
+        }
+        let model = swarm
+            .as_ref()
+            .map(|s| {
+                if s.role == Role::Planner {
+                    s.planner_model.clone()
+                } else {
+                    s.worker_model.clone()
+                }
+            })
+            .or(model);
         let s = Session {
             id: id.clone(),
             name: name.into(),
@@ -99,6 +164,8 @@ impl Engine {
             created_at: now(),
             last_active: now(),
             error: None,
+            model,
+            swarm,
         };
         self.store.insert(&s)?;
         let lock = self.lock(&id);
@@ -146,7 +213,21 @@ impl Engine {
             plane.action(vm, "start").await?;
         }
         plane.ready(vm).await?;
-        let worker = Pi::start(&self.cfg, &plane.config, vm, id, self.store.clone()).await?;
+        let mut cfg = self.cfg.clone();
+        cfg.pi_model = s.model.clone().or(cfg.pi_model);
+        let token = uuid::Uuid::new_v4().to_string();
+        self.worker_tokens
+            .lock()
+            .unwrap()
+            .insert(id.into(), token.clone());
+        let swarm = s.swarm.as_ref().map(|swarm| json!({"session":id,"token":token,"socket":self.cfg.data_dir.join("swarm.sock"),"role":swarm.role,"parent":swarm.parent,"task":swarm.task}));
+        let worker = match Pi::start(&cfg, &plane.config, vm, id, self.store.clone(), swarm).await {
+            Ok(worker) => worker,
+            Err(e) => {
+                self.worker_tokens.lock().unwrap().remove(id);
+                return Err(e);
+            }
+        };
         self.workers.lock().await.insert(id.into(), worker);
         self.store.phase(id, Phase::Idle)?;
         Ok(())
@@ -162,6 +243,9 @@ impl Engine {
         );
         let lock = self.lock(id);
         let _guard = lock.lock().await;
+        self.prompt_locked(id, message).await
+    }
+    async fn prompt_locked(&self, id: &str, message: &str) -> Result<()> {
         if self.store.get(id)?.phase == Phase::Asleep
             && let Err(e) = self.launch(id, false).await
         {
@@ -213,6 +297,7 @@ impl Engine {
         self.store.get(id)
     }
     async fn stop_worker(&self, id: &str) {
+        self.worker_tokens.lock().unwrap().remove(id);
         let worker = self.workers.lock().await.remove(id);
         if let Some(worker) = worker {
             worker.close().await;
@@ -274,12 +359,25 @@ impl Engine {
         }
     }
     pub async fn close_session(&self, id: &str) -> Result<()> {
+        let _swarm = self.swarm_gate.lock().await;
         let lock = self.lock(id);
         let _guard = lock.lock().await;
         let s = self.store.get(id)?;
         if s.phase == Phase::Closed {
             return Ok(());
         }
+        ensure!(
+            !self
+                .store
+                .list()?
+                .iter()
+                .any(|node| node.phase != Phase::Closed
+                    && node
+                        .swarm
+                        .as_ref()
+                        .is_some_and(|swarm| swarm.parent.as_deref() == Some(id))),
+            "Close this planner's children first"
+        );
         s.phase.check(Phase::Closing)?;
         self.store.phase(id, Phase::Closing)?;
         self.stop_worker(id).await;
@@ -329,6 +427,7 @@ impl Engine {
         })
     }
     pub async fn shutdown(&self) {
+        self.worker_tokens.lock().unwrap().clear();
         let workers = std::mem::take(&mut *self.workers.lock().await);
         for (id, worker) in workers {
             worker.close().await;
@@ -340,9 +439,211 @@ impl Engine {
     }
     pub async fn timer(self: Arc<Self>) {
         loop {
-            tokio::time::sleep(Duration::from_secs(self.cfg.idle_seconds.min(30))).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            self.deliver_messages().await;
             self.sweep().await;
         }
+    }
+    pub fn worker_identity(&self, token: &str) -> Result<String> {
+        let id = self
+            .worker_tokens
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, t)| t.as_str() == token)
+            .map(|(id, _)| id.clone())
+            .context("Invalid worker token")?;
+        let s = self.store.get(&id)?;
+        ensure!(
+            matches!(
+                s.phase,
+                Phase::Idle | Phase::Working | Phase::Starting | Phase::Waking
+            ),
+            "Worker is inactive"
+        );
+        ensure!(s.swarm.is_some(), "Not a swarm session");
+        Ok(id)
+    }
+    pub fn tree(&self, id: &str) -> Result<Vec<Session>> {
+        let s = self.store.get(id)?;
+        let swarm = s.swarm.context("Not a swarm session")?;
+        Ok(self
+            .store
+            .list()?
+            .into_iter()
+            .filter(|s| s.swarm.as_ref().is_some_and(|n| n.root == swarm.root))
+            .collect())
+    }
+    pub async fn spawn_child(
+        &self,
+        parent: &str,
+        name: &str,
+        role: Role,
+        task: &str,
+    ) -> Result<Session> {
+        ensure!(
+            !task.trim().is_empty() && task.len() <= 32000,
+            "Task must be 1–32000 bytes"
+        );
+        let _gate = self.swarm_gate.lock().await;
+        let parent_session = self.store.get(parent)?;
+        ensure!(
+            !matches!(
+                parent_session.phase,
+                Phase::Closed | Phase::Closing | Phase::Interrupted
+            ),
+            "Parent is inactive"
+        );
+        let p = parent_session.swarm.context("Not a swarm planner")?;
+        ensure!(
+            p.role == Role::Planner,
+            "Only planners can schedule children"
+        );
+        ensure!(
+            p.depth < self.cfg.swarm_max_depth,
+            "Swarm depth limit reached"
+        );
+        ensure!(
+            self.tree(parent)?.len() < self.cfg.swarm_max_agents,
+            "Swarm size limit reached"
+        );
+        let child = self
+            .create_node(
+                name,
+                None,
+                Some(Swarm {
+                    root: p.root,
+                    parent: Some(parent.into()),
+                    role,
+                    depth: p.depth + 1,
+                    planner_model: p.planner_model,
+                    worker_model: p.worker_model,
+                    task: task.into(),
+                }),
+            )
+            .await?;
+        self.store.event(
+            parent,
+            json!({"type":"notice","text":format!("Scheduled {} ({})", child.name, child.id)}),
+        )?;
+        Ok(child)
+    }
+    pub fn send_message(&self, sender: &str, recipient: &str, message: &str) -> Result<i64> {
+        ensure!(
+            !message.trim().is_empty() && message.len() <= 32000,
+            "Message must be 1–32000 bytes"
+        );
+        let from = self.store.get(sender)?;
+        let to = self.store.get(recipient)?;
+        let a = from.swarm.context("Sender is not in a swarm")?;
+        let b = to.swarm.context("Recipient is not in a swarm")?;
+        ensure!(
+            a.root == b.root
+                && (a.parent.as_deref() == Some(recipient) || b.parent.as_deref() == Some(sender)),
+            "Messages are limited to direct parent–child relationships"
+        );
+        ensure!(
+            !matches!(to.phase, Phase::Closed | Phase::Closing),
+            "Recipient is closed"
+        );
+        self.store.enqueue(sender, recipient, message)
+    }
+    pub async fn deliver_messages(&self) {
+        let sessions = self.store.list().unwrap_or_default();
+        // Each recipient runs independently; a sleeping workspace must not block the others.
+        join_all(
+            sessions
+                .into_iter()
+                .filter(|s| s.swarm.is_some())
+                .map(|s| async move {
+                    let lock = self.lock(&s.id);
+                    let Ok(_guard) = lock.try_lock() else {
+                        return;
+                    };
+                    let Ok(current) = self.store.get(&s.id) else {
+                        return;
+                    };
+                    if !matches!(current.phase, Phase::Idle | Phase::Asleep) {
+                        return;
+                    }
+                    if let Ok(Some((mid, sender, text))) = self.store.claim_message(&s.id) {
+                        let prompt = self.message_prompt(&sender, &current, &text);
+                        let delivered = match prompt {
+                            Ok((prompt, event)) => {
+                                self.store.stage_delivery(mid, &prompt, &event).is_ok()
+                                    && self.prompt_locked(&s.id, &prompt).await.is_ok()
+                            }
+                            Err(_) => false,
+                        };
+                        let status = if delivered { "delivered" } else { "uncertain" };
+                        let _ = self.store.message_status(mid, status);
+                    }
+                }),
+        )
+        .await;
+    }
+    pub async fn set_model(&self, id: &str, model: &str) -> Result<Session> {
+        self.validate_model(Some(model))?;
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        let s = self.store.get(id)?;
+        ensure!(
+            s.swarm.is_none(),
+            "Swarm models are inherited from their root configuration"
+        );
+        ensure!(
+            matches!(s.phase, Phase::Idle | Phase::Asleep | Phase::Interrupted),
+            "Wait for the agent to finish before changing models"
+        );
+        if s.phase == Phase::Idle {
+            let worker = self
+                .workers
+                .lock()
+                .await
+                .get(id)
+                .cloned()
+                .context("Agent disconnected")?;
+            let (provider, model_id) = model.split_once('/').context("Invalid model")?;
+            worker
+                .command("set_model", json!({"provider":provider,"modelId":model_id}))
+                .await?;
+        }
+        self.store.update(id, |s| {
+            s.model = Some(model.into());
+            Ok(())
+        })
+    }
+    fn message_prompt(
+        &self,
+        sender: &str,
+        recipient: &Session,
+        text: &str,
+    ) -> Result<(String, Value)> {
+        let from = self.store.get(sender)?;
+        let source = from.swarm.as_ref().context("Sender is not in a swarm")?;
+        let target = recipient
+            .swarm
+            .as_ref()
+            .context("Recipient is not in a swarm")?;
+        ensure!(source.root == target.root, "Sender is in another swarm");
+        let relationship = if target.parent.as_deref() == Some(sender) {
+            "parent"
+        } else if source.parent.as_deref() == Some(recipient.id.as_str()) {
+            "child"
+        } else {
+            bail!("Sender is not a direct parent or child");
+        };
+        let role = match source.role {
+            Role::Planner => "planner",
+            Role::Worker => "worker",
+        };
+        Ok((
+            format!(
+                "Message from your {relationship} {role} {name:?} (session {sender}):\n{text}",
+                name = from.name
+            ),
+            json!({"type":"swarm_message","text":text,"source":{"id":sender,"name":from.name,"role":role,"relationship":relationship}}),
+        ))
     }
 }
 
@@ -350,6 +651,193 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::config::PlaneConfig;
+    fn swarm_fixture() -> (tempfile::TempDir, Arc<Engine>) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            demo: true,
+            data_dir: dir.path().into(),
+            pi_model: Some("test/planner".into()),
+            pi_models: vec!["test/planner".into(), "test/worker".into()],
+            swarm_max_depth: 2,
+            planes: vec![PlaneConfig {
+                id: "test".into(),
+                server: "demo".into(),
+                creds: "unused".into(),
+                client: "unused".into(),
+                template: "debian".into(),
+                egress: "deny".into(),
+                principal: None,
+                allow: vec![],
+                max_vms: 16,
+            }],
+            ..Config::default()
+        };
+        let store = Arc::new(Store::open(&dir.path().join("db")).unwrap());
+        (dir, Engine::new(cfg, store).unwrap())
+    }
+    fn swarm_options() -> CreateOptions {
+        CreateOptions {
+            swarm: true,
+            planner_model: Some("test/planner".into()),
+            worker_model: Some("test/worker".into()),
+            ..Default::default()
+        }
+    }
+    #[tokio::test]
+    async fn swarm_inherits_models_and_enforces_vertical_relationships() {
+        let (_dir, e) = swarm_fixture();
+        let root = e.create_options("root", swarm_options()).await.unwrap();
+        let sub = e
+            .spawn_child(&root.id, "sub", Role::Planner, "Plan the implementation")
+            .await
+            .unwrap();
+        let worker = e
+            .spawn_child(&sub.id, "worker", Role::Worker, "Implement it")
+            .await
+            .unwrap();
+        let sibling = e
+            .spawn_child(&root.id, "sibling", Role::Worker, "Review it")
+            .await
+            .unwrap();
+        assert_eq!(root.model.as_deref(), Some("test/planner"));
+        assert_eq!(sub.model, root.model);
+        assert_eq!(worker.model.as_deref(), Some("test/worker"));
+        assert_eq!(worker.swarm.as_ref().unwrap().depth, 2);
+        assert_eq!(worker.swarm.as_ref().unwrap().root, root.id);
+        assert!(
+            e.spawn_child(&worker.id, "forbidden", Role::Worker, "task")
+                .await
+                .is_err()
+        );
+        assert!(e.send_message(&worker.id, &root.id, "skip parent").is_err());
+        assert!(e.send_message(&sub.id, &sibling.id, "sibling").is_err());
+        assert!(e.send_message(&worker.id, &sub.id, "Result").is_ok());
+        assert!(e.close_session(&root.id).await.is_err());
+        let other = e.create_options("other", swarm_options()).await.unwrap();
+        assert!(e.send_message(&sub.id, &other.id, "cross swarm").is_err());
+        assert!(e.set_model(&root.id, "test/worker").await.is_err());
+        assert!(
+            e.create_options(
+                "invalid",
+                CreateOptions {
+                    model: Some("not/enabled".into()),
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+        );
+        let deep = e
+            .spawn_child(&sub.id, "deep", Role::Planner, "Plan")
+            .await
+            .unwrap();
+        assert!(
+            e.spawn_child(&deep.id, "too deep", Role::Worker, "Task")
+                .await
+                .is_err()
+        );
+        e.shutdown().await;
+    }
+    #[tokio::test]
+    async fn swarm_mail_waits_for_idle_and_tokens_are_revoked() {
+        let (_dir, e) = swarm_fixture();
+        let root = e.create_options("root", swarm_options()).await.unwrap();
+        let child = e
+            .spawn_child(&root.id, "child", Role::Worker, "Do the task")
+            .await
+            .unwrap();
+        let token = e
+            .worker_tokens
+            .lock()
+            .unwrap()
+            .get(&child.id)
+            .unwrap()
+            .clone();
+        assert_eq!(e.worker_identity(&token).unwrap(), child.id);
+        e.store.phase(&child.id, Phase::Working).unwrap();
+        e.deliver_messages().await;
+        assert_eq!(e.store.mailbox(&child.id).unwrap()[0]["status"], "pending");
+        e.store.phase(&child.id, Phase::Idle).unwrap();
+        e.deliver_messages().await;
+        assert_eq!(
+            e.store.mailbox(&child.id).unwrap()[0]["status"],
+            "delivered"
+        );
+        assert_eq!(e.store.get(&child.id).unwrap().phase, Phase::Working);
+        tokio::task::yield_now().await;
+        let parent_message = format!(
+            "Message from your parent planner \"root\" (session {}):\nDo the task",
+            root.id
+        );
+        assert_eq!(
+            e.message_prompt(&root.id, &child, "Do the task").unwrap().0,
+            parent_message
+        );
+        assert!(
+            e.store
+                .events(&child.id, 0)
+                .unwrap()
+                .iter()
+                .any(|event| event["type"] == "swarm_message"
+                    && event["text"] == "Do the task"
+                    && event["source"]["relationship"] == "parent"
+                    && event["source"]["id"] == root.id)
+        );
+        e.send_message(&child.id, &root.id, "Here are my findings")
+            .unwrap();
+        e.deliver_messages().await;
+        tokio::task::yield_now().await;
+        let child_message = format!(
+            "Message from your child worker \"child\" (session {}):\nHere are my findings",
+            child.id
+        );
+        assert_eq!(
+            e.message_prompt(&child.id, &root, "Here are my findings")
+                .unwrap()
+                .0,
+            child_message
+        );
+        assert!(
+            e.store
+                .events(&root.id, 0)
+                .unwrap()
+                .iter()
+                .any(|event| event["type"] == "swarm_message"
+                    && event["text"] == "Here are my findings"
+                    && event["source"]["relationship"] == "child"
+                    && event["source"]["id"] == child.id)
+        );
+        e.abort(&child.id).await.unwrap();
+        assert!(e.worker_identity(&token).is_err());
+        let mid = e.send_message(&root.id, &child.id, "Second task").unwrap();
+        e.deliver_messages().await;
+        assert_eq!(e.store.mailbox(&child.id).unwrap()[0]["status"], "pending");
+        e.store.message_status(mid, "dispatching").unwrap();
+        e.store.recover().unwrap();
+        assert_eq!(
+            e.store.mailbox(&child.id).unwrap()[0]["status"],
+            "uncertain"
+        );
+        e.shutdown().await;
+    }
+    #[tokio::test]
+    async fn model_choice_survives_sleep_and_relaunch() {
+        let (_dir, e) = swarm_fixture();
+        let s = e.create("single").await.unwrap();
+        e.set_model(&s.id, "test/worker").await.unwrap();
+        e.sleep(&s.id).await.unwrap();
+        assert_eq!(
+            e.store.get(&s.id).unwrap().model.as_deref(),
+            Some("test/worker")
+        );
+        e.prompt(&s.id, "hello").await.unwrap();
+        assert_eq!(
+            e.store.get(&s.id).unwrap().model.as_deref(),
+            Some("test/worker")
+        );
+        assert!(e.set_model(&s.id, "test/planner").await.is_err());
+        e.shutdown().await;
+    }
     #[tokio::test]
     async fn placement_sleep_wake_and_recovery() {
         let dir = tempfile::tempdir().unwrap();
@@ -447,6 +935,8 @@ mod tests {
                 created_at: now(),
                 last_active: now(),
                 error: None,
+                model: None,
+                swarm: None,
             })
             .unwrap();
         assert!(e.reconcile(&id).await.is_err());

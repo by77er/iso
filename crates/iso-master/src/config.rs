@@ -13,6 +13,9 @@ pub struct Config {
     pub pi_bin: PathBuf,
     pub pi_extension: PathBuf,
     pub pi_model: Option<String>,
+    pub pi_models: Vec<String>,
+    pub swarm_max_depth: usize,
+    pub swarm_max_agents: usize,
     pub pi_env_file: Option<PathBuf>,
     pub idle_seconds: u64,
     pub max_agents: usize,
@@ -30,6 +33,9 @@ impl Default for Config {
             pi_bin: "contrib/master/node_modules/.bin/pi".into(),
             pi_extension: "contrib/master/pi/remote-tools.ts".into(),
             pi_model: None,
+            pi_models: vec![],
+            swarm_max_depth: 4,
+            swarm_max_agents: 16,
             pi_env_file: None,
             idle_seconds: 900,
             max_agents: 16,
@@ -89,6 +95,19 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
+            self.swarm_max_agents > 0 && self.swarm_max_depth <= 16,
+            "Invalid swarm limits"
+        );
+        for model in self.models() {
+            ensure!(
+                model
+                    .split_once('/')
+                    .is_some_and(|(p, m)| !p.is_empty() && !m.is_empty())
+                    && !model.chars().any(char::is_whitespace),
+                "Models must use provider/model format"
+            );
+        }
+        ensure!(
             self.idle_seconds > 0 && self.max_agents > 0,
             "idle_seconds/max_agents must be positive"
         );
@@ -134,5 +153,14 @@ impl Config {
             }
             None => Ok(BTreeMap::new()),
         }
+    }
+    pub fn models(&self) -> Vec<String> {
+        let mut models = self.pi_models.clone();
+        if let Some(model) = &self.pi_model {
+            models.push(model.clone());
+        }
+        models.sort();
+        models.dedup();
+        models
     }
 }

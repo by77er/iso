@@ -1,7 +1,9 @@
 // Dedicated headless extension: no local-tool fallback, no VM lifecycle commands.
 import https from "node:https";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, posix } from "node:path";
+import { Type } from "typebox";
+import { registerSwarm, type SwarmContext } from "./swarm.ts";
 import {
   createReadTool,
   createWriteTool,
@@ -12,6 +14,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
+  const swarm = process.env.MASTER_SWARM
+    ? (JSON.parse(process.env.MASTER_SWARM) as SwarmContext)
+    : undefined;
+  const planner = swarm?.role === "planner";
   const cfg = JSON.parse(process.env.MASTER_REMOTE!) as {
     server: string;
     creds: string;
@@ -138,31 +144,87 @@ export default function (pi: ExtensionAPI) {
   const promptGuidelines = [
     "read, write, edit and bash operate only inside the assigned iso microVM. Use bash for file search.",
   ];
+  // Pi passes its host session cwd in the execution context. Do not forward
+  // that context: these tools must resolve paths against the guest cwd above.
+  const readTool = createReadTool(cwd, { operations: read });
+  const writeTool = createWriteTool(cwd, { operations: write });
+  const editTool = createEditTool(cwd, { operations: { ...read, ...write } });
+  const bashTool = createBashTool(cwd, { operations: bash });
   pi.registerTool({
-    ...createReadTool(cwd, { operations: read }),
+    ...readTool,
+    execute: (id, params, signal, update) =>
+      readTool.execute(id, params, signal, update),
     promptGuidelines,
   });
-  pi.registerTool({
-    ...createWriteTool(cwd, { operations: write }),
-    promptGuidelines,
-  });
-  pi.registerTool({
-    ...createEditTool(cwd, { operations: { ...read, ...write } }),
-    promptGuidelines,
-  });
-  pi.registerTool({
-    ...createBashTool(cwd, { operations: bash }),
-    promptGuidelines,
-  });
+  if (planner) {
+    pi.registerTool({
+      name: "list",
+      label: "List guest directory",
+      description: "Read-only directory listing inside your workspace.",
+      parameters: Type.Object({ path: Type.Optional(Type.String()) }),
+      execute: async (_id, params, signal) => ({
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              await call(
+                "GET",
+                "/dir?" +
+                  new URLSearchParams({
+                    path: posix.resolve(cwd, params.path || "."),
+                  }),
+                undefined,
+                signal,
+              ),
+              null,
+              2,
+            ),
+          },
+        ],
+        details: {},
+      }),
+    });
+  } else {
+    pi.registerTool({
+      ...writeTool,
+      execute: (id, params, signal, update) =>
+        writeTool.execute(id, params, signal, update),
+      promptGuidelines,
+    });
+    pi.registerTool({
+      ...editTool,
+      execute: (id, params, signal, update) =>
+        editTool.execute(id, params, signal, update),
+      promptGuidelines,
+    });
+    pi.registerTool({
+      ...bashTool,
+      execute: (id, params, signal, update) =>
+        bashTool.execute(id, params, signal, update),
+      promptGuidelines,
+    });
+  }
   pi.on("before_agent_start", (event) => ({
     systemPrompt: event.systemPrompt.replace(
       `Current working directory: ${process.cwd()}`,
       `Current working directory: ${cwd} (inside an iso microVM; master files are not accessible)`,
     ),
   }));
-  pi.on("user_bash", () => ({ operations: bash }));
+  pi.on("user_bash", () => ({
+    operations: {
+      exec: (command, _workdir, options) => {
+        if (planner)
+          throw new Error(
+            "Planners cannot execute shell commands; delegate to a worker",
+          );
+        return bash.exec(command, cwd, options);
+      },
+    },
+  }));
+  const active = planner ? ["read", "list"] : ["read", "write", "edit", "bash"];
+  if (swarm) active.push(...registerSwarm(pi, swarm));
   pi.on("session_start", (_event, ctx) => {
-    pi.setActiveTools(["read", "write", "edit", "bash"]);
+    pi.setActiveTools(active);
     ctx.ui.notify("iso-master-remote-ready", "info");
   });
 }

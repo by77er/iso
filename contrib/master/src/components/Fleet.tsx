@@ -31,7 +31,6 @@ export default function Fleet() {
     <div className="fleet-page">
       <header className="workspace-header">
         <div>
-          <span className="breadcrumb">Infrastructure / Operator view</span>
           <h1>Control planes</h1>
         </div>
         <Server size={24} />

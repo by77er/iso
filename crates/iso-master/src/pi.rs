@@ -40,6 +40,7 @@ impl Pi {
         vm: &str,
         id: &str,
         store: Arc<Store>,
+        swarm: Option<Value>,
     ) -> Result<Arc<Self>> {
         let dir = cfg.data_dir.join("sessions").join(id);
         std::fs::create_dir_all(&dir)?;
@@ -59,6 +60,9 @@ impl Pi {
         }
         let mut cmd = Command::new(&cfg.pi_bin);
         configure(&mut cmd, cfg, &dir)?;
+        if let Some(swarm) = swarm {
+            cmd.env("MASTER_SWARM", serde_json::to_string(&swarm)?);
+        }
         cmd.env(
             "MASTER_REMOTE",
             serde_json::to_string(

@@ -84,6 +84,67 @@ the least populated with capacity, and serializes creation. It counts all VMs on
 that plane, including ones created outside the master. It is **not** a CPU/RAM-aware
 scheduler. There is no cross-plane migration of a sleeping or failed session.
 
+## Models and swarms
+
+`pi_models` is the operator-controlled list of `provider/model` IDs offered in
+the UI. `pi_model`, when configured, is also included and is the default. These
+must be models supported by the installed pi version and authenticated on the
+master. For example:
+
+```json
+{
+  "pi_model": "openai-codex/gpt-5.5",
+  "pi_models": ["openai-codex/gpt-5.5", "openai-codex/gpt-5.6-sol"],
+  "swarm_max_depth": 4,
+  "swarm_max_agents": 16
+}
+```
+
+New agent offers a model dropdown. An existing standalone session can change
+models while idle, asleep, or interrupted; the choice persists across restarts.
+An idle worker switches through pi's model RPC without losing its conversation.
+
+Enable **Swarm mode** when creating an agent to select separate **Planner model**
+and **Worker model** values. The root is a planner. Every sub-planner inherits the
+planner model and every worker inherits the worker model. These role settings are
+fixed for that tree; create a new swarm to use a different pair.
+
+Planners have only `read` and `list` for workspace inspection, plus `swarm_spawn`,
+`swarm_send`, and `swarm_status` for coordination. They cannot use shell commands,
+write, or edit. Workers get the normal remote read/write/edit/bash tools and
+messaging/status, but cannot spawn children. These restrictions are implemented
+in the tool registrations and checked by the master for scheduling; they are not
+just prompt instructions. Each node has its own VM: disks are not shared, so
+tasks should include repository/setup instructions and report patches or results
+back to their parent.
+
+The sidebar displays the swarm hierarchy with collapsible branches, roles, and
+phases. Click a node to inspect its chat and model. Parent/child messages appear
+as distinct cards identifying the sender. Planners can schedule children
+themselves, or the operator can open **Coordination** and use **Schedule child**.
+The default maximum is four edges from root
+to leaf and 16 total nodes per tree (including closed nodes), additionally bounded
+by `max_agents` and control-plane capacity. Scheduling returns a capacity error
+when a limit is reached; it does not silently create a second workspace or retry.
+Close descendants before closing their planner.
+
+Messages only travel between direct parents and children. They are stored in
+SQLite, queued while the recipient works, and delivered as a new turn when idle
+or asleep. Sleeping recipients wake automatically. Interrupted recipients require
+explicit recovery. A delivery interrupted before acknowledgment is marked
+`uncertain` and never automatically replayed. The panel shows mailbox status;
+inspect the conversation before manually repeating an uncertain message. Workers
+are instructed to send results to their parent, and waiting planners should end
+their turn so incoming reports can wake them.
+
+Coordination uses a `0600` Unix socket at `<data_dir>/swarm.sock`, with a separate
+session token for each pi process. Tokens are revoked when a worker stops and
+rotated on recovery; these endpoints are not served on the browser's TCP listener.
+No master or provider credentials are passed into guests.
+
+Demo mode supports manually building and inspecting trees without model calls.
+It does not simulate autonomous planner decisions.
+
 ## Session lifecycle
 
 ```text
@@ -150,8 +211,9 @@ ownership/authorization and audit policy.
   Model messages and tool output may contain sensitive data.
 - The pi process uses a cleared environment plus explicitly configured provider
   values. It does not inherit `MASTER_PASSWORD` or ambient GitHub credentials.
-- The dedicated pi extension only exposes remote `read`, `write`, `edit`, and
-  `bash`. There is **no local fallback**. Built-in tools, auto-discovered extensions,
+- The dedicated pi extension exposes remote `read`, `write`, `edit`, and
+  `bash` for standalone agents/workers; swarm planners get read-only inspection
+  and coordination tools as described above. There is **no local fallback**. Built-in tools, auto-discovered extensions,
   skills, prompt templates and context files are disabled; startup requires a
   readiness notification from the explicit remote extension.
 - The browser cannot send arbitrary pi RPC commands, load extensions, select a
@@ -167,7 +229,7 @@ Limits: `max_agents` defaults to 16 live pi processes. Tool exec is capped at te
 minutes and 256 KiB per stdout/stderr stream. Browser events are capped at 256 KiB;
 oversized events are replaced with a notice (full pi history remains on disk).
 The read tool is text-only in this version; use shell tools for search. No file
-uploads, interactive extension dialogs, branching UI, model picker, runtime plane
+uploads, interactive extension dialogs, conversation branching, runtime plane
 registration, transcript deletion/retention job, or per-user RBAC yet. Plan storage
 retention externally. SQLite calls are short synchronous operations; this is not
 a high-throughput scheduler.

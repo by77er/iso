@@ -19,6 +19,20 @@ export interface Session {
   created_at: number;
   last_active: number;
   error: string | null;
+  model: string | null;
+  swarm: {
+    root: string;
+    parent: string | null;
+    role: "planner" | "worker";
+    depth: number;
+    planner_model: string;
+    worker_model: string;
+    task: string;
+  } | null;
+}
+export interface ModelCatalog {
+  models: string[];
+  default: string | null;
 }
 export interface User {
   user: string;

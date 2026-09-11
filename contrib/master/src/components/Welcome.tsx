@@ -1,4 +1,4 @@
-import { Layers, Plus, Code2, Search, ShieldCheck, Moon } from "lucide-react";
+import { Layers, Plus, Code2, Search, ShieldCheck } from "lucide-react";
 
 export default function Welcome({ create }: { create: () => void }) {
   return (
@@ -6,7 +6,6 @@ export default function Welcome({ create }: { create: () => void }) {
       <div className="welcome-icon">
         <Layers size={30} />
       </div>
-      <div className="eyebrow">LESS SETUP. MORE BUILDING.</div>
       <h1>A workspace for every idea.</h1>
       <p>
         Start a conversation with an agent. It gets its own isolated
@@ -34,10 +33,6 @@ export default function Welcome({ create }: { create: () => void }) {
           <p>Tools run in a dedicated microVM, not on the master.</p>
         </div>
       </div>
-      <small>
-        <Moon size={15} />
-        Workspaces resume automatically when you send a message.
-      </small>
     </div>
   );
 }

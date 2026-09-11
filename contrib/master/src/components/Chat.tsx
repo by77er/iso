@@ -5,12 +5,12 @@ import {
   Trash2,
   Moon,
   RotateCcw,
-  Box,
   Square,
   ArrowUp,
-  ShieldCheck,
 } from "lucide-react";
-import { api, type Session } from "../api";
+import { api, type Session, type ModelCatalog } from "../api";
+import ModelSelect from "./ModelSelect";
+import SwarmPanel from "./SwarmPanel";
 import { reduceEvents, type Item, type Event } from "../transcript";
 import { Badge, ErrorBanner } from "./shared";
 import Transcript from "./Transcript";
@@ -18,9 +18,13 @@ import Transcript from "./Transcript";
 export default function Chat({
   id,
   onUpdate,
+  select,
+  sessions,
 }: {
   id: string;
   onUpdate: (s: Session) => void;
+  select: (id: string) => void;
+  sessions: Session[];
 }) {
   const [session, setSession] = useState<Session | null>(null),
     [items, setItems] = useState<Item[]>([]),
@@ -29,6 +33,18 @@ export default function Chat({
     [busy, setBusy] = useState(false),
     [details, setDetails] = useState(false);
   const updateRef = useRef(onUpdate);
+  const [models, setModels] = useState<string[]>([]);
+  useEffect(() => {
+    let stopped = false;
+    api<ModelCatalog>("/models")
+      .then((catalog) => {
+        if (!stopped) setModels(catalog.models);
+      })
+      .catch(() => {});
+    return () => {
+      stopped = true;
+    };
+  }, []);
   updateRef.current = onUpdate;
   useEffect(() => {
     let stopped = false,
@@ -51,7 +67,14 @@ export default function Chat({
           cursor = r.events.at(-1)!.seq;
           setItems((old) => reduceEvents(old, r.events));
         }
-        timer = setTimeout(poll, r.events.length === 500 ? 0 : 700);
+        timer = setTimeout(
+          poll,
+          r.events.length === 500
+            ? 0
+            : r.session.phase === "working"
+              ? 150
+              : 700,
+        );
       } catch (e) {
         if (!stopped) {
           setError((e as Error).message);
@@ -125,7 +148,6 @@ export default function Chat({
     <div className="chat">
       <header className="workspace-header">
         <div>
-          <span className="breadcrumb">Agents / Workspace</span>
           <h1>{session.name}</h1>
         </div>
         <div className="header-actions">
@@ -133,6 +155,8 @@ export default function Chat({
           <button
             className="icon"
             aria-label="Workspace details"
+            title="Workspace details"
+            aria-expanded={details}
             onClick={() => setDetails(!details)}
           >
             <Server size={18} />
@@ -140,6 +164,7 @@ export default function Chat({
           <button
             className="icon danger"
             aria-label="Close agent"
+            title="Close agent"
             disabled={
               busy ||
               !["idle", "working", "asleep", "interrupted"].includes(
@@ -152,6 +177,41 @@ export default function Chat({
           </button>
         </div>
       </header>
+      <div className="conversation-options">
+        {session.swarm ? (
+          <span>
+            {session.swarm.role === "planner" ? "Read-only planner" : "Worker"}{" "}
+            · {session.model}
+          </span>
+        ) : (
+          <ModelSelect
+            label="Model"
+            models={models}
+            value={session.model || ""}
+            disabled={
+              busy || !["idle", "asleep", "interrupted"].includes(session.phase)
+            }
+            onChange={async (model) => {
+              setBusy(true);
+              setError("");
+              try {
+                const updated = await api<Session>(
+                  `/sessions/${id}/model`,
+                  "POST",
+                  { model },
+                );
+                setSession(updated);
+                updateRef.current(updated);
+              } catch (error) {
+                setError((error as Error).message);
+              } finally {
+                setBusy(false);
+              }
+            }}
+          />
+        )}
+      </div>
+      {session.swarm && <SwarmPanel session={session} />}
       {details && (
         <div className="workspace-details">
           <span>
@@ -210,7 +270,13 @@ export default function Chat({
           </button>
         </div>
       )}
-      <Transcript items={items} phase={session.phase} />
+      <Transcript
+        items={items}
+        phase={session.phase}
+        select={select}
+        session={session}
+        sessions={sessions}
+      />
       <div className="composer-area">
         {session.phase === "asleep" && (
           <div className="wake-hint">
@@ -228,7 +294,7 @@ export default function Chat({
                 ? "This conversation is closed."
                 : "Describe a task, ask a question, or share an idea…"
             }
-            disabled={!canSend}
+            disabled={busy || session.phase === "closed"}
             rows={3}
             maxLength={100000}
             onKeyDown={(e) => {
@@ -243,10 +309,6 @@ export default function Chat({
             }}
           />
           <div className="composer-bottom">
-            <span>
-              <Box size={14} />
-              pi · isolated workspace
-            </span>
             {session.phase === "working" ? (
               <button
                 type="button"
@@ -275,16 +337,13 @@ export default function Chat({
                 ) : (
                   <ArrowUp size={18} />
                 )}
+                Send
               </button>
             )}
           </div>
         </form>
         <div className="composer-footnote">
           <span>Enter to send · Shift + Enter for a new line</span>
-          <span>
-            <ShieldCheck size={12} />
-            Private microVM
-          </span>
         </div>
       </div>
     </div>
