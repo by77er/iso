@@ -51,6 +51,20 @@ pub(crate) async fn connect(path: &Path) -> std::io::Result<UnixStream> {
 // wedged or orphaned VMM (e.g. one inherited across a control-plane restart)
 // can't block lifecycle ops (stop/destroy) forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Snapshot create and load are the exception the comment above anticipates:
+/// they write or read the guest's entire RAM, so their cost scales with machine
+/// size, not with how responsive the VMM is. A 2 GiB guest fit inside the
+/// 10-second budget and a 16 GiB one does not, which failed as a bake timeout
+/// rather than as anything that pointed at memory size.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+fn timeout_for(path: &str) -> Duration {
+    if path.starts_with("/snapshot/") {
+        SNAPSHOT_TIMEOUT
+    } else {
+        REQUEST_TIMEOUT
+    }
+}
 
 fn be<E: std::fmt::Display>(e: E) -> Error {
     Error::Backend(e.to_string())
@@ -75,9 +89,15 @@ pub async fn request(
     path: &str,
     body: Option<&serde_json::Value>,
 ) -> Result<(u16, String)> {
-    tokio::time::timeout(REQUEST_TIMEOUT, request_inner(socket, method, path, body))
+    let budget = timeout_for(path);
+    tokio::time::timeout(budget, request_inner(socket, method, path, body))
         .await
-        .map_err(|_| Error::Backend(format!("firecracker API {method} {path} timed out")))?
+        .map_err(|_| {
+            Error::Backend(format!(
+                "firecracker API {method} {path} timed out after {}s",
+                budget.as_secs()
+            ))
+        })?
 }
 
 async fn request_inner(

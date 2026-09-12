@@ -554,8 +554,12 @@ async fn bake_inner(
 
     // Run provisioning commands as `coder` inside the builder (over ssh in the
     // netns) before snapshotting, so any warmed state is CoW-shared. Non-fatal.
-    for cmd in provision {
-        eprintln!("[bake] provision: {cmd}");
+    // The command is never logged: `--provision` is how the caller ships secrets
+    // into the builder (iso-coder-template passes a GCS token and a GitHub token
+    // this way), so echoing it puts live credentials in the bake output.
+    let total = provision.len();
+    for (i, cmd) in provision.iter().enumerate() {
+        eprintln!("[bake] provision {}/{total}", i + 1);
         let ok = Command::new("ip")
             .args([
                 "netns", "exec", netns, "ssh", "-i", &ssh_key.to_string_lossy(),
@@ -567,7 +571,7 @@ async fn bake_inner(
             .map(|s| s.success())
             .unwrap_or(false);
         if !ok {
-            eprintln!("[bake] provision command failed (continuing): {cmd}");
+            eprintln!("[bake] provision {}/{total} failed (continuing)", i + 1);
         }
     }
 
