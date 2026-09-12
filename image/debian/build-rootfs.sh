@@ -111,6 +111,18 @@ in_chroot systemctl enable iso-guest-agent.service ssh.service >/dev/null 2>&1
 
 # --- network: the kernel's ip= argument configures eth0 before userspace;
 #     only the resolver is ours to set ---
+#
+# Nothing in the guest may manage eth0. Debian's systemd presets enable
+# systemd-networkd, and systemd-network-generator turns the kernel's ip=
+# into /run/systemd/network/70-eth0.network, which hands eth0 to networkd.
+# That is fatal here: networkd starts an LLDP client, the guest kernel has
+# CONFIG_PACKET=m with no modules in this rootfs, so the AF_PACKET socket
+# fails with EAFNOSUPPORT, networkd reports `eth0: Failed` and reconfigures
+# in a loop, and the address the kernel already set never survives. The guest
+# then answers no ARP and the bake times out waiting for sshd. Mask the three
+# units and the kernel's configuration stands, as this section intends.
+in_chroot systemctl mask systemd-networkd.service systemd-networkd.socket \
+  systemd-network-generator.service >/dev/null 2>&1
 printf 'nameserver 172.22.0.1\n' > "$R/etc/resolv.conf"
 echo "iso-guest" > "$R/etc/hostname"
 printf '127.0.0.1 localhost\n127.0.1.1 iso-guest\n' > "$R/etc/hosts"
