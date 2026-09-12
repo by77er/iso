@@ -155,11 +155,28 @@ the egress proxy, when the Debian mirrors are on this VM's allow-list.
 
 ## Outbound network & credentials
 
-Outbound HTTPS is routed through iso's egress proxy, which injects
-credentials in flight. For GitHub (github.com, api.github.com) you do NOT
-need to log in, set a token, or run `gh auth login`: `git` over HTTPS and
-direct API calls are authenticated for you automatically. Just make the
-request. Plain HTTP is dropped; use https URLs.
+Outbound HTTPS is routed through iso's egress proxy on the host. The proxy
+terminates TLS and overrides credential headers in flight, so real credentials
+never exist inside this VM.
+
+Which hosts are credentialed is the host's decision, made per VM, and it can
+change while you are running. Do not assume any particular service is
+authenticated, and do not try to work it out from your own environment:
+values like `ANTHROPIC_API_KEY` here are placeholders, not secrets.
+
+What this means for you:
+
+- Make requests normally. Where a client library insists on a credential,
+  pass any syntactically valid placeholder — the proxy replaces it.
+- Do not fetch, refresh, validate or cache tokens for these APIs, and do not
+  run `gh auth login` or anything like it. There is nothing here to log in
+  with, and replacing an injected header with one you obtained yourself turns
+  a working request into a broken one.
+- Plain HTTP is dropped; use `https://`.
+- A connection that is reset means that host is not on this VM's allow-list.
+  A request that completes but returns 401 or 403 means the host is allowed
+  but no credential is brokered for it. Neither is fixable from in here, so
+  report it rather than working around it.
 
 ## Your VM identity & service endpoints
 
