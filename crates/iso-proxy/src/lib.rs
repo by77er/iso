@@ -24,7 +24,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::LazyConfigAcceptor;
 
-use rpc::{CaClient, SecretsClient};
+use rpc::CaClient;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Resp = Response<BoxBody<Bytes, BoxError>>;
@@ -45,7 +45,7 @@ pub struct ProxyConfig {
 #[derive(Clone)]
 struct Ctx {
     ca: Arc<CaClient>,
-    secrets: Arc<SecretsClient>,
+    secrets: Arc<iso_secrets::Client>,
     client: UpstreamClient,
     resolver: Arc<dyn PolicyResolver>,
 }
@@ -80,7 +80,7 @@ fn build_ctx(
     let ca = Arc::new(
         CaClient::new(ca_sock.to_path_buf()).map_err(|e| std::io::Error::other(e.to_string()))?,
     );
-    let secrets = Arc::new(SecretsClient::new(secrets_sock.to_path_buf()));
+    let secrets = Arc::new(iso_secrets::Client::new(secrets_sock));
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
@@ -193,7 +193,15 @@ async fn handle(
     parts.uri = uri;
     parts.headers.remove(HOST); // re-derived from the authority by the client
 
-    for (k, v) in ctx.secrets.headers(&sni, principal.as_deref()).await {
+    // The provider sees the path (never the query string) so it can apply
+    // path-scoped rules — a credential that must not reach a vendor's OAuth
+    // routes, say — instead of deciding host-wide.
+    let path = parts.uri.path().to_string();
+    for (k, v) in ctx
+        .secrets
+        .headers(&sni, principal.as_deref(), Some(&path))
+        .await
+    {
         if let (Ok(name), Ok(val)) = (
             http::header::HeaderName::from_bytes(k.as_bytes()),
             http::header::HeaderValue::from_str(&v),

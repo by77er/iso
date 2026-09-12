@@ -1,6 +1,7 @@
-//! RPC clients for the two boundaries: the CertAuthority (`iso-cad`) and the
-//! SecretProvider (`iso-secretsd`). Each call is one connection: write JSON,
-//! half-close, read the JSON reply (see `iso-proxy/DESIGN.md`).
+//! RPC client for the CertAuthority boundary (`iso-cad`). One connection per
+//! call: write JSON, half-close, read the JSON reply (see
+//! `iso-proxy/DESIGN.md`). The SecretProvider client lives in `iso-secrets`
+//! beside the wire types, because the metadata server speaks it too.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,7 +17,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use iso_ca::{SignRequest, SignResponse};
-use iso_secrets::{HeadersRequest, HeadersResponse};
 
 pub(crate) async fn call<Req: Serialize, Resp: DeserializeOwned>(
     sock: &Path,
@@ -29,31 +29,6 @@ pub(crate) async fn call<Req: Serialize, Resp: DeserializeOwned>(
     let mut buf = Vec::new();
     conn.read_to_end(&mut buf).await?;
     Ok(serde_json::from_slice(&buf)?)
-}
-
-/// SecretProvider RPC client. Fail-open: any error ⇒ inject nothing.
-pub struct SecretsClient {
-    sock: PathBuf,
-}
-
-impl SecretsClient {
-    pub fn new(sock: PathBuf) -> Self {
-        Self { sock }
-    }
-
-    pub async fn headers(&self, domain: &str, principal: Option<&str>) -> HashMap<String, String> {
-        let req = HeadersRequest {
-            domain: domain.to_string(),
-            principal: principal.map(str::to_string),
-        };
-        match call::<_, HeadersResponse>(&self.sock, &req).await {
-            Ok(r) => r.headers,
-            Err(e) => {
-                tracing::warn!("secrets rpc failed, injecting nothing: {e}");
-                HashMap::new()
-            }
-        }
-    }
 }
 
 /// CertAuthority RPC client. Holds one disposable leaf key shared across all

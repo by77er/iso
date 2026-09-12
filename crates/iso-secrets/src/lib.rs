@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -43,17 +43,143 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// `(domain, principal)` lookup request.
-#[derive(Debug, Serialize, Deserialize)]
+/// Lookup request.
+///
+/// `domain` and `principal` are the original two fields. The other two are
+/// additive and default, so a new caller and an old provider (or the reverse)
+/// still understand each other: unknown fields are ignored on the way in, and
+/// a missing field reads as the pre-existing behaviour.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct HeadersRequest {
     pub domain: String,
     pub principal: Option<String>,
+    /// Request path, **without** the query string, when the caller has one.
+    ///
+    /// A provider whose rules are path-scoped (Keysmith publishes `paths` and
+    /// `exclude_paths` per endpoint, and is normative that `exclude_paths` must
+    /// be honored) cannot apply them to a domain-only question, and has to
+    /// choose between over-injecting and refusing. The query string is
+    /// deliberately excluded: it routinely carries tokens and identifiers, and
+    /// no path rule needs it.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Ask what *would* be injected, without producing a credential.
+    ///
+    /// The answer is header **names** only, in [`HeadersResponse::names`]. A
+    /// provider that mints on demand must not mint to answer this — the point
+    /// is to let callers that are merely describing the environment (the guest
+    /// metadata service) do so without issuing credentials, and without a
+    /// guest being able to drive credential issuance by polling.
+    #[serde(default)]
+    pub names_only: bool,
+}
+
+impl HeadersRequest {
+    pub fn new(domain: impl Into<String>, principal: Option<&str>) -> Self {
+        Self {
+            domain: domain.into(),
+            principal: principal.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// Attach the request path. Strips any query string for the caller.
+    pub fn with_path(mut self, path: Option<&str>) -> Self {
+        self.path = path.map(|p| p.split('?').next().unwrap_or(p).to_string());
+        self
+    }
+
+    pub fn names_only(mut self) -> Self {
+        self.names_only = true;
+        self
+    }
 }
 
 /// Effective headers to set/override (empty = inject nothing).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct HeadersResponse {
     pub headers: HashMap<String, String>,
+    /// Header names, for a [`HeadersRequest::names_only`] request. Empty
+    /// otherwise, and empty from a provider that predates the field.
+    #[serde(default)]
+    pub names: Vec<String>,
+}
+
+impl HeadersResponse {
+    /// The header names this response describes, whichever way the provider
+    /// answered. A names-only caller must use this rather than reading
+    /// `headers`: a provider that predates `names_only` answers such a request
+    /// with the full headers, values included, and this keeps those values from
+    /// reaching a caller that asked not to have them.
+    pub fn header_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = if self.names.is_empty() {
+            self.headers.keys().cloned().collect()
+        } else {
+            self.names.clone()
+        };
+        names.sort();
+        names
+    }
+}
+
+/// SecretProvider RPC client: one connection per call — write JSON, half-close,
+/// read the JSON reply. Fail-open, matching the daemon: any error answers as
+/// though nothing is configured, so a provider that is down degrades to "no
+/// injection" rather than blocking egress.
+pub struct Client {
+    sock: PathBuf,
+}
+
+impl Client {
+    pub fn new(sock: impl Into<PathBuf>) -> Self {
+        Self { sock: sock.into() }
+    }
+
+    async fn call(&self, req: &HeadersRequest) -> std::io::Result<HeadersResponse> {
+        let mut conn = UnixStream::connect(&self.sock).await?;
+        conn.write_all(&serde_json::to_vec(req)?).await?;
+        conn.shutdown().await?; // half-close: end of request
+        let mut buf = Vec::new();
+        conn.read_to_end(&mut buf).await?;
+        Ok(serde_json::from_slice(&buf)?)
+    }
+
+    /// Headers to inject for this request. `path` may be `None` when the caller
+    /// has no path (or is not making a request on anyone's behalf).
+    pub async fn headers(
+        &self,
+        domain: &str,
+        principal: Option<&str>,
+        path: Option<&str>,
+    ) -> HashMap<String, String> {
+        let req = HeadersRequest::new(domain, principal).with_path(path);
+        match self.call(&req).await {
+            Ok(r) => r.headers,
+            Err(e) => {
+                tracing::warn!("secrets rpc failed, injecting nothing: {e}");
+                HashMap::new()
+            }
+        }
+    }
+
+    /// Which headers *would* be injected, without minting anything.
+    pub async fn names(
+        &self,
+        domain: &str,
+        principal: Option<&str>,
+        path: Option<&str>,
+    ) -> Vec<String> {
+        let req = HeadersRequest::new(domain, principal)
+            .with_path(path)
+            .names_only();
+        match self.call(&req).await {
+            Ok(r) => r.header_names(),
+            Err(e) => {
+                tracing::warn!("secrets rpc failed, describing nothing: {e}");
+                Vec::new()
+            }
+        }
+    }
 }
 
 type DomainHeaders = HashMap<String, HashMap<String, HeaderSpec>>;
@@ -209,11 +335,23 @@ pub async fn serve_unix(provider: Arc<TomlSecretProvider>, sock: &Path) -> std::
             if conn.read_to_end(&mut buf).await.is_err() {
                 return;
             }
-            let headers = match serde_json::from_slice::<HeadersRequest>(&buf) {
-                Ok(r) => provider.headers(&r.domain, r.principal.as_deref()),
+            // The TOML file is keyed by domain alone, so `path` has nothing to
+            // narrow here; it exists for providers whose rules are path-scoped.
+            // Nothing is minted either way, so `names_only` is just a projection.
+            let out = match serde_json::from_slice::<HeadersRequest>(&buf) {
+                Ok(r) => {
+                    let headers = provider.headers(&r.domain, r.principal.as_deref());
+                    if r.names_only {
+                        let mut names: Vec<String> = headers.into_keys().collect();
+                        names.sort();
+                        HeadersResponse { names, ..Default::default() }
+                    } else {
+                        HeadersResponse { headers, ..Default::default() }
+                    }
+                }
                 Err(_) => Default::default(), // fail-open
             };
-            let resp = serde_json::to_vec(&HeadersResponse { headers }).unwrap_or_default();
+            let resp = serde_json::to_vec(&out).unwrap_or_default();
             let _ = conn.write_all(&resp).await;
             let _ = conn.shutdown().await;
         });
@@ -297,5 +435,77 @@ mod tests {
     fn unknown_domain_empty() {
         let p = TomlSecretProvider::from_toml(TOML).unwrap();
         assert!(p.headers("example.com", Some("default")).is_empty());
+    }
+
+    #[test]
+    fn request_defaults_are_the_old_wire_format() {
+        // A request written before `path`/`names_only` existed still parses,
+        // and reads as the behaviour it had then.
+        let r: HeadersRequest =
+            serde_json::from_str(r#"{"domain":"api.example.com","principal":"alice"}"#).unwrap();
+        assert_eq!(r.domain, "api.example.com");
+        assert_eq!(r.path, None);
+        assert!(!r.names_only);
+    }
+
+    #[test]
+    fn with_path_drops_the_query_string() {
+        // Query strings carry tokens and identifiers; no path rule needs them.
+        let r = HeadersRequest::new("api.example.com", None).with_path(Some("/v1/x?token=sk-secret"));
+        assert_eq!(r.path.as_deref(), Some("/v1/x"));
+    }
+
+    #[test]
+    fn header_names_never_exposes_values() {
+        // A provider that predates `names_only` answers a names-only request
+        // with full headers. The accessor must still yield only names.
+        let old_style = HeadersResponse {
+            headers: HashMap::from([("authorization".into(), "Bearer sk-secret".into())]),
+            names: vec![],
+        };
+        assert_eq!(old_style.header_names(), vec!["authorization".to_string()]);
+
+        let new_style = HeadersResponse {
+            headers: HashMap::new(),
+            names: vec!["x-api-key".into(), "authorization".into()],
+        };
+        assert_eq!(
+            new_style.header_names(),
+            vec!["authorization".to_string(), "x-api-key".to_string()] // sorted
+        );
+    }
+
+    #[tokio::test]
+    async fn names_only_answers_names_and_withholds_values() {
+        let dir = std::env::temp_dir().join(format!("iso-secrets-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("secrets.sock");
+
+        let provider = Arc::new(TomlSecretProvider::from_toml(TOML).unwrap());
+        let listen = sock.clone();
+        tokio::spawn(async move { serve_unix(provider, &listen).await });
+        for _ in 0..100 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let client = Client::new(&sock);
+        let headers = client.headers("api.anthropic.com", Some("default"), None).await;
+        assert_eq!(headers.get("x-api-key").map(String::as_str), Some("global-key"));
+
+        let names = client.names("api.anthropic.com", Some("default"), None).await;
+        assert!(names.contains(&"x-api-key".to_string()));
+        assert!(!names.contains(&"global-key".to_string()));
+
+        // And the raw response for a names-only request carries no values.
+        let resp = client
+            .call(&HeadersRequest::new("api.anthropic.com", Some("default")).names_only())
+            .await
+            .unwrap();
+        assert!(resp.headers.is_empty(), "names_only must not return values");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
