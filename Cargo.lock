@@ -1228,6 +1228,7 @@ dependencies = [
  "iso-guest-agent",
  "iso-guest-proto",
  "iso-network-manager",
+ "iso-secrets",
  "iso-storage-manager",
  "libc",
  "reqwest 0.12.28",

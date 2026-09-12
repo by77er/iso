@@ -11,6 +11,9 @@ pub struct Settings {
     pub firecracker: iso_firecracker::Config,
     /// Admin API unix socket.
     pub control_sock: PathBuf,
+    /// SecretProvider socket (`iso-secretsd` or a drop-in replacement). The
+    /// metadata server asks it, names-only, what a VM's egress would carry.
+    pub secrets_sock: PathBuf,
     /// Admin API TCP listener (for a remote orchestrator's HTTP client).
     pub control_tcp: std::net::SocketAddr,
     /// Where the admin CA and server identity live (`ISO_ADMIN_TLS_DIR`).
@@ -106,6 +109,7 @@ pub fn from_env() -> Settings {
             ..Default::default()
         },
         control_sock: state.join("control.sock"),
+        secrets_sock: state.join("secrets.sock"),
         admin_tls_dir: env("ISO_ADMIN_TLS_DIR").map(PathBuf::from).unwrap_or_else(|| state.join("admin-pki")),
         admin_insecure: env("ISO_ADMIN_INSECURE")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))

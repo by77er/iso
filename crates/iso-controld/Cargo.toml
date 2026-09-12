@@ -15,6 +15,7 @@ path = "src/bin/iso-openapi.rs"
 [dependencies]
 iso-common = { path = "../iso-common" }
 iso-control-plane = { path = "../iso-control-plane" }
+iso-secrets = { path = "../iso-secrets" }
 iso-network-manager = { path = "../iso-network-manager" }
 iso-storage-manager = { path = "../iso-storage-manager" }
 iso-firecracker = { path = "../iso-firecracker" }
