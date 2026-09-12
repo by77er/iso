@@ -268,6 +268,20 @@ export default function Chat({
           >
             Reconcile
           </button>
+          <button
+            className="secondary"
+            disabled={busy}
+            onClick={() => {
+              if (
+                confirm(
+                  "Retry allocation only after inspecting the plane and confirming the previous request is no longer running. A fresh label check must find zero VMs. This creates a workspace for this session; prompts will not be replayed. Continue?",
+                )
+              )
+                void act("retry-allocation");
+            }}
+          >
+            Retry allocation
+          </button>
         </div>
       )}
       <Transcript

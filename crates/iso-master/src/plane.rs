@@ -1,9 +1,97 @@
 use crate::config::PlaneConfig;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use iso_client::{Client, Credentials, types};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+
+async fn wait_ready<F, Fut>(budget: Duration, mut probe: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    tokio::time::timeout(budget, async {
+        let mut delay = Duration::from_millis(250);
+        loop {
+            if probe().await { return; }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(2));
+        }
+    }).await.context("Guest readiness timed out: guest agent and DNS resolution of metadata.iso.internal are required")
+}
+
+fn dns_probe() -> types::ExecRequest {
+    types::ExecRequest {
+        cmd: "getent".into(),
+        args: vec![
+            "-s".into(),
+            "dns".into(),
+            "ahostsv4".into(),
+            "metadata.iso.internal".into(),
+        ],
+        cwd: Some("/".into()),
+        env: Default::default(),
+        max_output_bytes: Some(4096),
+        stdin: None,
+        timeout_ms: Some(2000),
+    }
+}
+
+fn dns_ready(result: &types::ExecResult) -> bool {
+    result.exit_code == Some(0)
+        && !result.timed_out
+        && result.signal.is_none()
+        && result.stdout.lines().any(|line| {
+            line.split_whitespace()
+                .next()
+                .is_some_and(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn readiness_retries_transient_failures_and_bounds_hanging_probes() {
+        let mut attempts = 0;
+        wait_ready(Duration::from_secs(2), || {
+            attempts += 1;
+            std::future::ready(attempts == 3)
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts, 3);
+        let error = wait_ready(Duration::from_millis(20), || std::future::pending::<bool>())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("metadata.iso.internal"));
+    }
+
+    #[test]
+    fn probe_requires_successful_dns_output_and_is_read_only() {
+        let request = dns_probe();
+        assert_eq!(request.cmd, "getent");
+        assert_eq!(
+            request.args,
+            ["-s", "dns", "ahostsv4", "metadata.iso.internal"]
+        );
+        assert_eq!(request.timeout_ms, Some(2000));
+        let mut result: types::ExecResult = serde_json::from_value(json!({
+            "duration_ms":1,"exit_code":0,"signal":null,"stderr":"",
+            "stdout":"172.22.0.1 STREAM metadata.iso.internal\n", "timed_out":false,"truncated":false
+        })).unwrap();
+        assert!(dns_ready(&result));
+        result.timed_out = true;
+        assert!(!dns_ready(&result));
+        result.timed_out = false;
+        result.exit_code = Some(2);
+        assert!(!dns_ready(&result));
+        result.exit_code = Some(0);
+        result.stdout.clear();
+        assert!(!dns_ready(&result));
+    }
+}
 
 #[derive(Clone)]
 pub struct Plane {
@@ -110,16 +198,21 @@ impl Plane {
     }
     pub async fn ready(&self, id: &str) -> Result<()> {
         if let Some(c) = &self.client {
-            tokio::time::timeout(Duration::from_secs(60), async {
-                loop {
-                    if tokio::time::timeout(Duration::from_secs(3), c.agent_info().id(id).send())
-                        .await
-                        .is_ok_and(|r| r.is_ok())
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+            wait_ready(Duration::from_secs(60), || async {
+                if !tokio::time::timeout(Duration::from_secs(3), c.agent_info().id(id).send())
+                    .await
+                    .is_ok_and(|r| r.is_ok())
+                {
+                    return false;
                 }
+                // Only this bounded, read-only infrastructure probe is retried.
+                // DNS is forced through NSS's DNS backend, not /etc/hosts.
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    c.guest_exec().id(id).body(dns_probe()).send(),
+                )
+                .await
+                .is_ok_and(|r| r.is_ok_and(|result| dns_ready(&result)))
             })
             .await?;
         }

@@ -32,7 +32,7 @@ impl Phase {
             || matches!(
                 (self, next),
                 (Allocating, Starting | AllocationUnknown | Interrupted)
-                    | (AllocationUnknown, Interrupted | Closed)
+                    | (AllocationUnknown, Allocating | Interrupted | Closed)
                     | (Starting, Idle | Interrupted)
                     | (Idle, Working | Sleeping | Interrupted | Closing)
                     | (Working, Idle | Interrupted | Closing)

@@ -212,7 +212,10 @@ impl Engine {
         if recover || info["state"] != "running" {
             plane.action(vm, "start").await?;
         }
-        plane.ready(vm).await?;
+        if let Err(error) = plane.ready(vm).await {
+            self.store.event(id, json!({"type":"notice","text":format!("{error}. Workspace retained; pi was not started and no prompts were replayed.")}))?;
+            return Err(error);
+        }
         let mut cfg = self.cfg.clone();
         cfg.pi_model = s.model.clone().or(cfg.pi_model);
         let token = uuid::Uuid::new_v4().to_string();
@@ -418,13 +421,58 @@ impl Engine {
             .collect::<Vec<_>>();
         ensure!(
             found.len() == 1,
-            "Expected exactly one VM with this session label; inspect the plane before retrying"
+            "Found {} VMs with this session label. If none exist, inspect the plane for unfinished allocations before using Retry allocation; multiple matches require manual inspection.",
+            found.len()
         );
         self.store.update(id, |s| {
             s.vm = Some(found[0]["id"].as_str().context("Invalid VM ID")?.into());
             s.phase = Phase::Interrupted;
             Ok(())
         })
+    }
+    pub async fn retry_allocation(&self, id: &str) -> Result<Session> {
+        let _placement = self.placement.lock().await;
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        let s = self.store.get(id)?;
+        ensure!(
+            s.phase == Phase::AllocationUnknown && s.vm.is_none(),
+            "Only an unresolved allocation without a workspace can be retried"
+        );
+        let plane = self.plane(&s.plane)?;
+        let vms = plane.list().await?;
+        ensure!(
+            !vms.iter().any(|vm| vm["labels"]["master-session"] == id),
+            "A VM already has this session label. Use Reconcile; no VM was created."
+        );
+        ensure!(
+            vms.len() < plane.config.max_vms,
+            "Control plane is at capacity"
+        );
+        ensure!(
+            self.workers.lock().await.len() < self.cfg.max_agents,
+            "Active agent limit reached"
+        );
+        self.store.phase(id, Phase::Allocating)?;
+        self.store.event(id, json!({"type":"notice","text":"Operator explicitly retried allocation after checking the plane. No prompts will be replayed."}))?;
+        match plane.create(id, &s.name).await {
+            Ok(vm) => {
+                self.store.update(id, |session| {
+                    session.vm = Some(vm);
+                    session.phase = Phase::Interrupted;
+                    session.error = None;
+                    Ok(())
+                })?;
+                self.store.event(id, json!({"type":"notice","text":"Workspace allocated. Use Recover to start the agent; no prompts were replayed."}))?;
+            }
+            Err(_) => {
+                self.store.phase(id, Phase::AllocationUnknown)?;
+                bail!(
+                    "Allocation outcome unknown again. Inspect the plane and reconcile before considering another explicit retry."
+                );
+            }
+        }
+        self.store.get(id)
     }
     pub async fn shutdown(&self) {
         self.worker_tokens.lock().unwrap().clear();
@@ -942,10 +990,38 @@ mod tests {
         assert!(e.reconcile(&id).await.is_err());
         assert!(e.planes[0].list().await.unwrap().is_empty());
         let vm = e.planes[0].create(&id, "ambiguous").await.unwrap();
+        assert!(e.retry_allocation(&id).await.is_err());
+        assert_eq!(e.planes[0].list().await.unwrap().len(), 1);
+        let duplicate = e.planes[0].create(&id, "duplicate").await.unwrap();
+        assert!(e.reconcile(&id).await.is_err());
+        assert!(e.retry_allocation(&id).await.is_err());
+        assert_eq!(e.planes[0].list().await.unwrap().len(), 2);
+        e.planes[0].action(&duplicate, "destroy").await.unwrap();
         let s = e.reconcile(&id).await.unwrap();
         assert_eq!(s.vm.as_deref(), Some(vm.as_str()));
         assert_eq!(s.phase, Phase::Interrupted);
         assert_eq!(e.planes[0].list().await.unwrap().len(), 1);
+        e.close_session(&id).await.unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut unresolved = s.clone();
+        unresolved.id = id.clone();
+        unresolved.vm = None;
+        unresolved.phase = Phase::AllocationUnknown;
+        e.store.insert(&unresolved).unwrap();
+        let (a, b) = tokio::join!(e.retry_allocation(&id), e.retry_allocation(&id));
+        assert_ne!(a.is_ok(), b.is_ok());
+        let retried = e.store.get(&id).unwrap();
+        assert_eq!(retried.phase, Phase::Interrupted);
+        assert!(retried.vm.is_some());
+        assert_eq!(e.planes[0].list().await.unwrap().len(), 1);
+        assert!(e.workers.lock().await.is_empty());
+        assert!(
+            !e.store
+                .events(&id, 0)
+                .unwrap()
+                .iter()
+                .any(|event| event["type"] == "message")
+        );
         e.close_session(&id).await.unwrap();
     }
 

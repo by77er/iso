@@ -336,6 +336,9 @@ async fn action(State(web): State<Web>, Path((id, action)): Path<(Uuid, String)>
         "reconcile" => {
             web.engine.reconcile(&id).await?;
         }
+        "retry-allocation" => {
+            web.engine.retry_allocation(&id).await?;
+        }
         _ => {
             return Err(ApiError(
                 StatusCode::NOT_FOUND,

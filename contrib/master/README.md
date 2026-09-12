@@ -163,7 +163,7 @@ process-wide file lock prevents two masters from using the same SQLite database.
 
 | Operation    | Behavior                                                                                                                                              |
 | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| New agent    | Persist session, create a **durable** VM, wait for its guest agent, start pi and require a remote-tool readiness handshake.                           |
+| New agent    | Persist session, create a **durable** VM, wait for its guest agent and internal DNS, start pi and require a remote-tool readiness handshake.         |
 | Prompt       | One in flight per session. Conversation events are journaled and delivered to React using durable sequence cursors.                                   |
 | Idle timeout | Default 900 seconds, checked at most every 30 seconds. Only fully settled (`agent_settled`) sessions sleep. Browser polling does not keep them awake. |
 | Sleep        | Close the idle pi worker; ask iso to **suspend** the VM. Preserve disk, VM ID, history and assignment.                                                |
@@ -178,6 +178,11 @@ allocated. This version does not evict suspended VMs to cold storage.
 
 ### Interrupted operations
 
+- **Retry allocation** is an explicit operator action for unresolved sessions
+  with zero matching VMs. Inspect the plane first and confirm the previous create
+  is no longer running: absence alone cannot rule out an in-flight request.
+  The master rechecks labels and capacity, serializes retries, and refuses any
+  existing match. Success requires a separate **Recover**; prompts are not replayed.
 - VM creation has no upstream idempotency key. An ambiguous create is **never
   automatically retried or failed over**. The VM carries a `master-session` label.
   **Reconcile** adopts it only if exactly one VM has that label on the assigned
@@ -216,6 +221,12 @@ ownership/authorization and audit policy.
   and coordination tools as described above. There is **no local fallback**. Built-in tools, auto-discovered extensions,
   skills, prompt templates and context files are disabled; startup requires a
   readiness notification from the explicit remote extension.
+- Before starting pi (including wake/recovery), the master waits up to 60 seconds
+  for guest-agent connectivity and guest-side `getent -s dns ahostsv4 metadata.iso.internal`.
+  Templates must provide `getent` with the DNS NSS backend. The read-only probe
+  has a two-second guest timeout and bounded backoff; agent prompts and commands
+  are never replayed. Failure retains the workspace and emits a readiness notice.
+  This checks ISO DNS reachability, not public DNS, proxy health, or credentials.
 - The browser cannot send arbitrary pi RPC commands, load extensions, select a
   credential principal, or supply a control-plane URL. `/` and `!` harness command
   input is disabled. Trusted operator config still has full authority.
