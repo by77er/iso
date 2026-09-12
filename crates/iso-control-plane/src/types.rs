@@ -119,6 +119,11 @@ pub struct VmRecord {
     /// credential injection). In `Allow` mode the rest go direct; in `Proxy`
     /// mode the rest are denied.
     pub allow: Vec<String>,
+    /// This VM's own snapshot, from the last successful suspend. Preferred over
+    /// the template's on resume — the template's is where every clone *starts*,
+    /// this is where this one left off. Cleared when the VM is destroyed (the
+    /// runtime removes the files with the rest of its state dir).
+    pub snapshot: Option<SnapshotRef>,
 }
 
 /// Request to create a VM.

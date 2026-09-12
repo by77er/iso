@@ -838,8 +838,15 @@ pub(crate) mod tests {
             self.0.lock().unwrap().insert(vm, VmStatus::Running);
             Ok(())
         }
-        async fn suspend(&self, vm: VmId) -> IRes<()> {
+        async fn suspend(&self, vm: VmId) -> IRes<iso_common::SnapshotRef> {
             self.0.lock().unwrap().insert(vm, VmStatus::Suspended);
+            Ok(iso_common::SnapshotRef {
+                mem_file: format!("/state/{vm}/mem").into(),
+                vmstate: format!("/state/{vm}/vmstate").into(),
+            })
+        }
+        async fn release(&self, vm: VmId) -> IRes<()> {
+            self.0.lock().unwrap().insert(vm, VmStatus::Stopped);
             Ok(())
         }
         async fn stop(&self, vm: VmId) -> IRes<()> {

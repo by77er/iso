@@ -86,8 +86,16 @@ impl JailerConfig {
 /// The jail-relative paths Firecracker's API is given. Constant across VMs.
 pub const GUEST_KERNEL: &str = "/vmlinux";
 pub const GUEST_ROOTFS: &str = "/rootfs";
-pub const GUEST_SNAPSHOT_MEM: &str = "/snapshot/mem";
-pub const GUEST_SNAPSHOT_VMSTATE: &str = "/snapshot/vmstate";
+/// Resume inputs: hard links to the template's snapshot, shared with every
+/// other clone and with the golden copy itself. **Read-only by contract** —
+/// writing here would corrupt the snapshot every other VM resumes from.
+pub const GUEST_SNAPSHOT_IN_MEM: &str = "/snapshot/in/mem";
+pub const GUEST_SNAPSHOT_IN_VMSTATE: &str = "/snapshot/in/vmstate";
+/// Suspend outputs: an empty directory owned by the jail identity, so the
+/// dropped-privilege VMM can create its own files instead of being handed
+/// root-owned ones it cannot open for write.
+pub const GUEST_SNAPSHOT_OUT_MEM: &str = "/snapshot/out/mem";
+pub const GUEST_SNAPSHOT_OUT_VMSTATE: &str = "/snapshot/out/vmstate";
 pub const GUEST_API_SOCKET: &str = "/run/firecracker.socket";
 
 /// Everything that has to exist for one jailed VM, on the host side, plus the
@@ -128,8 +136,8 @@ pub fn plan(jail: &JailerConfig, firecracker: &Path, netns_path: &Path, spec: &I
         .as_ref()
         .map(|s| {
             vec![
-                (s.mem_file.clone(), root.join("snapshot/mem")),
-                (s.vmstate.clone(), root.join("snapshot/vmstate")),
+                (s.mem_file.clone(), root.join("snapshot/in/mem")),
+                (s.vmstate.clone(), root.join("snapshot/in/vmstate")),
             ]
         })
         .unwrap_or_default();
@@ -230,7 +238,19 @@ fn link_or_cache(src: &Path, dst: &Path, cache_dir: &Path) -> Result<()> {
 /// and snapshot linked in, and the rootfs device nodes pointing at
 /// `rootfs_device`.
 pub fn materialize(plan: &JailPlan, jail: &JailerConfig, rootfs_device: &Path) -> Result<()> {
-    for dir in [&plan.root, &plan.root.join("run"), &plan.root.join("snapshot")] {
+    // `snapshot/in` holds links to the shared template snapshot; `snapshot/out`
+    // is where suspend writes. They are separate directories because the same
+    // path cannot be both: the inputs are hard links to a root-owned inode that
+    // other VMs resume from, so a suspend writing over them would both fail
+    // (the VMM is uid `jail.uid`, the file is root's) and, if it succeeded,
+    // rewrite the golden snapshot through the shared inode.
+    for dir in [
+        &plan.root,
+        &plan.root.join("run"),
+        &plan.root.join("snapshot"),
+        &plan.root.join("snapshot/in"),
+        &plan.root.join("snapshot/out"),
+    ] {
         std::fs::create_dir_all(dir).map_err(|e| be(&format!("mkdir {}", dir.display()), e))?;
         chown(dir, jail.uid, jail.gid)?;
     }
@@ -352,8 +372,8 @@ mod tests {
         assert_eq!(
             p.snapshot,
             vec![
-                ("/var/lib/iso/templates/base/mem".into(), p.root.join("snapshot/mem")),
-                ("/var/lib/iso/templates/base/vmstate".into(), p.root.join("snapshot/vmstate")),
+                ("/var/lib/iso/templates/base/mem".into(), p.root.join("snapshot/in/mem")),
+                ("/var/lib/iso/templates/base/vmstate".into(), p.root.join("snapshot/in/vmstate")),
             ]
         );
         // both the jailed name and the unjailed bake's host path resolve to this VM's device

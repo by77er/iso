@@ -130,6 +130,10 @@ impl Store {
         // Migrate pre-policy databases (idempotent; errors = column exists).
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN principal TEXT", []);
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN allow TEXT NOT NULL DEFAULT '[]'", []);
+        // A VM's own snapshot, written by suspend. Nullable: most VMs never
+        // have one, and a VM loses it when it is destroyed.
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN snapshot_mem TEXT", []);
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN snapshot_vmstate TEXT", []);
         // Migrate the legacy `vms.ingress` JSON blob into `port_forwards`, then
         // drop the column. No-op once migrated and on fresh databases.
         Self::migrate_ingress_blob(&conn)?;
@@ -249,13 +253,16 @@ impl Store {
     /// a concurrent policy/forward edit (and vice-versa).
     pub fn update_placement(&self, v: &VmRecord) -> Result<()> {
         self.lock().execute(
-            "UPDATE vms SET slot=?2, state=?3, rootfs_device=?4, tap=?5 WHERE id=?1",
+            "UPDATE vms SET slot=?2, state=?3, rootfs_device=?4, tap=?5, \
+             snapshot_mem=?6, snapshot_vmstate=?7 WHERE id=?1",
             rusqlite::params![
                 v.id.to_string(),
                 v.slot.map(|s| s.get()),
                 v.state.as_str(),
                 v.rootfs_device.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 v.tap,
+                v.snapshot.as_ref().map(|s| s.mem_file.to_string_lossy().into_owned()),
+                v.snapshot.as_ref().map(|s| s.vmstate.to_string_lossy().into_owned()),
             ],
         )?;
         Ok(())
@@ -360,8 +367,8 @@ impl Store {
     }
 }
 
-const VM_SELECT: &str = "SELECT id, slot, template, egress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow FROM vms WHERE id=?1";
-const VM_SELECT_ALL: &str = "SELECT id, slot, template, egress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow FROM vms";
+const VM_SELECT: &str = "SELECT id, slot, template, egress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow, snapshot_mem, snapshot_vmstate FROM vms WHERE id=?1";
+const VM_SELECT_ALL: &str = "SELECT id, slot, template, egress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow, snapshot_mem, snapshot_vmstate FROM vms";
 
 fn template_from_row(r: &rusqlite::Row<'_>) -> Result<TemplateDef> {
     let mem: Option<String> = r.get(2)?;
@@ -401,6 +408,13 @@ fn vm_from_row(r: &rusqlite::Row<'_>) -> Result<VmRecord> {
     let tap: Option<String> = r.get(11)?;
     let principal: Option<String> = r.get(12)?;
     let allow: Vec<String> = serde_json::from_str(&r.get::<_, String>(13)?)?;
+    let snap_mem: Option<String> = r.get(14)?;
+    let snap_vmstate: Option<String> = r.get(15)?;
+    // Both or neither: half a snapshot is not resumable.
+    let snapshot = match (snap_mem, snap_vmstate) {
+        (Some(m), Some(v)) => Some(SnapshotRef { mem_file: PathBuf::from(m), vmstate: PathBuf::from(v) }),
+        _ => None,
+    };
     Ok(VmRecord {
         id,
         slot: slot.and_then(|s| SlotId::new(s).ok()),
@@ -418,5 +432,6 @@ fn vm_from_row(r: &rusqlite::Row<'_>) -> Result<VmRecord> {
         tap,
         principal,
         allow,
+        snapshot,
     })
 }

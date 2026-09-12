@@ -86,8 +86,17 @@ pub trait VmRuntime {
     /// Begin or resume execution.
     fn start(&self, vm: VmId) -> impl Future<Output = Result<()>> + Send;
 
-    /// Pause execution (and snapshot to disk for a later resume).
-    fn suspend(&self, vm: VmId) -> impl Future<Output = Result<()>> + Send;
+    /// Pause execution and snapshot to disk, returning where the snapshot
+    /// landed so the caller can persist it. The paths are the runtime's to
+    /// choose and outlive the VMM process, so a VM that is started again after
+    /// its VMM is gone can resume its own state rather than the template's.
+    fn suspend(&self, vm: VmId) -> impl Future<Output = Result<SnapshotRef>> + Send;
+
+    /// Stop the VMM and clear its per-process scratch (API socket, pidfile,
+    /// jail), but keep what a later [`Self::start`] needs — notably a snapshot
+    /// [`Self::suspend`] wrote. This is the stop half of the lifecycle;
+    /// [`Self::destroy`] is the everything-goes half.
+    fn release(&self, vm: VmId) -> impl Future<Output = Result<()>> + Send;
 
     /// Request graceful in-guest shutdown.
     fn stop(&self, vm: VmId) -> impl Future<Output = Result<()>> + Send;

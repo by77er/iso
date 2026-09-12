@@ -24,7 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use iso_common::{Error, InstanceSpec, Result, VmId, VmRuntime, VmStatus};
+use iso_common::{Error, InstanceSpec, Result, SnapshotRef, VmId, VmRuntime, VmStatus};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -78,6 +78,18 @@ struct ApiPaths {
     rootfs: String,
     snapshot_mem: String,
     snapshot_vmstate: String,
+}
+
+/// Move a file the jailed VMM just wrote out of the jail. `rename` first (both
+/// sides normally live under the same state dir); fall back to copy+unlink when
+/// they are on different filesystems.
+fn move_out(src: &Path, dst: &Path) -> Result<()> {
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(src, dst).map_err(|e| Error::Backend(format!("copy {}: {e}", src.display())))?;
+    let _ = std::fs::remove_file(src);
+    Ok(())
 }
 
 pub struct FirecrackerRuntime {
@@ -174,9 +186,39 @@ impl FirecrackerRuntime {
         Ok(ApiPaths {
             kernel: jail::GUEST_KERNEL.into(),
             rootfs: jail::GUEST_ROOTFS.into(),
-            snapshot_mem: jail::GUEST_SNAPSHOT_MEM.into(),
-            snapshot_vmstate: jail::GUEST_SNAPSHOT_VMSTATE.into(),
+            snapshot_mem: jail::GUEST_SNAPSHOT_IN_MEM.into(),
+            snapshot_vmstate: jail::GUEST_SNAPSHOT_IN_VMSTATE.into(),
         })
+    }
+
+    /// Stop the VMM and remove its per-process scratch. `keep_snapshot` spares
+    /// the state dir, which is where [`VmRuntime::suspend`] leaves the memory
+    /// and vmstate a later start resumes from: a durable VM that stops has not
+    /// thrown that away, only a destroyed one has.
+    async fn teardown_vmm(&self, vm: VmId, keep_snapshot: bool) {
+        self.kill(vm);
+        let own_child = self.children.lock().unwrap().remove(&vm);
+        match own_child {
+            // our own child: reap it.
+            Some(mut child) => {
+                let _ = child.wait();
+            }
+            // VM re-adopted across a restart (no Child handle): wait for the
+            // SIGKILL'd process to actually exit so its rootfs LV is released
+            // before storage teardown (else lvremove fails on an open device).
+            None => self.wait_dead(vm, Duration::from_secs(5)).await,
+        }
+        let _ = std::fs::remove_file(self.socket(vm));
+        let _ = std::fs::remove_file(self.pidfile(vm));
+        if !keep_snapshot {
+            let _ = std::fs::remove_dir_all(self.snap_dir(vm));
+        }
+        // The jail always goes: its snapshot/in links are rebuilt from the
+        // resume source on the next spawn, and spawn_jailed tears it down
+        // anyway.
+        if let Some(j) = &self.cfg.jailer {
+            jail::teardown(&j.jail_dir(&self.fc_bin, vm));
+        }
     }
 
     fn pid_of(&self, vm: VmId) -> Option<i32> {
@@ -434,25 +476,44 @@ impl VmRuntime for FirecrackerRuntime {
         }
     }
 
-    async fn suspend(&self, vm: VmId) -> Result<()> {
+    async fn suspend(&self, vm: VmId) -> Result<SnapshotRef> {
         let socket = self.socket(vm);
+        // Firecracker refuses to snapshot a running microVM.
         client::patch(&socket, "/vm", json!({ "state": "Paused" })).await?;
-        let (vmstate, mem) = if self.jail_root(vm).is_some() {
-            (jail::GUEST_SNAPSHOT_VMSTATE.to_string(), jail::GUEST_SNAPSHOT_MEM.to_string())
-        } else {
-            let dir = self.snap_dir(vm);
-            std::fs::create_dir_all(&dir).map_err(be)?;
-            (
-                dir.join("vmstate").to_string_lossy().into_owned(),
-                dir.join("mem").to_string_lossy().into_owned(),
-            )
+        let dir = self.snap_dir(vm);
+        std::fs::create_dir_all(&dir).map_err(be)?;
+        let out = SnapshotRef { mem_file: dir.join("mem"), vmstate: dir.join("vmstate") };
+
+        // Jailed, the VMM writes into its own `snapshot/out` — never over the
+        // `snapshot/in` links, which share the template's inode with every
+        // other clone. Unjailed, it writes straight to the destination.
+        let jail_root = self.jail_root(vm);
+        let (vmstate, mem) = match &jail_root {
+            Some(_) => (
+                jail::GUEST_SNAPSHOT_OUT_VMSTATE.to_string(),
+                jail::GUEST_SNAPSHOT_OUT_MEM.to_string(),
+            ),
+            None => (
+                out.vmstate.to_string_lossy().into_owned(),
+                out.mem_file.to_string_lossy().into_owned(),
+            ),
         };
         client::put(
             &socket,
             "/snapshot/create",
             json!({ "snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": mem }),
         )
-        .await
+        .await?;
+
+        // Move it out of the jail: the next `spawn_jailed` tears the jail dir
+        // down wholesale, so anything left inside is lost on the next start —
+        // which is exactly the state we would want to resume from.
+        if let Some(root) = jail_root {
+            let snap_out = root.join("snapshot/out");
+            move_out(&snap_out.join("vmstate"), &out.vmstate)?;
+            move_out(&snap_out.join("mem"), &out.mem_file)?;
+        }
+        Ok(out)
     }
 
     async fn stop(&self, vm: VmId) -> Result<()> {
@@ -470,25 +531,13 @@ impl VmRuntime for FirecrackerRuntime {
         Ok(())
     }
 
+    async fn release(&self, vm: VmId) -> Result<()> {
+        self.teardown_vmm(vm, true).await;
+        Ok(())
+    }
+
     async fn destroy(&self, vm: VmId) -> Result<()> {
-        self.kill(vm);
-        let own_child = self.children.lock().unwrap().remove(&vm);
-        match own_child {
-            // our own child: reap it.
-            Some(mut child) => {
-                let _ = child.wait();
-            }
-            // VM re-adopted across a restart (no Child handle): wait for the
-            // SIGKILL'd process to actually exit so its rootfs LV is released
-            // before storage teardown (else lvremove fails on an open device).
-            None => self.wait_dead(vm, Duration::from_secs(5)).await,
-        }
-        let _ = std::fs::remove_file(self.socket(vm));
-        let _ = std::fs::remove_file(self.pidfile(vm));
-        let _ = std::fs::remove_dir_all(self.snap_dir(vm));
-        if let Some(j) = &self.cfg.jailer {
-            jail::teardown(&j.jail_dir(&self.fc_bin, vm));
-        }
+        self.teardown_vmm(vm, false).await;
         Ok(())
     }
 

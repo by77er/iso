@@ -202,6 +202,8 @@ where
             tap: None,
             principal: req.principal.clone(),
             allow: req.allow.clone(),
+            // A new VM has never suspended; it resumes from its template.
+            snapshot: None,
         };
         // write-ahead intent so a crash mid-create is recoverable. `rec.ingress`
         // drives bring_up's apply; the persisted desired state is the normalized
@@ -259,9 +261,21 @@ where
         };
         let fixture = self.net.apply(slot, &policy).await?;
 
-        // custom vcpu/mem forgoes the snapshot (fresh boot); otherwise resume.
+        // Custom vcpu/mem forgoes any snapshot: it was taken at the template's
+        // machine shape and cannot resume into a different one.
+        //
+        // Otherwise this VM's own snapshot wins over the template's. The
+        // template's is where every clone *starts*; a VM that has suspended has
+        // somewhere of its own to come back to, and `allow_resume` does not
+        // gate it — that flag exists to force a stopped durable VM to boot
+        // fresh off its rootfs rather than re-enter the template's memory,
+        // which is a different question from resuming its own state.
         let custom = rec.vcpus.is_some() || rec.mem_mib.is_some();
-        let resume_from = if allow_resume && !custom {
+        let resume_from = if custom {
+            None
+        } else if rec.snapshot.is_some() {
+            rec.snapshot.clone()
+        } else if allow_resume {
             tpl.snapshot.clone()
         } else {
             None
@@ -364,7 +378,17 @@ where
     /// Release placement; tear down storage + record for Ephemeral, keep storage
     /// (free slot/network only) for Durable.
     async fn finalize_stop(&self, mut rec: VmRecord) -> Result<()> {
-        let _ = self.runtime.destroy(rec.id).await;
+        // A durable VM keeps its storage across a stop; it keeps its snapshot
+        // for the same reason, so that a stop after a suspend comes back as
+        // itself. `destroy` removes both.
+        match rec.lifecycle {
+            Lifecycle::Durable => {
+                let _ = self.runtime.release(rec.id).await;
+            }
+            Lifecycle::Ephemeral => {
+                let _ = self.runtime.destroy(rec.id).await;
+            }
+        }
         if let Some(slot) = rec.slot {
             let _ = self.net.teardown(slot).await;
             self.slots.lock().unwrap().free(slot);
@@ -401,7 +425,10 @@ where
                 op: "suspend",
             });
         }
-        self.runtime.suspend(id).await?;
+        // Keep where the snapshot landed: without it, a start after the VMM is
+        // gone would fall back to the template and silently discard this VM's
+        // state.
+        rec.snapshot = Some(self.runtime.suspend(id).await?);
         rec.state = VmState::Suspended;
         self.store.update_placement(&rec)?;
         Ok(())
@@ -804,9 +831,17 @@ mod tests {
                 Ok(())
             }
         }
-        async fn suspend(&self, vm: VmId) -> IRes<()> {
+        async fn suspend(&self, vm: VmId) -> IRes<SnapshotRef> {
             self.log.push("rt.suspend");
             self.set(vm, VmStatus::Suspended);
+            Ok(SnapshotRef {
+                mem_file: format!("/state/{vm}/mem").into(),
+                vmstate: format!("/state/{vm}/vmstate").into(),
+            })
+        }
+        async fn release(&self, vm: VmId) -> IRes<()> {
+            self.log.push("rt.release");
+            self.set(vm, VmStatus::Stopped);
             Ok(())
         }
         async fn stop(&self, vm: VmId) -> IRes<()> {
@@ -1001,6 +1036,32 @@ mod tests {
         assert!(rec.slot.is_some());
         // a restart fresh-boots (rootfs has diverged from the template snapshot).
         assert!(log.has("rt.create:resume=false"));
+    }
+
+    /// A durable VM that suspended and then stopped must come back as itself.
+    /// Before per-VM snapshots this fresh-booted, silently discarding the
+    /// suspended state; `allow_resume=false` on the stopped path only ever
+    /// meant "don't re-enter the *template's* memory".
+    #[tokio::test]
+    async fn suspended_then_stopped_durable_resumes_its_own_snapshot() {
+        let (cp, log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp.create_vm(req(Lifecycle::Durable, RestartPolicy::Never)).await.unwrap();
+
+        cp.suspend_vm(id).await.unwrap();
+        let suspended = cp.get_vm(id).unwrap().unwrap();
+        assert_eq!(suspended.state, VmState::Suspended);
+        let own = suspended.snapshot.clone().expect("suspend records where it wrote");
+
+        cp.stop_vm(id).await.unwrap();
+        // Stopping a durable VM releases the VMM but keeps its snapshot, the
+        // same way it keeps its rootfs.
+        assert!(log.has("rt.release"));
+        assert_eq!(cp.get_vm(id).unwrap().unwrap().snapshot, Some(own));
+
+        cp.start_vm(id).await.unwrap();
+        assert!(log.has("rt.create:resume=true"));
+        assert_eq!(cp.get_vm(id).unwrap().unwrap().state, VmState::Running);
     }
 
     #[tokio::test]
