@@ -19,10 +19,23 @@ export PATH="/usr/sbin:/sbin:$HOME/.nix-profile/bin:$PATH"
 mkdir -p "$STATE"
 
 # --- control plane (needs root: netlink, nft, lvm, firecracker, kvm) ---
+#
+# sudo's env_reset drops the caller's environment, so anything the daemon
+# should see has to be named on this line. Naming a hand-picked few silently
+# discarded the rest: export ISO_ADMIN_TCP to keep the admin API on loopback
+# and it still came up on the host's primary interface, with nothing said.
+# Forward every ISO_* variable that is set, then apply this script's own
+# resolved values on top (they already fold in ISO_STATE_DIR/ISO_VG/ISO_UPLINK
+# from the caller, and `env` takes the last assignment of a name).
+daemon_env=()
+while IFS= read -r -d '' kv; do
+  case "$kv" in ISO_*) daemon_env+=("$kv") ;; esac
+done < <(env -0)
+daemon_env+=("ISO_STATE_DIR=$STATE" "ISO_VG=$VG" "ISO_UPLINK=${ISO_UPLINK:-}")
+
 if ! pgrep -f "$BIN/iso-controld" >/dev/null 2>&1; then
   echo "[iso-up] starting iso-controld"
-  sudo -n setsid env "PATH=$PATH" \
-    ISO_STATE_DIR="$STATE" ISO_VG="$VG" ISO_UPLINK="${ISO_UPLINK:-}" \
+  sudo -n setsid env "PATH=$PATH" "${daemon_env[@]}" \
     "$BIN/iso-controld" >"$STATE/controld.log" 2>&1 </dev/null &
   for i in $(seq 1 150); do [ -S "$SOCK" ] && break; sleep 0.2; done
 else

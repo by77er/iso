@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+use iso_common::Error;
+
 /// Fully-resolved configuration for every subsystem.
 pub struct Settings {
     pub control: iso_control_plane::Config,
@@ -33,6 +35,44 @@ pub fn primary_ipv4() -> Option<std::net::Ipv4Addr> {
     match sock.local_addr().ok()?.ip() {
         std::net::IpAddr::V4(v) => Some(v),
         _ => None,
+    }
+}
+
+/// Where the admin API listens.
+///
+/// `ISO_ADMIN_TCP` if set, otherwise port 7070 on the host's primary IPv4 so a
+/// remote orchestrator can reach it (see the README's `isoctl admin
+/// issue-client` flow).
+///
+/// Every failure here used to widen the listener silently, which is the wrong
+/// direction for an endpoint where any client certificate from the admin CA is
+/// a full administrator. A value that does not parse -- `localhost:7070`, or a
+/// typo in the port -- fell through to the primary interface, turning an
+/// attempt to *restrict* the listener into exposing it. So: names resolve, a
+/// value that cannot be understood is an error rather than a fallback, and a
+/// host whose primary address cannot be determined gets loopback rather than
+/// `0.0.0.0`, because losing remote admin is the recoverable failure and
+/// listening on every interface is not.
+fn admin_tcp() -> Result<std::net::SocketAddr, Error> {
+    use std::net::ToSocketAddrs;
+    match env("ISO_ADMIN_TCP") {
+        Some(v) => v
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())
+            .ok_or_else(|| {
+                Error::Backend(format!(
+                    "ISO_ADMIN_TCP={v:?} is not an address the admin API can bind. \
+                     Use HOST:PORT, e.g. 127.0.0.1:7070 for loopback only or \
+                     0.0.0.0:7070 for every interface."
+                ))
+            }),
+        None => Ok(std::net::SocketAddr::new(
+            primary_ipv4()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            7070,
+        )),
     }
 }
 
@@ -67,7 +107,7 @@ fn env(key: &str) -> Option<String> {
 /// - `ISO_ADMIN_TCP` (default `<primary ip>:7070`), `ISO_ADMIN_TLS_DIR`
 ///   (default `<state>/admin-pki`), `ISO_ADMIN_SANS`, and `ISO_ADMIN_INSECURE=1`
 ///   to serve plain HTTP on TCP.
-pub fn from_env() -> Settings {
+pub fn from_env() -> Result<Settings, Error> {
     let state = PathBuf::from(env("ISO_STATE_DIR").unwrap_or_else(|| "/var/lib/iso".into()));
     let vg = env("ISO_VG").unwrap_or_else(|| "iso".into());
     let uplink = env("ISO_UPLINK")
@@ -78,7 +118,7 @@ pub fn from_env() -> Settings {
         .unwrap_or(100);
 
     let jailer = iso_firecracker::JailerConfig::from_env(&state);
-    Settings {
+    Ok(Settings {
         control: iso_control_plane::Config {
             db_path: state.join("control.db"),
             ..Default::default()
@@ -121,13 +161,6 @@ pub fn from_env() -> Settings {
         // remote orchestrator can use it (and derive the same address for ssh).
         // Authenticated with client certificates from the admin CA unless
         // ISO_ADMIN_INSECURE says otherwise.
-        control_tcp: env("ISO_ADMIN_TCP")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                let ip = primary_ipv4()
-                    .map(std::net::IpAddr::V4)
-                    .unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
-                std::net::SocketAddr::new(ip, 7070)
-            }),
-    }
+        control_tcp: admin_tcp()?,
+    })
 }

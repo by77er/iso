@@ -103,7 +103,7 @@ async fn end_to_end_create_boot_destroy() {
     }
     cleanup(); // pre-clean any prior run
 
-    let s = settings::from_env();
+    let s = settings::from_env().expect("settings from env");
     let fc_state = s.firecracker.state_dir.clone();
     // a second storage handle for out-of-band template setup (cp owns the other)
     let setup = StoreManager::new(s.storage.clone(), Arc::new(SystemRunner));

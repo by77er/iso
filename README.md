@@ -161,7 +161,7 @@ multi-tenant authorization layer or HA scheduler.
 
 ## Admin API
 
-Served on `$ISO_STATE_DIR/control.sock` (root only) and on TCP port 7070 of the host's primary IP with mutual TLS: the daemon keeps a CA of its own and `isoctl admin issue-client` mints certificates for it. The OpenAPI document is generated from the handlers and served at `/openapi.json`; `crates/iso-client` is generated from it, and `isoctl vm` wraps that. [docs/admin-api.md](docs/admin-api.md) has the details. JSON in, JSON out.
+Served on `$ISO_STATE_DIR/control.sock` (root only) and on TCP port 7070 of the host's primary IP with mutual TLS: the daemon keeps a CA of its own and `isoctl admin issue-client` mints certificates for it. `ISO_ADMIN_TCP=host:port` moves that listener — `127.0.0.1:7070` to keep it on loopback, `0.0.0.0:7070` for every interface; names are resolved, and a value that can't be parsed is a startup error rather than a silent fall back to the primary IP. The startup line says which of the three you got, because any certificate from the admin CA is a full administrator. The OpenAPI document is generated from the handlers and served at `/openapi.json`; `crates/iso-client` is generated from it, and `isoctl vm` wraps that. [docs/admin-api.md](docs/admin-api.md) has the details. JSON in, JSON out.
 
 | Endpoint | Effect |
 | --- | --- |

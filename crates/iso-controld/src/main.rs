@@ -45,7 +45,7 @@ where
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut s = settings::from_env();
+    let mut s = settings::from_env()?;
 
     // The jailer is the default, so resolve it before anything boots. If it is
     // on but unusable, stop here: falling back to an unjailed VMM would hand
@@ -156,11 +156,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TCP admin listener for a remote orchestrator's HTTP client: mutual TLS
     // with the admin CA, unless explicitly told to serve plain HTTP.
     let tcp_cp = cp.clone();
+    // Say who can reach it, not just where it is. Whether this ends up on
+    // loopback or on the host's primary interface depends on ISO_ADMIN_TCP,
+    // and any certificate from the admin CA is a full administrator.
+    let reach = if control_tcp.ip().is_loopback() {
+        "loopback only"
+    } else if control_tcp.ip().is_unspecified() {
+        "EVERY interface"
+    } else {
+        "reachable from the network"
+    };
     let tcp_listener = tokio::net::TcpListener::bind(control_tcp).await;
     match (tcp_listener, admin_insecure) {
         (Err(e), _) => eprintln!("iso-controld: tcp admin bind {control_tcp} failed: {e}"),
         (Ok(l), true) => {
-            eprintln!("iso-controld: admin API on {} and PLAIN HTTP {control_tcp} (ISO_ADMIN_INSECURE)", control_sock.display());
+            eprintln!(
+                "iso-controld: admin API on {} and PLAIN HTTP {control_tcp} — {reach}, \
+                 UNAUTHENTICATED (ISO_ADMIN_INSECURE)",
+                control_sock.display()
+            );
             tokio::spawn(async move {
                 if let Err(e) = axum::serve(l, http::router(tcp_cp)).await {
                     eprintln!("iso-controld: tcp admin exited: {e}");
@@ -172,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pki = iso_admin_pki::AdminPki::load_or_generate(&admin_tls_dir, &sans)?;
             let acceptor = tls::acceptor(&pki).map_err(|e| e.to_string())?;
             eprintln!(
-                "iso-controld: admin API on {} and https://{control_tcp} (client certs from {})",
+                "iso-controld: admin API on {} and https://{control_tcp} — {reach} (client certs from {})",
                 control_sock.display(),
                 admin_tls_dir.join("ca.crt").display()
             );
