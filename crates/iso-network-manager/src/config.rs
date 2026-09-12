@@ -28,6 +28,13 @@ pub struct Config {
     pub host_addr: Option<std::net::Ipv4Addr>,
     /// Constant guest MAC (routed datapath, never bridged).
     pub mac: MacAddr,
+    /// Constant MAC for the TAP, the guest's gateway. Constant for the same
+    /// reason `tap_name` is, and more urgently: a resumed snapshot restores the
+    /// guest's ARP cache, which holds the gateway's MAC from bake time. Leave
+    /// the kernel to pick a random one per TAP and every clone spends the first
+    /// ~30 seconds sending frames to a MAC nobody answers for, until Linux
+    /// times the stale neighbour entry out and re-ARPs.
+    pub tap_mac: MacAddr,
     /// TAP interface name inside every VM's netns. Constant (not slot-derived):
     /// the netns is isolated, so an identical name in each makes the Firecracker
     /// snapshot's frozen network config valid for every clone without override.
@@ -49,6 +56,8 @@ impl Default for Config {
             uplink: "eth0".to_string(),
             host_addr: None,
             mac: MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            // The gateway half of the pair, as `inner_tap` is to `inner_vm`.
+            tap_mac: MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x00]),
             tap_name: "tap0".to_string(),
             tap_owner: None,
         }

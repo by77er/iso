@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
 
 use futures::TryStreamExt;
-use iso_common::{Error, NetworkFixture, Result};
+use iso_common::{Error, MacAddr, NetworkFixture, Result};
 use netns_rs::NetNs;
 use rtnetlink::{
     new_connection, Handle, LinkDummy, LinkUnspec, LinkVeth, RouteMessageBuilder,
@@ -120,6 +120,10 @@ const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 const TUNSETPERSIST: libc::c_ulong = 0x4004_54cb;
 const TUNSETOWNER: libc::c_ulong = 0x4004_54cc;
 const TUNSETGROUP: libc::c_ulong = 0x4004_54ce;
+/// Sets a TAP's hardware address. The tun driver serves this on its own fd, so
+/// no auxiliary socket is needed.
+const SIOCSIFHWADDR: libc::c_ulong = 0x8924;
+const ARPHRD_ETHER: libc::sa_family_t = 1;
 const IFF_TAP: libc::c_short = 0x0002;
 const IFF_NO_PI: libc::c_short = 0x1000;
 
@@ -130,9 +134,31 @@ struct IfReq {
     _pad: [u8; 22],
 }
 
+/// `ifreq` in its `ifr_hwaddr` shape. Padded to a full `struct ifreq` (40
+/// bytes on x86_64, where the union's widest member is `struct ifmap`): the tun
+/// driver copies `sizeof(struct ifreq)` in from userspace regardless of which
+/// member the ioctl uses, so a struct sized to `sa_family_t + sa_data` alone
+/// would have the kernel reading past the end of it.
+#[repr(C)]
+struct IfReqHwAddr {
+    name: [libc::c_char; libc::IFNAMSIZ],
+    family: libc::sa_family_t,
+    data: [u8; 14],
+    _pad: [u8; 8],
+}
+
 /// Create a persistent TAP in the *current* network namespace, owned by
-/// `owner` when given (so an unprivileged VMM can attach to it).
-fn create_tap(name: &str, owner: Option<(u32, u32)>) -> Result<()> {
+/// `owner` when given (so an unprivileged VMM can attach to it), with a
+/// constant hardware address.
+///
+/// The MAC has to be the same in every netns. Guests resume from one shared
+/// memory snapshot, and that snapshot restores the guest's ARP cache, which
+/// names the MAC of whichever TAP existed when the template was baked. A
+/// kernel-assigned random MAC per TAP invalidates that entry for every clone,
+/// and the guest keeps sending to the baked-in MAC — reachable as far as it
+/// knows — until the neighbour entry decays and it re-ARPs, about thirty
+/// seconds during which nothing the guest sends leaves the link.
+fn create_tap(name: &str, owner: Option<(u32, u32)>, mac: MacAddr) -> Result<()> {
     if name.len() >= libc::IFNAMSIZ {
         return Err(Error::Backend(format!("tap name too long: {name}")));
     }
@@ -171,6 +197,27 @@ fn create_tap(name: &str, owner: Option<(u32, u32)>) -> Result<()> {
                     "TUNSETGROUP {name}: {}",
                     std::io::Error::last_os_error()
                 )));
+            }
+        }
+        let mut hw = IfReqHwAddr {
+            name: [0; libc::IFNAMSIZ],
+            family: ARPHRD_ETHER,
+            data: [0; 14],
+            _pad: [0; 8],
+        };
+        for (i, b) in name.bytes().enumerate() {
+            hw.name[i] = b as libc::c_char;
+        }
+        hw.data[..6].copy_from_slice(&mac.0);
+        // Set while the link is still down. Re-provisioning is idempotent and
+        // can land on a TAP that is already up, where the kernel refuses with
+        // EBUSY; that TAP already has whatever MAC it was created with, and
+        // taking the fixture down to change it would cut a running VM off for
+        // the sake of a boot-time optimisation.
+        if unsafe { libc::ioctl(fd, SIOCSIFHWADDR, &hw) } < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EBUSY) {
+                return Err(Error::Backend(format!("SIOCSIFHWADDR {name}: {e}")));
             }
         }
         if unsafe { libc::ioctl(fd, TUNSETPERSIST, 1) } < 0 {
@@ -291,7 +338,7 @@ pub fn converge(plan: &Plan, cfg: &Config) -> Result<()> {
             addr_and_up(&handle, &fx.veth_netns, fx.vp_ip, 31).await?;
             set_up(&handle, "lo").await?;
 
-            create_tap(&fx.tap, cfg.tap_owner)?;
+            create_tap(&fx.tap, cfg.tap_owner, cfg.tap_mac)?;
             addr_and_up(&handle, &fx.tap, inner_tap, 31).await?;
 
             for r in &routes {
@@ -332,4 +379,19 @@ pub fn destroy(fx: &NetworkFixture) -> Result<()> {
         }
         Ok::<(), Error>(())
     })
+}
+
+#[cfg(test)]
+mod ifreq_tests {
+    use super::*;
+
+    /// The tun driver copies a whole `struct ifreq` in from userspace whichever
+    /// member the ioctl names, so both shapes must be that size or the kernel
+    /// reads past them.
+    #[test]
+    fn ifreq_shapes_match_the_kernel_struct() {
+        const IFREQ_SIZE: usize = 40; // x86_64: 16-byte name + 24-byte union
+        assert_eq!(std::mem::size_of::<IfReq>(), IFREQ_SIZE);
+        assert_eq!(std::mem::size_of::<IfReqHwAddr>(), IFREQ_SIZE);
+    }
 }
