@@ -136,7 +136,7 @@ Inside the guest, `curl https://api.github.com/user` just works. No token in the
 
 Agents tend to expect a stock distribution. `isoctl bake --distro debian --name debian` bakes one instead of NixOS: a Debian (`--debian-suite`, default `trixie`) built by `mmdebstrap` on the flake's kernel, with the same user, sshd, resolver, proxy CA and guest agent, so `sudo apt install` works through the proxy once `deb.debian.org` and `security.debian.org` are on the VM's allow-list. It needs `mmdebstrap` on the host (`apt install mmdebstrap`).
 
-On a fresh development machine, `sudo scripts/dev-up.sh` does all of the above: host packages, a jailed control plane on a loop-file pool under `./state`, an admin client certificate in `~/.iso/creds`, and a baked Debian template. `scripts/iso-up.sh` brings the whole stack up idempotently and is safe to run on every boot; it registers every template `isoctl bake` left under `state/templates/`. `ISO_JAILER=1` in its environment (or the daemon's) runs every VM under Firecracker's jailer.
+On a fresh development machine, `sudo scripts/dev-up.sh` does all of the above: host packages, a jailed control plane on a loop-file pool under `./state`, an admin client certificate in `~/.iso/creds`, and a baked Debian template. `scripts/iso-up.sh` brings the whole stack up idempotently and is safe to run on every boot; it registers every template `isoctl bake` left under `state/templates/`. Every VM runs under Firecracker's jailer unless you set `ISO_JAILER=0`.
 
 ## Using it from pi
 
@@ -184,7 +184,7 @@ Guests can ask `http://metadata.iso.internal/` who they are: their id, name, lab
 This is a working prototype, not a hardened product.
 
 - Any client certificate from the admin CA is a full administrator: no roles, no per-VM ownership, no revocation short of replacing the CA.
-- The jailer is opt-in (`ISO_JAILER=1`); without it Firecracker runs as a direct child of root.
+- The jailer is on by default; `ISO_JAILER=0` turns it off and runs Firecracker as a direct child of root. The daemon refuses to start if the jailer is on but its binary cannot be resolved, rather than falling back to unjailed.
 - Templates baked before the guest agent existed have no vsock device, so `exec` and the file operations need a re-bake with the current image.
 - x86_64 only; the guest kernel config is Firecracker-specific.
 - `isoctl bake` drives the host directly rather than through the daemon, so bake on a quiet host.

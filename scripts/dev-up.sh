@@ -77,7 +77,8 @@ DAEMON_ENV=(
   "ISO_UPLINK=$UPLINK"
   "ISO_IMAGE_SIZE_GIB=${ISO_IMAGE_SIZE_GIB:-30}"
   "ISO_VETH_NET=$ISO_VETH_NET"
-  "ISO_JAILER=1"
+  # Jailing is the daemon's default; pass the resolved binary so it does not
+  # depend on root's PATH finding the nix-provided one.
   "ISO_JAILER_BIN=$JAILER"
   "ISO_FIRECRACKER_BIN=$FC"
   "ISO_ADMIN_TCP=127.0.0.1:7070"

@@ -45,7 +45,32 @@ where
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let s = settings::from_env();
+    let mut s = settings::from_env();
+
+    // The jailer is the default, so resolve it before anything boots. If it is
+    // on but unusable, stop here: falling back to an unjailed VMM would hand
+    // the operator less isolation than they are entitled to assume, without
+    // saying so. Opting out is a decision, and has to look like one.
+    match s.firecracker.jailer.as_mut() {
+        Some(j) => {
+            j.bin = iso_firecracker::jail::resolve_bin(&j.bin).map_err(|e| {
+                format!(
+                    "{e}. Install Firecracker's jailer, point ISO_JAILER_BIN at it, \
+                     or set ISO_JAILER=0 to run VMs as direct children of root."
+                )
+            })?;
+            eprintln!(
+                "iso-controld: VMs are jailed (uid {} gid {}, chroot {})",
+                j.uid,
+                j.gid,
+                j.chroot_base.display()
+            );
+        }
+        None => eprintln!(
+            "iso-controld: ISO_JAILER is off — VMs run as direct children of root, unjailed"
+        ),
+    }
+
     let control_sock = s.control_sock.clone();
     let control_tcp = s.control_tcp;
     let admin_tls_dir = s.admin_tls_dir.clone();
