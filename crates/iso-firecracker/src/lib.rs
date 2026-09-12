@@ -135,12 +135,14 @@ impl FirecrackerRuntime {
     }
 
     /// Where a snapshot taken by [`VmRuntime::suspend`] lands: `mem` and
-    /// `vmstate` files in this directory (inside the jail when jailed).
+    /// `vmstate` files in this directory.
+    ///
+    /// The same place whether or not the VM is jailed. A jailed VMM writes into
+    /// its own `snapshot/out` because it cannot write anywhere else, but
+    /// `suspend` moves the result here before returning — the jail is torn down
+    /// on the next spawn, so nothing may be left inside it.
     pub fn snapshot_dir(&self, vm: VmId) -> PathBuf {
-        match self.jail_root(vm) {
-            Some(root) => root.join("snapshot"),
-            None => self.snap_dir(vm),
-        }
+        self.snap_dir(vm)
     }
 
     fn vsock_path(&self, vm: VmId) -> PathBuf {
