@@ -77,6 +77,20 @@ What it does, in order:
    and a proxied request to `api.github.com` comes back with the token
    injected on the control host.
 
+## Reading the access log
+
+The tier writes one JSON line per request and per tunnel (`ISO_LOG_FORMAT=json`
+in its unit), so a VM's traffic is one filter away:
+
+```bash
+ssh root@<control> "journalctl -u iso-proxyd -o cat | grep '\"target\":\"iso_proxy::access\"' | grep '\"vm\":\"<id>\"'"
+```
+
+Each line names the edge the request came through, the VM and principal,
+the method, scheme, host and path, the decision and rule, the names of the
+injected headers, the status and the latency. Query strings and header
+values are never logged.
+
 ## Check it end to end
 
 ```bash

@@ -40,6 +40,9 @@ pub async fn proxy_upgrade(
     mut req: Request<Incoming>,
     client_h1: &UpstreamClient,
     on_task: Option<crate::OnTask>,
+    conn: crate::access::Conn,
+    host: String,
+    path: String,
 ) -> Result<Resp, BoxError> {
     // Take the guest side now: hyper resolves it once the 101 is written.
     let on_guest = hyper::upgrade::on(&mut req);
@@ -70,14 +73,20 @@ pub async fn proxy_upgrade(
                 return;
             }
         };
-        let mut guest = TokioIo::new(guest);
-        let mut upstream = TokioIo::new(upstream);
+        let started = std::time::Instant::now();
+        // Metered on the way in, so the counts survive a tunnel that ends in
+        // an error (a reset from either side is the usual way one ends).
+        let mut guest = Metered::new(TokioIo::new(guest));
+        let mut upstream = Metered::new(TokioIo::new(upstream));
+        let (to_guest, to_upstream) = (guest.written(), upstream.written());
         // No timer of its own: the tunnel lives exactly as long as the guest
         // connection, and the edge ends that on a policy change.
-        match tokio::io::copy_bidirectional(&mut guest, &mut upstream).await {
-            Ok((a, b)) => tracing::debug!("websocket tunnel closed: {a} bytes up, {b} bytes down"),
-            Err(e) => tracing::debug!("websocket tunnel ended: {e}"),
+        if let Err(e) = tokio::io::copy_bidirectional(&mut guest, &mut upstream).await {
+            tracing::debug!("websocket tunnel ended: {e}");
         }
+        let up = to_upstream.load(std::sync::atomic::Ordering::Relaxed);
+        let down = to_guest.load(std::sync::atomic::Ordering::Relaxed);
+        conn.tunnel_closed("websocket", &host, &path, up, down, started.elapsed());
     });
     // Register the tunnel where the connection is registered, and hold that
     // registration exactly as long as the tunnel runs.
@@ -93,3 +102,50 @@ pub async fn proxy_upgrade(
 
 #[allow(dead_code)]
 fn _assert_types(_: BoxBody<Bytes, BoxError>) {}
+
+/// A stream that counts the bytes written to it. The count is what a tunnel
+/// reports on close, whether it closed cleanly or not.
+pub struct Metered<S> {
+    inner: S,
+    written: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<S> Metered<S> {
+    pub fn new(inner: S) -> Self {
+        Self { inner, written: Default::default() }
+    }
+    /// A handle on the count, readable after the stream is gone.
+    pub fn written(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.written.clone()
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Metered<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Metered<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write(cx, data);
+        if let std::task::Poll::Ready(Ok(n)) = &r {
+            self.written.fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        r
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}

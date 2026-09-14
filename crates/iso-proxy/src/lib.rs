@@ -20,6 +20,7 @@
 //! mint a leaf, terminate, and per request check the authority, evaluate the
 //! URI rules, inject credentials, and forward or tunnel.
 
+pub mod access;
 pub mod ca;
 pub mod edge;
 pub mod policy;
@@ -28,7 +29,7 @@ pub mod ws;
 
 pub use policy::{Policy, PolicyResolver, RpcResolver, StaticResolver, WirePolicy};
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -437,8 +438,9 @@ async fn single_conn(tcp: TcpStream, peer: SocketAddr, rt: Arc<Runtime>) {
         let ip = peer.ip();
         Arc::new(move |h| registry.register(ip, &policy, h))
     };
+    let conn = access::Conn::new(peer.ip(), &rt.cfg.host_id, &policy);
     let task = tokio::spawn(async move {
-        if let Err(e) = serve_conn(tcp, peer.ip(), policy, ctx, Some(on_task)).await {
+        if let Err(e) = serve_conn(tcp, conn, policy, ctx, Some(on_task)).await {
             tracing::debug!("conn {peer} ended: {e}");
         }
     });
@@ -589,6 +591,7 @@ fn accept_stream(
         return simple(403, "deny-mode vm");
     }
     let on_upgrade = hyper::upgrade::on(&mut req);
+    let conn = access::Conn::new(src, edge_name, &policy);
     tokio::spawn(async move {
         let stream = match on_upgrade.await {
             Ok(u) => TokioIo::new(u),
@@ -597,7 +600,7 @@ fn accept_stream(
                 return;
             }
         };
-        if let Err(e) = serve_conn(stream, src, policy, ctx, None).await {
+        if let Err(e) = serve_conn(stream, conn, policy, ctx, None).await {
             tracing::debug!("conn {src} via {edge} ended: {e}");
         }
     });
@@ -610,7 +613,7 @@ fn accept_stream(
 /// Serve one guest connection: SNI gate, mint, terminate, then requests.
 async fn serve_conn<S>(
     stream: S,
-    peer: IpAddr,
+    conn: access::Conn,
     policy: Policy,
     ctx: Ctx,
     on_task: Option<OnTask>,
@@ -634,7 +637,7 @@ where
     // Host phase: is there any allow rule this host could satisfy? A host
     // with no allow rule is never terminated and never gets a certificate.
     if !policy.rules.host_allowed(&sni) {
-        tracing::info!("deny {sni} for {peer} (no allow rule names it)");
+        conn.sni_denied(&sni);
         return Ok(());
     }
 
@@ -663,6 +666,7 @@ where
             policy.clone(),
             ctx.clone(),
             on_task.clone(),
+            conn.clone(),
         )
     });
 
@@ -677,7 +681,10 @@ async fn handle(
     policy: Arc<Policy>,
     ctx: Ctx,
     on_task: Option<OnTask>,
+    conn: access::Conn,
 ) -> Result<Resp, BoxError> {
+    let started = std::time::Instant::now();
+    let method = req.method().clone();
     // Anti-fronting: the request authority must equal the SNI we terminated.
     let authority = req.uri().host().map(str::to_string).or_else(|| {
         req.headers()
@@ -687,6 +694,18 @@ async fn handle(
     });
     if authority.as_deref() != Some(sni.as_str()) {
         tracing::warn!("authority {authority:?} != sni {sni}");
+        conn.request(&access::RequestOutcome {
+            method: &method,
+            scheme: "https",
+            host: &sni,
+            path: req.uri().path(),
+            decision: "deny",
+            rule: Some("authority"),
+            injected: &[],
+            status: 421,
+            latency: started.elapsed(),
+            upgrade: false,
+        });
         return Ok(simple(421, "authority does not match TLS SNI"));
     }
 
@@ -707,11 +726,18 @@ async fn handle(
     let scheme = if upgrade { Scheme::Wss } else { Scheme::Https };
     let path = uri.path().to_string();
     if let Decision::Deny(rule) = policy.rules.evaluate(scheme, &sni, None, &path) {
-        tracing::info!(
-            "deny {} {}://{sni}{path} (rule {rule:?})",
-            req.method(),
-            scheme.as_str()
-        );
+        conn.request(&access::RequestOutcome {
+            method: &method,
+            scheme: scheme.as_str(),
+            host: &sni,
+            path: &path,
+            decision: "deny",
+            rule: Some(rule.as_deref().unwrap_or("default")),
+            injected: &[],
+            status: 403,
+            latency: started.elapsed(),
+            upgrade,
+        });
         return Ok(denied(&sni, scheme, &path, rule.as_deref()));
     }
 
@@ -722,6 +748,7 @@ async fn handle(
     // The provider sees the path (never the query string) so it can apply
     // path-scoped rules — a credential that must not reach a vendor's OAuth
     // routes, say — instead of deciding host-wide.
+    let mut injected = Vec::new();
     for (k, v) in ctx
         .secrets
         .headers(&sni, policy.principal.as_deref(), Some(&path))
@@ -731,20 +758,47 @@ async fn handle(
             http::header::HeaderName::from_bytes(k.as_bytes()),
             http::header::HeaderValue::from_str(&v),
         ) {
+            injected.push(name.as_str().to_string());
             parts.headers.insert(name, val); // override
         }
     }
+    injected.sort();
 
     let upstream = Request::from_parts(parts, body);
+    let outcome = |status: u16, latency: Duration| access::RequestOutcome {
+        method: &method,
+        scheme: scheme.as_str(),
+        host: &sni,
+        path: &path,
+        decision: "allow",
+        rule: None,
+        injected: &injected,
+        status,
+        latency,
+        upgrade,
+    };
     if upgrade {
-        return match ws::proxy_upgrade(upstream, &ctx.client_h1, on_task).await {
-            Ok(resp) => Ok(resp),
-            Err(e) => Ok(simple(502, &format!("upstream error: {e}"))),
+        let result = ws::proxy_upgrade(upstream, &ctx.client_h1, on_task, conn.clone(), sni.to_string(), path.clone()).await;
+        return match result {
+            Ok(resp) => {
+                conn.request(&outcome(resp.status().as_u16(), started.elapsed()));
+                Ok(resp)
+            }
+            Err(e) => {
+                conn.request(&outcome(502, started.elapsed()));
+                Ok(simple(502, &format!("upstream error: {e}")))
+            }
         };
     }
     match ctx.client.request(upstream).await {
-        Ok(resp) => Ok(resp.map(|b| b.map_err(|e| Box::new(e) as BoxError).boxed())),
-        Err(e) => Ok(simple(502, &format!("upstream error: {e}"))),
+        Ok(resp) => {
+            conn.request(&outcome(resp.status().as_u16(), started.elapsed()));
+            Ok(resp.map(|b| b.map_err(|e| Box::new(e) as BoxError).boxed()))
+        }
+        Err(e) => {
+            conn.request(&outcome(502, started.elapsed()));
+            Ok(simple(502, &format!("upstream error: {e}")))
+        }
     }
 }
 

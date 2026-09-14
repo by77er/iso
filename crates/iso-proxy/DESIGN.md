@@ -202,6 +202,23 @@ re-signs at a third of the life left, without a generation bump). The
 CA and secrets services likewise answer only the tier's certificate name
 (`ISO_ALLOWED_CLIENTS`), and no host holds the admin CA key.
 
+## Access log
+
+Every request the proxy terminates (`single` and `proxy` roles) leaves one
+`tracing` event under the target `iso_proxy::access`, and every tunnel it
+closes (a WebSocket after its 101) leaves one more. The request event
+carries who (`src`, `edge`, `vm`, `principal`), what (`method`, `scheme`,
+`host`, `path`), the decision (`decision`, `rule`), the *names* of the
+headers injected (`injected`), and the outcome (`status`, `latency_ms`,
+`upgrade`); a ClientHello dropped at SNI time leaves a `phase = sni` event.
+The tunnel event carries `kind`, `host`, `path`, `bytes_up`, `bytes_down`
+and `duration_ms`. Never a query string, a header value or a body: this
+log is meant to be shipped. `iso-proxyd --log-format json` (or
+`ISO_LOG_FORMAT=json`) writes each line as one JSON object;
+`RUST_LOG=iso_proxy::access=info` keeps the access log alone. On the tier
+`edge` is the name on the edge's certificate, so a line names the host a
+request came through even when the host lies.
+
 ## Failure modes
 
 - Not TLS / no SNI ⇒ drop. No allow rule for the host ⇒ drop before minting.

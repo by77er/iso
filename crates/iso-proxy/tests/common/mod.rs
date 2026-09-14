@@ -31,10 +31,56 @@ pub const UPSTREAM_HOST: &str = "api.example.test";
 
 pub fn init() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // JSON lines into a buffer the tests can read back (the access log is
+    // asserted on), and to the test writer for a failing test's output.
+    use tracing_subscriber::fmt::writer::MakeWriterExt as _;
+    let capture = Capture(CAPTURE.get_or_init(Default::default).clone());
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
-        .with_test_writer()
+        .json()
+        .flatten_event(true)
+        .with_writer(capture.and(tracing_subscriber::fmt::TestWriter::new()))
         .try_init();
+}
+
+static CAPTURE: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+
+/// Everything the subscriber wrote, as bytes, shared by every test in the
+/// process: tests pick their own events out by a unique path or size.
+#[derive(Clone)]
+pub struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+    type Writer = Capture;
+    fn make_writer(&'a self) -> Capture {
+        self.clone()
+    }
+}
+
+/// The access log so far: every `iso_proxy::access` event as the JSON
+/// object the subscriber wrote.
+pub fn access_events() -> Vec<serde_json::Value> {
+    let bytes = CAPTURE.get().map(|c| c.lock().unwrap().clone()).unwrap_or_default();
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["target"] == iso_proxy::access::TARGET)
+        .collect()
+}
+
+/// A path no other test uses.
+pub fn unique_path(prefix: &str) -> String {
+    format!("{prefix}/{}", nanos())
 }
 
 pub fn tempdir(tag: &str) -> PathBuf {

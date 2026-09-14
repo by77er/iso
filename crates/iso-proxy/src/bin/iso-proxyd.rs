@@ -3,7 +3,10 @@
 //! Configuration comes from a TOML file named by `ISO_PROXY_CONFIG`; without
 //! one, the environment describes today's single-host deployment:
 //! `ISO_STATE_DIR` for the three Unix sockets and `ISO_PROXY_LISTEN` for the
-//! addresses. The file (every key optional unless the role needs it):
+//! addresses. `--log-format json` (or `ISO_LOG_FORMAT=json`) writes every
+//! log line, the access log included, as one JSON object; `RUST_LOG`
+//! filters (`iso_proxy::access=info` is the access log alone). The file
+//! (every key optional unless the role needs it):
 //!
 //! ```toml
 //! role = "single"                  # single | edge | proxy
@@ -105,12 +108,21 @@ fn env(k: &str) -> Option<String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    let mut log_format = env("ISO_LOG_FORMAT");
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--log-format" => log_format = args.next(),
+            other => return Err(format!("unknown argument {other:?} (usage: iso-proxyd [--log-format text|json])").into()),
+        }
+    }
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let fmt = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    match log_format.as_deref() {
+        Some("json") => fmt.json().flatten_event(true).init(),
+        None | Some("text") => fmt.init(),
+        Some(other) => return Err(format!("unknown log format {other:?} (text | json)").into()),
+    }
 
     let file: File = match env("ISO_PROXY_CONFIG") {
         Some(p) => toml::from_str(&std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}"))?)

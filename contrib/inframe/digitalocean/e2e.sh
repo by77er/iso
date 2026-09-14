@@ -63,6 +63,20 @@ gen=$(api "$ISO_SERVER/vms/$id" | py "print(d['policy_gen'])")
 [ "$gen" = 2 ] && ok "generation bumped to 2" || bad "generation is $gen"
 if vmexec "$id" 'curl -s --max-time 10 https://postman-echo.com/get >/dev/null'; then bad "postman-echo.com still reachable after the change"; else ok "postman-echo.com refused after the change"; fi
 
+control_pub=$(printf '%s' "$ISO_SERVER" | sed -E 's#^https?://##; s#:[0-9]+$##')
+echo "== tracing: the tier's access log names this VM's requests"
+if [ -n "${ISO_E2E_HOST_A:-}" ]; then
+  access() { ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$control_pub" "journalctl -u iso-proxyd --since '-10min' -o cat --no-pager | grep '\"target\":\"iso_proxy::access\"' | grep '\"vm\":\"$id\"'"; }
+  lines=$(access || true)
+  echo "$lines" | grep '"path":"/get"' | grep -q '"decision":"allow".*"status":200\|"status":200.*"decision":"allow"' && ok "allowed request logged with status 200" || bad "no allow line for /get: $(echo "$lines" | head -c 300)"
+  echo "$lines" | grep '"path":"/status/200"' | grep -q '"decision":"deny"' && ok "denied request logged with its rule" || bad "no deny line for /status/200"
+  echo "$lines" | grep -q '"kind":"websocket"' && ok "websocket tunnel close logged with byte counts" || bad "no tunnel line"
+  echo "$lines" | grep -q '"edge":"host-a"\|"edge":"host-b"' && ok "lines name the edge by certificate name" || bad "no edge name in the lines"
+  echo "$lines" | grep -q 'hello-from-the-control-host' && bad "a header value leaked into the log" || ok "no header values in the log"
+else
+  echo "  skip (set ISO_E2E_HOST_A, as deploy.sh prints)"
+fi
+
 echo "== hardening: a host cannot vouch for a policy the fleet did not sign"
 if [ -n "${ISO_E2E_HOST_A:-}" ] && [ -n "${ISO_E2E_CONTROL_PRIV:-}" ]; then
   # From host-a, with host-a's own edge identity, open a stream on the tier
@@ -75,7 +89,6 @@ if [ -n "${ISO_E2E_HOST_A:-}" ] && [ -n "${ISO_E2E_CONTROL_PRIV:-}" ]; then
   # curl 8.5 does not surface an HTTP/2 CONNECT's status; the tunnel simply
   # never opens (no response, exit 56), and the tier says why in its log.
   echo "$out" | grep -q "code=000" && ok "no tunnel for an unsigned policy from host-a's own identity" || bad "expected no tunnel, got: $out"
-  control_pub=$(printf '%s' "$ISO_SERVER" | sed -E 's#^https?://##; s#:[0-9]+$##')
   sleep 1
   if ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$control_pub" "journalctl -u iso-proxyd --since '-3min' --no-pager | grep -q 'edge host-a .* sent an unsigned policy'"; then
     ok "tier logged the refusal of host-a's unsigned policy"; else bad "tier did not log a refusal"; fi

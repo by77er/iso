@@ -448,3 +448,21 @@ async fn tier_serves_only_policies_the_fleet_signed_for_this_edge() {
         .unwrap();
     assert_eq!(body["headers"]["authorization"], "Bearer alice-token", "injection follows the signed principal");
 }
+
+/// On the tier, the access event names the edge by its certificate name,
+/// so a line can be traced to the host it came through.
+#[tokio::test]
+async fn the_tier_logs_requests_under_the_edge_name() {
+    let s = start_tier().await;
+    let rule = format!("allow https://{UPSTREAM_HOST}/**");
+    let e = start_edge(&s, "hostA", &s.pki.edge, &[&rule], Some("alice"), "proxy").await;
+    let path = unique_path("/split");
+    let r = guest_client(e.addr, &s.tier_ca, false).get(url(&path)).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let ev = access_events().into_iter().find(|ev| ev["path"] == path).expect("logged on the tier");
+    assert_eq!(ev["edge"], "edge-hostA");
+    assert_eq!(ev["principal"], "alice");
+    assert_eq!(ev["vm"], "vm-test");
+    assert_eq!(ev["injected"], "authorization,x-iso-injected");
+    assert_eq!(ev["decision"], "allow");
+}

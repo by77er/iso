@@ -155,7 +155,7 @@ unit "$CONTROL" iso-secretsd /usr/local/bin/iso-secretsd ISO_STATE_DIR=/var/lib/
 # the fleet first: its policy signing key is what the tier verifies against
 unit "$CONTROL" iso-fleetd   "/usr/local/bin/iso-fleetd /etc/iso-fleet/fleet.toml"
 for _ in $(seq 1 30); do "${SSH[@]}" "root@$CONTROL" test -f /var/lib/iso-fleet/pki/policy-signing.pub && break; sleep 1; done
-unit "$CONTROL" iso-proxyd   /usr/local/bin/iso-proxyd   ISO_PROXY_CONFIG=/etc/iso-fleet/proxy.toml
+unit "$CONTROL" iso-proxyd   /usr/local/bin/iso-proxyd   ISO_PROXY_CONFIG=/etc/iso-fleet/proxy.toml ISO_LOG_FORMAT=json
 # the tier CA guests must trust, the hosts admin CA certificate (not its key),
 # the host identities, and the operator's fleet credentials
 for _ in $(seq 1 30); do "${SSH[@]}" "root@$CONTROL" test -f /var/lib/iso/ca/ca.crt && break; sleep 1; done
@@ -210,7 +210,7 @@ EOT
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   for _ in $(seq 1 60); do "${SSH[@]}" "root@$ip" test -S /var/lib/iso/control.sock && break; sleep 2; done
   # the edge only needs identify.sock, which controld just created
-  unit "$ip" iso-proxyd /usr/local/bin/iso-proxyd ISO_PROXY_CONFIG=/etc/iso/edge.toml
+  unit "$ip" iso-proxyd /usr/local/bin/iso-proxyd ISO_PROXY_CONFIG=/etc/iso/edge.toml ISO_LOG_FORMAT=json
   if ! "${SSH[@]}" "root@$ip" test -f "/var/lib/iso/templates/$TEMPLATE/template.json"; then
     say "$name: baking template '$TEMPLATE' (Debian $SUITE), several minutes"
     "${SSH[@]}" "root@$ip" "cd /opt/iso && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

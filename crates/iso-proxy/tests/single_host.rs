@@ -42,6 +42,7 @@ async fn start(rules: &[&str], principal: Option<&str>, egress: &str) -> Single 
     cfg.upstream_pins
         .insert(UPSTREAM_HOST.into(), upstream.addr);
     cfg.watch_every = Duration::from_millis(50);
+    cfg.host_id = "hostT".into();
     tokio::spawn(run_with_listeners(vec![listener], cfg));
     Single {
         proxy,
@@ -268,4 +269,83 @@ async fn authority_must_match_the_sni() {
         .unwrap();
     assert_eq!(resp.status(), 421);
     assert!(s.upstream.hit_paths().is_empty());
+}
+
+/// Every request leaves one access event with who, what, the decision and
+/// the outcome, and never a query string or a header value; a WebSocket
+/// tunnel leaves one more when it closes, with the bytes each way.
+#[tokio::test]
+async fn every_request_and_tunnel_leaves_an_access_event() {
+    let s = start(
+        &[
+            "allow https://api.example.test/**",
+            "allow wss://api.example.test/ws",
+            "deny https://api.example.test/traced/denied/**",
+        ],
+        Some("alice"),
+        "proxy",
+    )
+    .await;
+    let client = guest_client(s.proxy, &s.tier_ca, true);
+    let tag = unique_path("/traced");
+
+    let r = client.get(url(&format!("{tag}/ok?token=SECRET-VALUE"))).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let r = client.get(url(&format!("/traced/denied{tag}"))).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+
+    let events = access_events();
+    let ok = events
+        .iter()
+        .find(|e| e["path"] == format!("{tag}/ok"))
+        .expect("the allowed request is logged");
+    assert_eq!(ok["decision"], "allow");
+    assert_eq!(ok["status"], 200);
+    assert_eq!(ok["method"], "GET");
+    assert_eq!(ok["scheme"], "https");
+    assert_eq!(ok["host"], UPSTREAM_HOST);
+    assert_eq!(ok["vm"], "vm-test");
+    assert_eq!(ok["principal"], "alice");
+    assert_eq!(ok["edge"], "hostT");
+    assert_eq!(ok["injected"], "authorization,x-iso-injected", "names only");
+    assert_eq!(ok["upgrade"], false);
+    assert!(ok["latency_ms"].is_u64(), "{ok}");
+    assert_eq!(ok["src"], "127.0.0.1");
+    let line = ok.to_string();
+    assert!(!line.contains("SECRET-VALUE") && !line.contains("token="), "no query string: {line}");
+    assert!(!line.contains("alice-token") && !line.contains("hello-from-iso"), "no header values: {line}");
+
+    let denied = events
+        .iter()
+        .find(|e| e["path"] == format!("/traced/denied{tag}"))
+        .expect("the denied request is logged");
+    assert_eq!(denied["decision"], "deny");
+    assert_eq!(denied["rule"], "deny https://api.example.test/traced/denied/**");
+    assert_eq!(denied["status"], 403);
+    assert_eq!(denied["injected"], "");
+
+    // A tunnel: a payload of a size no other test sends, echoed back.
+    let payload = vec![b'x'; 1000 + (tag.len() * 7) % 500];
+    let (mut ws, _) = open_ws(&client, "/ws").await.unwrap();
+    ws.write_all(&payload).await.unwrap();
+    let mut back = vec![0u8; payload.len()];
+    ws.read_exact(&mut back).await.unwrap();
+    assert_eq!(back, payload);
+    drop(ws);
+    let n = payload.len() as u64;
+    eventually(
+        || access_events().iter().any(|e| e["kind"] == "websocket" && e["bytes_up"] == n),
+        Duration::from_secs(5),
+        "the tunnel's close is logged",
+    )
+    .await;
+    let t = access_events().into_iter().find(|e| e["kind"] == "websocket" && e["bytes_up"] == n).unwrap();
+    assert_eq!(t["bytes_down"], n);
+    assert_eq!(t["path"], "/ws");
+    assert_eq!(t["host"], UPSTREAM_HOST);
+    assert_eq!(t["vm"], "vm-test");
+    assert!(t["duration_ms"].is_u64(), "{t}");
+    // Its handshake was a request too, judged under wss.
+    let hs = access_events().into_iter().filter(|e| e["path"] == "/ws" && e["upgrade"] == true).last().unwrap();
+    assert_eq!((hs["scheme"].as_str(), hs["status"].as_u64()), (Some("wss"), Some(101)));
 }
