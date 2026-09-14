@@ -27,6 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
     let mut s = settings::from_env()?;
+    let bake_settings = s.bake.take();
 
     // The jailer is the default, so resolve it before anything boots. If it is
     // on but unusable, stop here: falling back to an unjailed VMM would hand
@@ -90,6 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     let observer: Arc<dyn iso_dns_server::Observer> = dns_memory.clone();
+    // Template builds through the API, when this host has what a bake needs.
+    let builds = iso_controld::build::Builds::new(bake_settings);
+    if builds.configured() {
+        eprintln!("iso-controld: template builds enabled (POST /templates/build)");
+    }
     tokio::spawn(async move {
         if let Err(e) = iso_dns_server::run(dns_cfg, observer).await {
             eprintln!("iso-controld: dns server exited: {e}");
@@ -139,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TCP admin listener for a remote orchestrator's HTTP client: mutual TLS
     // with the admin CA, unless explicitly told to serve plain HTTP.
     let tcp_cp = cp.clone();
+    let builds_tcp = builds.clone();
     // Say who can reach it, not just where it is. Whether this ends up on
     // loopback or on the host's primary interface depends on ISO_ADMIN_TCP,
     // and any certificate from the admin CA is a full administrator.
@@ -159,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 control_sock.display()
             );
             tokio::spawn(async move {
-                if let Err(e) = axum::serve(l, http::router(tcp_cp)).await {
+                if let Err(e) = axum::serve(l, http::router(tcp_cp, builds_tcp)).await {
                     eprintln!("iso-controld: tcp admin exited: {e}");
                 }
             });
@@ -186,10 +193,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 control_sock.display(),
                 admin_tls_dir.join("ca.crt").display()
             );
-            tokio::spawn(tls::serve(l, acceptor, http::router(tcp_cp)));
+            tokio::spawn(tls::serve(l, acceptor, http::router(tcp_cp, builds_tcp)));
         }
     }
 
-    axum::serve(unix, http::router(cp)).await?;
+    axum::serve(unix, http::router(cp, builds.clone())).await?;
     Ok(())
 }

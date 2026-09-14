@@ -97,6 +97,17 @@ pass-through, exec routed to the right host through the real guest agent,
 delete on both sides, orphan and lost detection, a host going down and
 coming back with its VMs, deferred deletes, and the create grace period.
 
+## Templates from images
+
+`POST /templates/build` on the fleet asks every healthy host (or the one
+named by `host`) to build the same template from an OCI image, and answers
+per host; `GET /templates/builds/{name}` follows them with one `state` for
+the whole (`ready` when every host that has it is ready, `failed` when any
+failed, `building` otherwise). A template a VM is placed on has to exist on
+that host, which is why every host builds it. The Harbor adapter in
+`contrib/harbor` drives this to turn a task's Dockerfile into a template
+once per fleet.
+
 ## Signed policies
 
 The fleet signs the policy of every VM it places or changes, for the host it

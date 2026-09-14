@@ -207,6 +207,7 @@ EOT
   unit "$ip" iso-controld /usr/local/bin/iso-controld \
     ISO_STATE_DIR=/var/lib/iso ISO_VG=iso ISO_UPLINK=eth0 ISO_IMAGE_SIZE_GIB=40 \
     "ISO_ADMIN_TCP=$priv:7070" ISO_JAILER_BIN=/usr/local/bin/jailer ISO_FIRECRACKER_BIN=/usr/local/bin/firecracker \
+    ISO_BAKE_KERNEL=/opt/iso/vmlinux ISO_BAKE_AGENT_BIN=/opt/iso/iso-guest-agent ISO_ISOCTL_BIN=/usr/local/bin/isoctl \
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   for _ in $(seq 1 60); do "${SSH[@]}" "root@$ip" test -S /var/lib/iso/control.sock && break; sleep 2; done
   # the edge only needs identify.sock, which controld just created

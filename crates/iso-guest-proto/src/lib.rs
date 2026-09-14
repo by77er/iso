@@ -117,6 +117,13 @@ pub struct ExecRequest {
     /// Cap on captured bytes per stream (default [`DEFAULT_MAX_OUTPUT`]).
     #[serde(default)]
     pub max_output_bytes: Option<u64>,
+    /// Run as this user, a name or a numeric uid, with that user's primary
+    /// group and `HOME`. Only an agent running as root can switch; any
+    /// other agent refuses a user that is not itself. Absent, the agent's
+    /// default user (the image's `USER` in a template built from an OCI
+    /// image, else the agent's own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 /// The agent's answer. `ok` is the discriminator: on success `result` is set,

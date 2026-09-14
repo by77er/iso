@@ -33,7 +33,8 @@ fn dns_probe() -> types::ExecRequest {
         env: Default::default(),
         max_output_bytes: Some(4096),
         stdin: None,
-        timeout_ms: Some(2000),
+        user: None,
+                timeout_ms: Some(2000),
     }
 }
 

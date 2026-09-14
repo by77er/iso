@@ -39,6 +39,56 @@ pub mod types {
         }
     }
 
+    ///Ask for a template from an image.
+    #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug)]
+    pub struct BuildRequest {
+        ///Rebuild even when a template of this name is already registered.
+        ///Without it, an existing template answers `ready` at once.
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub force: ::std::option::Option<bool>,
+        ///The OCI image, as `isoctl bake --image` takes it:
+        /// `python:3.12-slim`, `ghcr.io/acme/tool:v3`,
+        /// `registry/repo@sha256:…`.
+        pub image: ::std::string::String,
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub mem_mib: ::std::option::Option<i32>,
+        ///Template name: `[a-z0-9][a-z0-9-]{0,31}`.
+        pub name: ::std::string::String,
+        ///Rootfs volume size, e.g. `16G`.
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub size: ::std::option::Option<::std::string::String>,
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub vcpus: ::std::option::Option<i32>,
+    }
+
+    impl BuildRequest {
+        pub fn builder() -> builder::BuildRequest {
+            Default::default()
+        }
+    }
+
+    ///How a build is going.
+    #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug)]
+    pub struct BuildStatus {
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub error: ::std::option::Option<::std::string::String>,
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub finished_at: ::std::option::Option<i64>,
+        pub image: ::std::string::String,
+        ///The last few KiB of the bake's output.
+        pub log_tail: ::std::string::String,
+        pub name: ::std::string::String,
+        pub started_at: i64,
+        ///`building`, `ready` or `failed`.
+        pub state: ::std::string::String,
+    }
+
+    impl BuildStatus {
+        pub fn builder() -> builder::BuildStatus {
+            Default::default()
+        }
+    }
+
     ///Create and boot a VM. Only `template` is required.
     #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug)]
     pub struct CreateVmRequest {
@@ -175,6 +225,13 @@ pub mod types {
         ///Wall-clock limit; the process group is killed when it elapses.
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub timeout_ms: ::std::option::Option<i64>,
+        ///Run as this user, a name or a numeric uid, with that user's primary
+        ///group and `HOME`. Only an agent running as root can switch; any
+        ///other agent refuses a user that is not itself. Absent, the agent's
+        ///default user (the image's `USER` in a template built from an OCI
+        ///image, else the agent's own).
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub user: ::std::option::Option<::std::string::String>,
     }
 
     impl ExecRequest {
@@ -654,6 +711,256 @@ pub mod types {
                     hostname: Ok(value.hostname),
                     uid: Ok(value.uid),
                     version: Ok(value.version),
+                }
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct BuildRequest {
+            force: ::std::result::Result<::std::option::Option<bool>, ::std::string::String>,
+            image: ::std::result::Result<::std::string::String, ::std::string::String>,
+            mem_mib: ::std::result::Result<::std::option::Option<i32>, ::std::string::String>,
+            name: ::std::result::Result<::std::string::String, ::std::string::String>,
+            size: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
+            vcpus: ::std::result::Result<::std::option::Option<i32>, ::std::string::String>,
+        }
+
+        impl ::std::default::Default for BuildRequest {
+            fn default() -> Self {
+                Self {
+                    force: Ok(Default::default()),
+                    image: Err("no value supplied for image".to_string()),
+                    mem_mib: Ok(Default::default()),
+                    name: Err("no value supplied for name".to_string()),
+                    size: Ok(Default::default()),
+                    vcpus: Ok(Default::default()),
+                }
+            }
+        }
+
+        impl BuildRequest {
+            pub fn force<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<bool>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.force = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for force: {e}"));
+                self
+            }
+            pub fn image<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.image = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for image: {e}"));
+                self
+            }
+            pub fn mem_mib<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<i32>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.mem_mib = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for mem_mib: {e}"));
+                self
+            }
+            pub fn name<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.name = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for name: {e}"));
+                self
+            }
+            pub fn size<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.size = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for size: {e}"));
+                self
+            }
+            pub fn vcpus<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<i32>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.vcpus = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for vcpus: {e}"));
+                self
+            }
+        }
+
+        impl ::std::convert::TryFrom<BuildRequest> for super::BuildRequest {
+            type Error = super::error::ConversionError;
+            fn try_from(
+                value: BuildRequest,
+            ) -> ::std::result::Result<Self, super::error::ConversionError> {
+                Ok(Self {
+                    force: value.force?,
+                    image: value.image?,
+                    mem_mib: value.mem_mib?,
+                    name: value.name?,
+                    size: value.size?,
+                    vcpus: value.vcpus?,
+                })
+            }
+        }
+
+        impl ::std::convert::From<super::BuildRequest> for BuildRequest {
+            fn from(value: super::BuildRequest) -> Self {
+                Self {
+                    force: Ok(value.force),
+                    image: Ok(value.image),
+                    mem_mib: Ok(value.mem_mib),
+                    name: Ok(value.name),
+                    size: Ok(value.size),
+                    vcpus: Ok(value.vcpus),
+                }
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct BuildStatus {
+            error: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
+            finished_at: ::std::result::Result<::std::option::Option<i64>, ::std::string::String>,
+            image: ::std::result::Result<::std::string::String, ::std::string::String>,
+            log_tail: ::std::result::Result<::std::string::String, ::std::string::String>,
+            name: ::std::result::Result<::std::string::String, ::std::string::String>,
+            started_at: ::std::result::Result<i64, ::std::string::String>,
+            state: ::std::result::Result<::std::string::String, ::std::string::String>,
+        }
+
+        impl ::std::default::Default for BuildStatus {
+            fn default() -> Self {
+                Self {
+                    error: Ok(Default::default()),
+                    finished_at: Ok(Default::default()),
+                    image: Err("no value supplied for image".to_string()),
+                    log_tail: Err("no value supplied for log_tail".to_string()),
+                    name: Err("no value supplied for name".to_string()),
+                    started_at: Err("no value supplied for started_at".to_string()),
+                    state: Err("no value supplied for state".to_string()),
+                }
+            }
+        }
+
+        impl BuildStatus {
+            pub fn error<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.error = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for error: {e}"));
+                self
+            }
+            pub fn finished_at<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<i64>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.finished_at = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for finished_at: {e}"));
+                self
+            }
+            pub fn image<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.image = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for image: {e}"));
+                self
+            }
+            pub fn log_tail<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.log_tail = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for log_tail: {e}"));
+                self
+            }
+            pub fn name<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.name = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for name: {e}"));
+                self
+            }
+            pub fn started_at<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<i64>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.started_at = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for started_at: {e}"));
+                self
+            }
+            pub fn state<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.state = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for state: {e}"));
+                self
+            }
+        }
+
+        impl ::std::convert::TryFrom<BuildStatus> for super::BuildStatus {
+            type Error = super::error::ConversionError;
+            fn try_from(
+                value: BuildStatus,
+            ) -> ::std::result::Result<Self, super::error::ConversionError> {
+                Ok(Self {
+                    error: value.error?,
+                    finished_at: value.finished_at?,
+                    image: value.image?,
+                    log_tail: value.log_tail?,
+                    name: value.name?,
+                    started_at: value.started_at?,
+                    state: value.state?,
+                })
+            }
+        }
+
+        impl ::std::convert::From<super::BuildStatus> for BuildStatus {
+            fn from(value: super::BuildStatus) -> Self {
+                Self {
+                    error: Ok(value.error),
+                    finished_at: Ok(value.finished_at),
+                    image: Ok(value.image),
+                    log_tail: Ok(value.log_tail),
+                    name: Ok(value.name),
+                    started_at: Ok(value.started_at),
+                    state: Ok(value.state),
                 }
             }
         }
@@ -1141,6 +1448,10 @@ pub mod types {
                 ::std::string::String,
             >,
             timeout_ms: ::std::result::Result<::std::option::Option<i64>, ::std::string::String>,
+            user: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
         }
 
         impl ::std::default::Default for ExecRequest {
@@ -1153,6 +1464,7 @@ pub mod types {
                     max_output_bytes: Ok(Default::default()),
                     stdin: Ok(Default::default()),
                     timeout_ms: Ok(Default::default()),
+                    user: Ok(Default::default()),
                 }
             }
         }
@@ -1230,6 +1542,16 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for timeout_ms: {e}"));
                 self
             }
+            pub fn user<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.user = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for user: {e}"));
+                self
+            }
         }
 
         impl ::std::convert::TryFrom<ExecRequest> for super::ExecRequest {
@@ -1245,6 +1567,7 @@ pub mod types {
                     max_output_bytes: value.max_output_bytes?,
                     stdin: value.stdin?,
                     timeout_ms: value.timeout_ms?,
+                    user: value.user?,
                 })
             }
         }
@@ -1259,6 +1582,7 @@ pub mod types {
                     max_output_bytes: Ok(value.max_output_bytes),
                     stdin: Ok(value.stdin),
                     timeout_ms: Ok(value.timeout_ms),
+                    user: Ok(value.user),
                 }
             }
         }
@@ -2711,6 +3035,43 @@ impl Client {
         builder::RegisterTemplate::new(self)
     }
 
+    ///Sends a `POST` request to `/templates/build`
+    ///
+    ///```ignore
+    /// let response = client.start_build()
+    ///    .body(body)
+    ///    .send()
+    ///    .await;
+    /// ```
+    pub fn start_build(&self) -> builder::StartBuild<'_> {
+        builder::StartBuild::new(self)
+    }
+
+    ///Sends a `GET` request to `/templates/builds`
+    ///
+    ///```ignore
+    /// let response = client.list_builds()
+    ///    .send()
+    ///    .await;
+    /// ```
+    pub fn list_builds(&self) -> builder::ListBuilds<'_> {
+        builder::ListBuilds::new(self)
+    }
+
+    ///Sends a `GET` request to `/templates/builds/{name}`
+    ///
+    ///Arguments:
+    /// - `name`: Template name
+    ///```ignore
+    /// let response = client.get_build()
+    ///    .name(name)
+    ///    .send()
+    ///    .await;
+    /// ```
+    pub fn get_build(&self) -> builder::GetBuild<'_> {
+        builder::GetBuild::new(self)
+    }
+
     ///Sends a `GET` request to `/vms`
     ///
     ///```ignore
@@ -3177,6 +3538,209 @@ pub mod builder {
             let response = result?;
             match response.status().as_u16() {
                 201u16 => Ok(ResponseValue::empty(response)),
+                _ => Err(Error::UnexpectedResponse(response)),
+            }
+        }
+    }
+
+    ///Builder for [`Client::start_build`]
+    ///
+    ///[`Client::start_build`]: super::Client::start_build
+    #[derive(Debug, Clone)]
+    pub struct StartBuild<'a> {
+        client: &'a super::Client,
+        body: Result<types::builder::BuildRequest, String>,
+    }
+
+    impl<'a> StartBuild<'a> {
+        pub fn new(client: &'a super::Client) -> Self {
+            Self {
+                client: client,
+                body: Ok(::std::default::Default::default()),
+            }
+        }
+
+        pub fn body<V>(mut self, value: V) -> Self
+        where
+            V: std::convert::TryInto<types::BuildRequest>,
+            <V as std::convert::TryInto<types::BuildRequest>>::Error: std::fmt::Display,
+        {
+            self.body = value
+                .try_into()
+                .map(From::from)
+                .map_err(|s| format!("conversion to `BuildRequest` for body failed: {}", s));
+            self
+        }
+
+        pub fn body_map<F>(mut self, f: F) -> Self
+        where
+            F: std::ops::FnOnce(types::builder::BuildRequest) -> types::builder::BuildRequest,
+        {
+            self.body = self.body.map(f);
+            self
+        }
+
+        ///Sends a `POST` request to `/templates/build`
+        pub async fn send(
+            self,
+        ) -> Result<ResponseValue<types::BuildStatus>, Error<types::ErrorBody>> {
+            let Self { client, body } = self;
+            let body = body
+                .and_then(|v| types::BuildRequest::try_from(v).map_err(|e| e.to_string()))
+                .map_err(Error::InvalidRequest)?;
+            let url = format!("{}/templates/build", client.baseurl,);
+            let mut header_map = ::reqwest::header::HeaderMap::with_capacity(1usize);
+            header_map.append(
+                ::reqwest::header::HeaderName::from_static("api-version"),
+                ::reqwest::header::HeaderValue::from_static(super::Client::api_version()),
+            );
+            #[allow(unused_mut)]
+            let mut request = client
+                .client
+                .post(url)
+                .header(
+                    ::reqwest::header::ACCEPT,
+                    ::reqwest::header::HeaderValue::from_static("application/json"),
+                )
+                .json(&body)
+                .headers(header_map)
+                .build()?;
+            let info = OperationInfo {
+                operation_id: "start_build",
+            };
+            client.pre(&mut request, &info).await?;
+            let result = client.exec(request, &info).await;
+            client.post(&result, &info).await?;
+            let response = result?;
+            match response.status().as_u16() {
+                202u16 => ResponseValue::from_response(response).await,
+                400u16 => Err(Error::ErrorResponse(
+                    ResponseValue::from_response(response).await?,
+                )),
+                409u16 => Err(Error::ErrorResponse(
+                    ResponseValue::from_response(response).await?,
+                )),
+                501u16 => Err(Error::ErrorResponse(
+                    ResponseValue::from_response(response).await?,
+                )),
+                _ => Err(Error::UnexpectedResponse(response)),
+            }
+        }
+    }
+
+    ///Builder for [`Client::list_builds`]
+    ///
+    ///[`Client::list_builds`]: super::Client::list_builds
+    #[derive(Debug, Clone)]
+    pub struct ListBuilds<'a> {
+        client: &'a super::Client,
+    }
+
+    impl<'a> ListBuilds<'a> {
+        pub fn new(client: &'a super::Client) -> Self {
+            Self { client: client }
+        }
+
+        ///Sends a `GET` request to `/templates/builds`
+        pub async fn send(
+            self,
+        ) -> Result<ResponseValue<::std::vec::Vec<types::BuildStatus>>, Error<()>> {
+            let Self { client } = self;
+            let url = format!("{}/templates/builds", client.baseurl,);
+            let mut header_map = ::reqwest::header::HeaderMap::with_capacity(1usize);
+            header_map.append(
+                ::reqwest::header::HeaderName::from_static("api-version"),
+                ::reqwest::header::HeaderValue::from_static(super::Client::api_version()),
+            );
+            #[allow(unused_mut)]
+            let mut request = client
+                .client
+                .get(url)
+                .header(
+                    ::reqwest::header::ACCEPT,
+                    ::reqwest::header::HeaderValue::from_static("application/json"),
+                )
+                .headers(header_map)
+                .build()?;
+            let info = OperationInfo {
+                operation_id: "list_builds",
+            };
+            client.pre(&mut request, &info).await?;
+            let result = client.exec(request, &info).await;
+            client.post(&result, &info).await?;
+            let response = result?;
+            match response.status().as_u16() {
+                200u16 => ResponseValue::from_response(response).await,
+                _ => Err(Error::UnexpectedResponse(response)),
+            }
+        }
+    }
+
+    ///Builder for [`Client::get_build`]
+    ///
+    ///[`Client::get_build`]: super::Client::get_build
+    #[derive(Debug, Clone)]
+    pub struct GetBuild<'a> {
+        client: &'a super::Client,
+        name: Result<::std::string::String, String>,
+    }
+
+    impl<'a> GetBuild<'a> {
+        pub fn new(client: &'a super::Client) -> Self {
+            Self {
+                client: client,
+                name: Err("name was not initialized".to_string()),
+            }
+        }
+
+        pub fn name<V>(mut self, value: V) -> Self
+        where
+            V: std::convert::TryInto<::std::string::String>,
+        {
+            self.name = value.try_into().map_err(|_| {
+                "conversion to `:: std :: string :: String` for name failed".to_string()
+            });
+            self
+        }
+
+        ///Sends a `GET` request to `/templates/builds/{name}`
+        pub async fn send(
+            self,
+        ) -> Result<ResponseValue<types::BuildStatus>, Error<types::ErrorBody>> {
+            let Self { client, name } = self;
+            let name = name.map_err(Error::InvalidRequest)?;
+            let url = format!(
+                "{}/templates/builds/{}",
+                client.baseurl,
+                encode_path(&name.to_string()),
+            );
+            let mut header_map = ::reqwest::header::HeaderMap::with_capacity(1usize);
+            header_map.append(
+                ::reqwest::header::HeaderName::from_static("api-version"),
+                ::reqwest::header::HeaderValue::from_static(super::Client::api_version()),
+            );
+            #[allow(unused_mut)]
+            let mut request = client
+                .client
+                .get(url)
+                .header(
+                    ::reqwest::header::ACCEPT,
+                    ::reqwest::header::HeaderValue::from_static("application/json"),
+                )
+                .headers(header_map)
+                .build()?;
+            let info = OperationInfo {
+                operation_id: "get_build",
+            };
+            client.pre(&mut request, &info).await?;
+            let result = client.exec(request, &info).await;
+            client.post(&result, &info).await?;
+            let response = result?;
+            match response.status().as_u16() {
+                200u16 => ResponseValue::from_response(response).await,
+                404u16 => Err(Error::ErrorResponse(
+                    ResponseValue::from_response(response).await?,
+                )),
                 _ => Err(Error::UnexpectedResponse(response)),
             }
         }

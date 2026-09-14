@@ -25,7 +25,27 @@ use iso_guest_proto::{AgentInfo, ClientError, DirEntry, ExecRequest, ExecResult,
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
+use crate::build::{BuildRequest, BuildStatus};
+
 type Cp<N, S, R> = Arc<ControlPlane<N, S, R>>;
+
+/// What the handlers share: the control plane, and the template builds.
+pub struct AppState<N, S, R> {
+    pub cp: Cp<N, S, R>,
+    pub builds: Arc<crate::build::Builds>,
+}
+
+impl<N, S, R> Clone for AppState<N, S, R> {
+    fn clone(&self) -> Self {
+        Self { cp: self.cp.clone(), builds: self.builds.clone() }
+    }
+}
+
+impl<N, S, R> axum::extract::FromRef<AppState<N, S, R>> for Cp<N, S, R> {
+    fn from_ref(s: &AppState<N, S, R>) -> Self {
+        s.cp.clone()
+    }
+}
 
 /// The shape of every error response.
 #[derive(Serialize, ToSchema)]
@@ -822,9 +842,10 @@ where
         license(name = "MIT"),
     ),
     paths(create, list, get_one, start, stop, suspend, halt, terminate, retire_suspension, destroy, set_policy, add_forward, remove_forward,
-        register_template, list_templates, stats, agent_info, guest_exec, read_file, write_file, remove_path, list_dir),
+        register_template, list_templates, start_build, list_builds, get_build, stats, agent_info, guest_exec, read_file, write_file, remove_path, list_dir),
     components(schemas(ErrorBody, PortForward, CreateVmRequest, CreatedVm, AddForwardRequest, Vm, PolicyRequest, SignedPolicyDto,
         WriteFileRequest, Written, DirListing, Stats, TemplateRequest, Template,
+        BuildRequest, BuildStatus,
         ExecRequest, ExecResult, AgentInfo, FileContent, DirEntry, iso_guest_proto::FileKind)),
     tags(
         (name = "vms", description = "VM lifecycle, policy and port forwards"),
@@ -840,7 +861,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
 }
 
 /// Build the admin router over a control plane.
-pub fn router<N, S, R>(cp: Cp<N, S, R>) -> Router
+pub fn router<N, S, R>(cp: Cp<N, S, R>, builds: Arc<crate::build::Builds>) -> Router
 where
     N: NetworkManager + Send + Sync + 'static,
     S: StorageManager + Send + Sync + 'static,
@@ -869,9 +890,62 @@ where
         )
         .route("/vms/{id}/dir", get(list_dir::<N, S, R>))
         .route("/templates", post(register_template::<N, S, R>).get(list_templates::<N, S, R>))
+        .route("/templates/build", post(start_build::<N, S, R>))
+        .route("/templates/builds", get(list_builds::<N, S, R>))
+        .route("/templates/builds/{name}", get(get_build::<N, S, R>))
         .route("/stats", get(stats::<N, S, R>))
         .route("/openapi.json", get(openapi_json))
-        .with_state(cp)
+        .with_state(AppState { cp, builds })
+}
+
+#[utoipa::path(post, path = "/templates/build", tag = "templates", request_body = BuildRequest,
+    responses(
+        (status = 202, description = "Building; poll GET /templates/builds/{name}", body = BuildStatus),
+        (status = 400, description = "A bad name or image", body = ErrorBody),
+        (status = 409, description = "Already building under that name", body = ErrorBody),
+        (status = 501, description = "This host is not configured to build templates", body = ErrorBody),
+    ))]
+async fn start_build<N, S, R>(
+    State(st): State<AppState<N, S, R>>,
+    Json(req): Json<BuildRequest>,
+) -> Result<(StatusCode, Json<BuildStatus>), ApiError>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    match st.builds.start(st.cp.clone(), req) {
+        Ok(b) => Ok((StatusCode::ACCEPTED, Json(b))),
+        Err((code, msg)) => Err(ApiError(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), msg)),
+    }
+}
+
+#[utoipa::path(get, path = "/templates/builds", tag = "templates",
+    responses((status = 200, description = "Every build this daemon has run, newest first", body = Vec<BuildStatus>)))]
+async fn list_builds<N, S, R>(State(st): State<AppState<N, S, R>>) -> Json<Vec<BuildStatus>>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    Json(st.builds.list())
+}
+
+#[utoipa::path(get, path = "/templates/builds/{name}", tag = "templates", params(("name" = String, Path, description = "Template name")),
+    responses((status = 200, description = "The build", body = BuildStatus), (status = 404, description = "No such build", body = ErrorBody)))]
+async fn get_build<N, S, R>(
+    State(st): State<AppState<N, S, R>>,
+    Path(name): Path<String>,
+) -> Result<Json<BuildStatus>, ApiError>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    st.builds
+        .get(&name)
+        .map(Json)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no build named {name:?}")))
 }
 
 #[cfg(test)]
@@ -1292,7 +1366,7 @@ mod openapi_tests {
         let extra: Vec<_> = documented.difference(&served).collect();
         assert!(missing.is_empty(), "routes without an OpenAPI operation: {missing:?}");
         assert!(extra.is_empty(), "documented operations with no route: {extra:?}");
-        assert_eq!(served.len(), 22, "operation count; update when routes change on purpose");
+        assert_eq!(served.len(), 25, "operation count; update when routes change on purpose");
     }
 
     #[test]

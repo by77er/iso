@@ -88,6 +88,24 @@ ssh, `tunnel tcp://postman-echo.com:80` for plain HTTP, `tunnel
 tcp://api.example:443` to let a pinned client see the real certificate. A
 tunnel is never injected into and is logged at connection level.
 
+## Templates from OCI images
+
+Hosts on this rig can build templates through the API: `ISO_BAKE_KERNEL`
+and `ISO_BAKE_AGENT_BIN` in controld's unit point at the kernel and the
+static agent the deploy shipped. Through the fleet:
+
+```bash
+isoctl template build --name py312 --image python:3.12-slim   # every host pulls and bakes it
+isoctl template wait py312
+isoctl vm create --template py312 --egress proxy --rule 'allow https://*/**' --quiet
+```
+
+The image's filesystem is the rootfs, the guest agent is its init, and the
+tier's CA is in the system bundle and in every runtime's trust-store
+variable, so `python -c 'import urllib.request; …'` reaches HTTPS hosts
+through the proxy without any change to the image. `contrib/harbor` uses
+the same path to run Harbor tasks here.
+
 ## Reading the access log
 
 The tier writes one JSON line per request and per tunnel (`ISO_LOG_FORMAT=json`

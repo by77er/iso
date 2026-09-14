@@ -24,6 +24,9 @@
 
 mod generated;
 
+/// The trait with `baseurl()` and `client()`, for callers that speak to
+/// routes the generated client does not know (the fleet's per-host shapes).
+pub use progenitor_client::ClientInfo;
 pub use generated::*;
 
 use std::path::{Path, PathBuf};

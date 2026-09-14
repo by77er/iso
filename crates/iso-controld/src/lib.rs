@@ -1,6 +1,7 @@
 //! iso-controld library: the axum admin API and daemon settings, kept as a lib
 //! so integration tests (and the binary) can share them.
 
+pub mod build;
 pub mod dns_memory;
 pub mod http;
 pub mod identify;

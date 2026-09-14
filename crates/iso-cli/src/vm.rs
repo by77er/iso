@@ -13,20 +13,27 @@ use iso_client::{Client, Credentials};
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// How to reach the admin API (a host's, or the fleet's).
 #[derive(Args)]
-pub struct Vm {
+pub struct Conn {
     /// Admin API base URL.
     #[arg(long, env = "ISO_SERVER", default_value = "https://127.0.0.1:7070", global = true)]
-    server: String,
+    pub server: String,
     /// Directory holding `ca.crt`, `<client>.crt` and `<client>.key`.
     #[arg(long, env = "ISO_CREDS", global = true)]
-    creds: Option<PathBuf>,
+    pub creds: Option<PathBuf>,
     /// Name of the client certificate in `--creds`.
     #[arg(long, env = "ISO_CLIENT", default_value = "admin", global = true)]
-    client: String,
+    pub client: String,
     /// Plain HTTP, for a daemon started with ISO_ADMIN_INSECURE=1.
     #[arg(long, global = true)]
-    insecure: bool,
+    pub insecure: bool,
+}
+
+#[derive(Args)]
+pub struct Vm {
+    #[command(flatten)]
+    conn: Conn,
     #[command(subcommand)]
     cmd: VmCmd,
 }
@@ -164,7 +171,7 @@ fn kv(pairs: &[String], what: &str) -> R<Vec<(String, String)>> {
         .collect()
 }
 
-fn connect(v: &Vm) -> R<Client> {
+pub fn connect(v: &Conn) -> R<Client> {
     if v.insecure {
         let base = if v.server.starts_with("http") { v.server.clone() } else { format!("http://{}", v.server) };
         return Ok(Client::insecure(&base));
@@ -175,7 +182,7 @@ fn connect(v: &Vm) -> R<Client> {
 }
 
 pub async fn run(v: Vm) -> R<()> {
-    let c = connect(&v)?;
+    let c = connect(&v.conn)?;
     match v.cmd {
         VmCmd::List => {
             let vms = c.list().send().await?.into_inner();

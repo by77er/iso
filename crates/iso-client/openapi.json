@@ -73,6 +73,130 @@
         }
       }
     },
+    "/templates/build": {
+      "post": {
+        "tags": [
+          "templates"
+        ],
+        "operationId": "start_build",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Building; poll GET /templates/builds/{name}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A bad name or image",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already building under that name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "This host is not configured to build templates",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/templates/builds": {
+      "get": {
+        "tags": [
+          "templates"
+        ],
+        "operationId": "list_builds",
+        "responses": {
+          "200": {
+            "description": "Every build this daemon has run, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BuildStatus"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/templates/builds/{name}": {
+      "get": {
+        "tags": [
+          "templates"
+        ],
+        "operationId": "get_build",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Template name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The build",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildStatus"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such build",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/vms": {
       "get": {
         "tags": [
@@ -1216,6 +1340,87 @@
           }
         }
       },
+      "BuildRequest": {
+        "type": "object",
+        "description": "Ask for a template from an image.",
+        "required": [
+          "name",
+          "image"
+        ],
+        "properties": {
+          "force": {
+            "type": "boolean",
+            "description": "Rebuild even when a template of this name is already registered.\nWithout it, an existing template answers `ready` at once."
+          },
+          "image": {
+            "type": "string",
+            "description": "The OCI image, as `isoctl bake --image` takes it: `python:3.12-slim`,\n`ghcr.io/acme/tool:v3`, `registry/repo@sha256:…`."
+          },
+          "mem_mib": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true,
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "Template name: `[a-z0-9][a-z0-9-]{0,31}`."
+          },
+          "size": {
+            "type": "string",
+            "description": "Rootfs volume size, e.g. `16G`.",
+            "nullable": true
+          },
+          "vcpus": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true,
+            "minimum": 0
+          }
+        }
+      },
+      "BuildStatus": {
+        "type": "object",
+        "description": "How a build is going.",
+        "required": [
+          "name",
+          "image",
+          "state",
+          "started_at",
+          "log_tail"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "nullable": true
+          },
+          "finished_at": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true,
+            "minimum": 0
+          },
+          "image": {
+            "type": "string"
+          },
+          "log_tail": {
+            "type": "string",
+            "description": "The last few KiB of the bake's output."
+          },
+          "name": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`building`, `ready` or `failed`."
+          }
+        }
+      },
       "CreateVmRequest": {
         "type": "object",
         "description": "Create and boot a VM. Only `template` is required.",
@@ -1416,6 +1621,11 @@
             "description": "Wall-clock limit; the process group is killed when it elapses.",
             "nullable": true,
             "minimum": 0
+          },
+          "user": {
+            "type": "string",
+            "description": "Run as this user, a name or a numeric uid, with that user's primary\ngroup and `HOME`. Only an agent running as root can switch; any\nother agent refuses a user that is not itself. Absent, the agent's\ndefault user (the image's `USER` in a template built from an OCI\nimage, else the agent's own).",
+            "nullable": true
           }
         }
       },

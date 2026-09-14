@@ -144,6 +144,6 @@ pub fn app_with_templates(templates: &[&str]) -> Router {
         })
         .unwrap();
     }
-    router(cp)
+    router(cp, crate::build::Builds::new(None))
 }
 

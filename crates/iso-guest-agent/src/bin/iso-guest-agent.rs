@@ -18,8 +18,22 @@ fn usage() -> ! {
     std::process::exit(2)
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // PID 1 means a template with no init of its own: be one, and run the
+    // agent proper as a child with the image's environment.
+    if std::process::id() == 1 {
+        let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--init").collect();
+        let args = if args.is_empty() { vec!["--port".to_string(), iso_guest_proto::DEFAULT_PORT.to_string()] } else { args };
+        iso_guest_agent::init::run(&args);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(serve());
+}
+
+async fn serve() {
     let mut port = iso_guest_proto::DEFAULT_PORT;
     let mut tcp: Option<String> = None;
     let mut args = std::env::args().skip(1);

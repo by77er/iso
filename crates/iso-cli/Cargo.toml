@@ -16,7 +16,19 @@ iso-storage-manager = { path = "../iso-storage-manager" }
 iso-firecracker = { path = "../iso-firecracker" }
 iso-admin-pki = { path = "../iso-admin-pki" }
 iso-client = { path = "../iso-client" }
+iso-guest-proto = { path = "../iso-guest-proto" }
 clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "fs"] }
 libc = "0.2.186"
+# Pulling OCI images for `bake --image`: the registry API over TLS, gzip
+# layers, tar extraction, digest checks.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+ring = "0.17"
+flate2 = "1"
+tar = "0.4"
+base64 = "0.22"
+tempfile = "3"
+futures-util = "0.3"

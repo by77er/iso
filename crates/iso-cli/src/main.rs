@@ -12,6 +12,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod oci;
+mod template;
 mod vm;
 
 use clap::{Parser, Subcommand};
@@ -37,6 +39,8 @@ enum Cmd {
     Admin(Admin),
     /// Create, inspect and use VMs through the admin API.
     Vm(vm::Vm),
+    /// Templates: list them, build one from an OCI image, follow a build.
+    Template(template::Template),
 }
 
 #[derive(Parser)]
@@ -81,11 +85,22 @@ struct Bake {
     /// Template name (rootfs LV `tpl_<name>` + snapshot dir).
     #[arg(long)]
     name: String,
-    /// What fills the rootfs: `nixos` (the flake's image) or `debian` (a stock
+    /// What fills the rootfs: `nixos` (the flake's image), `debian` (a stock
     /// Debian built by image/debian/build-rootfs.sh with mmdebstrap; agents get
-    /// apt). Both boot the flake's kernel and run the guest agent.
-    #[arg(long, default_value = "nixos", value_parser = ["nixos", "debian"])]
+    /// apt), or `oci` (an OCI image, see --image and --oci-tar; implied by
+    /// either). All boot the flake's kernel and run the guest agent.
+    #[arg(long, default_value = "nixos", value_parser = ["nixos", "debian", "oci"])]
     distro: String,
+    /// Pull this OCI image from its registry and make it the rootfs, e.g.
+    /// `python:3.12-slim`, `ghcr.io/acme/tool:v3`, `localhost:5000/x@sha256:…`.
+    /// Anonymous, or `ISO_REGISTRY_AUTH=user:password` for a private
+    /// registry. The image has no init; the guest agent is one.
+    #[arg(long, conflicts_with = "oci_tar")]
+    image: Option<String>,
+    /// Like --image, from a tarball on disk: `docker save`, an OCI image
+    /// layout, or a bare `docker export` rootfs.
+    #[arg(long)]
+    oci_tar: Option<PathBuf>,
     /// Debian suite for `--distro debian`.
     #[arg(long, default_value = "trixie")]
     debian_suite: String,
@@ -151,15 +166,13 @@ struct Bake {
     /// across every VM cloned from the template. Repeatable.
     #[arg(long)]
     seed_repo: Vec<String>,
-    /// Commands to run inside the builder as `coder` (over ssh) AFTER boot and
-    /// BEFORE the snapshot, e.g. to warm a toolchain once so it's CoW-shared
-    /// across all VMs. Implies egress=Allow for the builder. Non-fatal.
-    /// Repeatable.
+    /// Commands to run inside the builder through the guest agent (as the
+    /// agent's user: `coder` on the Debian and NixOS images, the image's
+    /// USER or root on an OCI image) AFTER boot and BEFORE the snapshot, e.g.
+    /// to warm a toolchain once so it's CoW-shared across all VMs. Gives the
+    /// builder direct egress. Non-fatal. Repeatable.
     #[arg(long)]
     provision: Vec<String>,
-    /// SSH key for `--provision` (default: <state>/keys/test_ed25519).
-    #[arg(long)]
-    ssh_key: Option<PathBuf>,
     /// Guest CID of the vsock device baked into the template, which is what the
     /// host's guest channel (exec, file access) rides on. Must match the
     /// control plane's `vsock_cid`.
@@ -271,6 +284,7 @@ async fn main() -> R<()> {
         Cmd::Bake(b) => bake(b).await,
         Cmd::Admin(a) => admin(a),
         Cmd::Vm(v) => vm::run(v).await,
+        Cmd::Template(t) => template::run(t).await,
     }
 }
 
@@ -347,15 +361,19 @@ async fn bake(b: Bake) -> R<()> {
         return Err("bake must run as root (LVM, netns, KVM)".into());
     }
 
-    eprintln!("[bake] building {} image from flake {}", b.distro, b.flake);
+    let oci = b.distro == "oci" || b.image.is_some() || b.oci_tar.is_some();
+    if oci && b.image.is_none() && b.oci_tar.is_none() {
+        return Err("--distro oci needs --image or --oci-tar".into());
+    }
+    eprintln!("[bake] building {} image from flake {}", if oci { "oci" } else { &b.distro }, b.flake);
     let kernel = match &b.kernel {
         Some(k) => k.clone(),
         None => PathBuf::from(nix_build(&b.flake, "kernel")?).join("vmlinux"),
     };
-    let debian = b.distro == "debian";
-    // NixOS: the system closure and the installer. Debian: the static agent
-    // the rootfs script copies in.
-    let (toplevel, nixos_install, agent) = if debian {
+    let debian = b.distro == "debian" && !oci;
+    // NixOS: the system closure and the installer. Debian and OCI: the static
+    // agent copied into the rootfs.
+    let (toplevel, nixos_install, agent) = if debian || oci {
         let agent = match &b.agent_bin {
             Some(a) => a.to_string_lossy().into_owned(),
             None => format!("{}/bin/iso-guest-agent", nix_build(&b.flake, "iso-guest-agent-static")?),
@@ -386,11 +404,17 @@ async fn bake(b: Bake) -> R<()> {
         eprintln!("[bake] --skip-install: re-using existing rootfs {}", dev.display());
     } else {
         storage.create_template(&b.name, &b.size).await?;
-        eprintln!("[bake] mkfs + {} onto {}", if debian { "mmdebstrap" } else { "nixos-install" }, dev.display());
+        eprintln!(
+            "[bake] mkfs + {} onto {}",
+            if oci { "the image's layers" } else if debian { "mmdebstrap" } else { "nixos-install" },
+            dev.display()
+        );
         run(&["mkfs.ext4", "-F", "-q", &dev.to_string_lossy()])?;
         let mnt = run_out(&["mktemp", "-d"])?;
         run(&["mount", &dev.to_string_lossy(), &mnt])?;
-        let install = if debian {
+        let install = if oci {
+            oci_rootfs(&b, &mnt, &agent).await
+        } else if debian {
             debian_rootfs(&b, &mnt, &agent)
         } else {
             run(&[
@@ -457,7 +481,14 @@ async fn bake(b: Bake) -> R<()> {
     let builder = VmId::from_u128(0xba6e_0000_0000_0000_0000_0000_0000_0001);
     let inner_vm = ncfg.inner_vm;
     let gw = ncfg.inner_tap;
-    let init = if debian { "/sbin/init" } else { "/nix/var/nix/profiles/system/init" };
+    // An OCI image has no init: the agent is one when it finds itself PID 1.
+    let init = if oci {
+        "/usr/local/bin/iso-guest-agent"
+    } else if debian {
+        "/sbin/init"
+    } else {
+        "/nix/var/nix/profiles/system/init"
+    };
     let boot_args = format!(
         "console=ttyS0 reboot=k panic=1 acpi=off quiet loglevel=3 \
          root=/dev/vda rootfstype=ext4 rw ip={inner_vm}::{gw}:255.255.255.254::eth0:off \
@@ -478,11 +509,7 @@ async fn bake(b: Bake) -> R<()> {
         vsock_cid: Some(b.vsock_cid),
     };
 
-    let ssh_key = b
-        .ssh_key
-        .clone()
-        .unwrap_or_else(|| b.state.join("keys/test_ed25519"));
-    let result = bake_inner(&rt, &net, &fixture.netns, slot, builder, inner_vm, &spec, b.boot_timeout, &b.state, &b.name, &b.provision, &ssh_key).await;
+    let result = bake_inner(&rt, &fixture.netns, builder, &spec, b.boot_timeout, &b.state, &b.name, &b.provision, b.vsock_cid).await;
 
     // always tear the builder down (keep the rootfs LV + the snapshot)
     let _ = rt.destroy(builder).await;
@@ -515,6 +542,30 @@ async fn bake(b: Bake) -> R<()> {
         b.state.display(),
         serde_json::to_string_pretty(&reg)?
     );
+    Ok(())
+}
+
+/// Fill a mounted volume with an OCI image's filesystem plus what a guest
+/// needs on top: the agent (as init), the image's config for it, the
+/// resolver, and the proxy's CA in every trust store.
+async fn oci_rootfs(b: &Bake, mnt: &str, agent: &str) -> R<()> {
+    let dest = Path::new(mnt);
+    let boxed = |e: Box<dyn std::error::Error + Send + Sync>| -> Box<dyn std::error::Error> { e };
+    let config = if let Some(image) = &b.image {
+        oci::pull(image, dest).await.map_err(boxed)?
+    } else if let Some(tar) = &b.oci_tar {
+        oci::from_archive(tar, dest).map_err(boxed)?
+    } else {
+        return Err("--distro oci needs --image or --oci-tar".into());
+    };
+    if let Some(u) = &config.user {
+        eprintln!("[bake] image user {u}, workdir {}", config.workdir.as_deref().unwrap_or("/"));
+    }
+    let ca = std::fs::read_to_string(b.state.join("ca/ca.crt")).ok();
+    if ca.is_none() {
+        eprintln!("[bake] warning: no {} on this host; guests will not trust the egress proxy", b.state.join("ca/ca.crt").display());
+    }
+    oci::install(dest, Path::new(agent), config, ca.as_deref()).map_err(boxed)?;
     Ok(())
 }
 
@@ -556,67 +607,84 @@ fn debian_rootfs(b: &Bake, mnt: &str, agent: &str) -> R<()> {
     }
 }
 
+/// The guest agent inside the builder, over the VMM's vsock channel: how
+/// the bake knows the guest is up, runs provisioning, and flushes the
+/// filesystem, whatever the image is (an OCI image has no sshd).
+async fn builder_agent(
+    rt: &iso_firecracker::FirecrackerRuntime,
+    vm: VmId,
+) -> R<iso_guest_proto::GuestClient<tokio::net::UnixStream>> {
+    use iso_common::runtime::VmRuntime as _;
+    let fd = rt.guest_channel(vm, iso_guest_proto::DEFAULT_PORT).await?;
+    let std = std::os::unix::net::UnixStream::from(fd);
+    std.set_nonblocking(true)?;
+    Ok(iso_guest_proto::GuestClient::new(tokio::net::UnixStream::from_std(std)?))
+}
+
+/// `sh -c cmd` in the builder, as the agent's user; the command is never
+/// echoed (it may carry a secret). Returns whether it exited 0.
+async fn builder_exec(rt: &iso_firecracker::FirecrackerRuntime, vm: VmId, cmd: &str, timeout_ms: u64) -> R<bool> {
+    let mut agent = builder_agent(rt, vm).await?;
+    let out = agent
+        .exec(iso_guest_proto::ExecRequest {
+            cmd: "sh".into(),
+            args: vec!["-c".into(), cmd.into()],
+            timeout_ms: Some(timeout_ms),
+            max_output_bytes: Some(64 * 1024),
+            ..Default::default()
+        })
+        .await?;
+    for line in out.stderr.lines().chain(out.stdout.lines()).rev().take(20).collect::<Vec<_>>().into_iter().rev() {
+        eprintln!("[bake]   | {line}");
+    }
+    Ok(out.exit_code == Some(0))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn bake_inner(
     rt: &iso_firecracker::FirecrackerRuntime,
-    _net: &iso_network_manager::Manager,
     netns: &str,
-    _slot: SlotId,
     builder: VmId,
-    inner_vm: std::net::Ipv4Addr,
     spec: &InstanceSpec,
     boot_timeout: u64,
     state: &Path,
     name: &str,
     provision: &[String],
-    ssh_key: &Path,
+    _vsock_cid: u32,
 ) -> R<(PathBuf, PathBuf)> {
     eprintln!("[bake] booting builder VM in netns {netns}");
     rt.create(spec).await?;
     rt.start(builder).await?;
 
-    // wait until the guest's sshd is accepting (it's fully booted by then).
-    eprintln!("[bake] waiting for guest to come up (<= {boot_timeout}s)");
+    // The guest is up when its agent answers on vsock.
+    eprintln!("[bake] waiting for the guest agent (<= {boot_timeout}s)");
     let deadline = Instant::now() + Duration::from_secs(boot_timeout);
-    let probe = format!("cat </dev/null >/dev/tcp/{inner_vm}/22");
     let mut up = false;
     while Instant::now() < deadline {
-        let ok = Command::new("ip")
-            .args(["netns", "exec", netns, "timeout", "2", "bash", "-c", &probe])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
+        if let Ok(mut agent) = builder_agent(rt, builder).await
+            && tokio::time::timeout(Duration::from_secs(2), agent.ping()).await.is_ok_and(|r| r.is_ok())
+        {
             up = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     if !up {
-        return Err("guest never reached sshd within the boot timeout".into());
+        return Err("the guest agent never answered within the boot timeout".into());
     }
     eprintln!("[bake] guest up");
 
-    // Run provisioning commands as `coder` inside the builder (over ssh in the
-    // netns) before snapshotting, so any warmed state is CoW-shared. Non-fatal.
-    // The command is never logged: `--provision` is how the caller ships secrets
-    // into the builder (iso-coder-template passes a GCS token and a GitHub token
-    // this way), so echoing it puts live credentials in the bake output.
+    // Run provisioning commands inside the builder before snapshotting, so
+    // any warmed state is CoW-shared. Non-fatal. The command is never logged:
+    // `--provision` is how a caller ships secrets into the builder, so echoing
+    // it puts live credentials in the bake output.
     let total = provision.len();
     for (i, cmd) in provision.iter().enumerate() {
         eprintln!("[bake] provision {}/{total}", i + 1);
-        let ok = Command::new("ip")
-            .args([
-                "netns", "exec", netns, "ssh", "-i", &ssh_key.to_string_lossy(),
-                "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=15", "-o", "LogLevel=ERROR",
-                &format!("coder@{inner_vm}"), cmd,
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            eprintln!("[bake] provision {}/{total} failed (continuing)", i + 1);
+        match builder_exec(rt, builder, cmd, 3_600_000).await {
+            Ok(true) => {}
+            Ok(false) => eprintln!("[bake] provision {}/{total} failed (continuing)", i + 1),
+            Err(e) => eprintln!("[bake] provision {}/{total} could not run: {e} (continuing)", i + 1),
         }
     }
 
@@ -626,17 +694,7 @@ async fn bake_inner(
     // metadata (e.g. the seeded `.git`, written by git/direnv activity during
     // boot) never reaches the LV and every CoW clone reads a torn repo.
     eprintln!("[bake] sync guest fs before snapshot");
-    let sync_ok = Command::new("ip")
-        .args([
-            "netns", "exec", netns, "ssh", "-i", &ssh_key.to_string_lossy(),
-            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=15", "-o", "LogLevel=ERROR",
-            &format!("coder@{inner_vm}"), "sync",
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !sync_ok {
+    if !matches!(builder_exec(rt, builder, "sync", 60_000).await, Ok(true)) {
         eprintln!("[bake] warning: guest sync before snapshot failed (rootfs may be inconsistent)");
     }
 

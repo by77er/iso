@@ -25,6 +25,10 @@ pub struct Settings {
     pub admin_insecure: bool,
     /// Extra names for the server certificate (`ISO_ADMIN_SANS`, comma-separated).
     pub admin_extra_sans: Vec<String>,
+    /// Template builds through the API (`ISO_BAKE_KERNEL`, `ISO_BAKE_AGENT_BIN`;
+    /// `ISO_ISOCTL_BIN` default `isoctl`, `ISO_BAKE_SLOT` default 32766).
+    /// `None` when unconfigured: the endpoint then says so.
+    pub bake: Option<crate::build::BakeSettings>,
 }
 
 /// The host's primary IPv4 (source IP toward the internet) — used for the
@@ -118,6 +122,18 @@ pub fn from_env() -> Result<Settings, Error> {
         .unwrap_or(100);
 
     let jailer = iso_firecracker::JailerConfig::from_env(&state);
+    let bake = match (env("ISO_BAKE_KERNEL"), env("ISO_BAKE_AGENT_BIN")) {
+        (Some(k), Some(a)) => Some(crate::build::BakeSettings {
+            isoctl: env("ISO_ISOCTL_BIN").map(PathBuf::from).unwrap_or_else(|| "isoctl".into()),
+            kernel: PathBuf::from(k),
+            agent_bin: PathBuf::from(a),
+            state: state.clone(),
+            vg: vg.clone(),
+            uplink: uplink.clone(),
+            slot: env("ISO_BAKE_SLOT").and_then(|s| s.parse().ok()).unwrap_or(32766),
+        }),
+        _ => None,
+    };
     Ok(Settings {
         control: iso_control_plane::Config {
             db_path: state.join("control.db"),
@@ -157,6 +173,7 @@ pub fn from_env() -> Result<Settings, Error> {
         admin_extra_sans: env("ISO_ADMIN_SANS")
             .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
             .unwrap_or_default(),
+        bake,
         // Bind the admin API on the host's reachable IP so a co-located *or*
         // remote orchestrator can use it (and derive the same address for ssh).
         // Authenticated with client certificates from the admin CA unless

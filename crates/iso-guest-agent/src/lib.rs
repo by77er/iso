@@ -9,8 +9,14 @@
 //! its service unit says (the image runs it as `coder`), and everything it does
 //! is done with that user's permissions.
 //!
+//! Run as PID 1 (a template built from an OCI image has no init of its
+//! own), the same binary is the init: see [`init`].
+//!
 //! Written against stable Rust on purpose: the guest image compiles this crate
 //! with the compiler nixpkgs ships, not the workspace's nightly.
+
+pub mod init;
+pub mod user;
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -139,13 +145,26 @@ async fn exec(req: ExecRequest) -> Result<ExecResult, String> {
 
     let mut cmd = tokio::process::Command::new(&req.cmd);
     cmd.args(&req.args)
-        .envs(&req.env)
         .stdin(if req.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Own process group, so a timeout can take the whole tree down.
         .process_group(0)
         .kill_on_drop(true);
+    // Whose command this is: the requested user, else the agent's default
+    // (the image's USER under an OCI template), else the agent itself.
+    let wanted = req.user.clone().or_else(|| std::env::var("ISO_DEFAULT_USER").ok().filter(|u| !u.is_empty()));
+    if let Some(u) = wanted.as_deref() {
+        let who = user::resolve(u).map_err(|e| format!("user {u:?}: {e}"))?;
+        if who.uid != unsafe { libc::getuid() } {
+            if unsafe { libc::geteuid() } != 0 {
+                return Err(format!("cannot run as {u:?}: the agent is not root"));
+            }
+            cmd.uid(who.uid).gid(who.gid);
+            cmd.env("HOME", &who.home).env("USER", &who.name).env("LOGNAME", &who.name);
+        }
+    }
+    cmd.envs(&req.env);
     if let Some(cwd) = &req.cwd {
         cmd.current_dir(cwd);
     }

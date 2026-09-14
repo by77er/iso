@@ -139,7 +139,7 @@ async fn end_to_end_create_boot_destroy() {
     })
     .expect("register template");
 
-    let app = http::router(cp.clone());
+    let app = http::router(cp.clone(), iso_controld::build::Builds::new(None));
 
     // --- create a VM through the HTTP API (provisions storage, network, boots FC) ---
     let resp = app

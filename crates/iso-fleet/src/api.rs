@@ -26,6 +26,9 @@ pub fn router(fleet: Shared) -> Router {
         .route("/vms/{id}/policy", patch(set_policy))
         .route("/vms/{id}/{*rest}", any(forward))
         .route("/hosts", get(hosts))
+        .route("/templates/build", post(build_template))
+        .route("/templates/builds", get(list_builds))
+        .route("/templates/builds/{name}", get(get_build))
         .route("/stats", get(stats))
         .route("/openapi.json", get(openapi))
         .with_state(fleet)
@@ -480,6 +483,104 @@ async fn forward(
 
 async fn hosts(State(fleet): State<Shared>) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!(fleet.store.list_hosts()?)))
+}
+
+/// `POST /templates/build` on every healthy host (or the one named by
+/// `host`), so the template exists everywhere a VM might be placed. The
+/// answer is per host; `GET /templates/builds/{name}` follows them.
+async fn build_template(
+    State(fleet): State<Shared>,
+    Json(mut body): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let pin = body.get("host").and_then(Value::as_str).map(str::to_string);
+    if let Some(o) = body.as_object_mut() {
+        o.remove("host");
+    }
+    let name = body["name"].as_str().unwrap_or("").to_string();
+    if name.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "name is required".into()));
+    }
+    let hosts = fleet.store.list_hosts()?;
+    let targets: Vec<_> = hosts
+        .iter()
+        .filter(|h| h.healthy && pin.as_deref().is_none_or(|p| p == h.name))
+        .collect();
+    if targets.is_empty() {
+        return Err(ApiError(StatusCode::CONFLICT, "no healthy host to build on".into()));
+    }
+    let ct = HeaderValue::from_static("application/json");
+    let mut per_host = serde_json::Map::new();
+    let mut accepted = 0;
+    for h in targets {
+        let Some(client) = fleet.host(&h.name) else { continue };
+        let entry = match client.forward("POST", "/templates/build", Some(&ct), Bytes::from(body.to_string())).await {
+            Ok((status, _, bytes)) => {
+                if status.is_success() {
+                    accepted += 1;
+                }
+                let mut v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("http".into(), json!(status.as_u16()));
+                }
+                v
+            }
+            Err(e) => json!({ "http": 502, "error": e.to_string() }),
+        };
+        per_host.insert(h.name.clone(), entry);
+    }
+    let code = if accepted > 0 { StatusCode::ACCEPTED } else { StatusCode::BAD_GATEWAY };
+    Ok((code, Json(json!({ "name": name, "hosts": per_host }))))
+}
+
+/// Every host's builds, by host.
+async fn list_builds(State(fleet): State<Shared>) -> Result<Json<Value>, ApiError> {
+    let mut out = serde_json::Map::new();
+    for h in fleet.store.list_hosts()? {
+        let Some(client) = fleet.host(&h.name) else { continue };
+        let v = match client.forward("GET", "/templates/builds", None, Bytes::new()).await {
+            Ok((status, _, bytes)) if status.is_success() => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            Ok((status, _, _)) => json!({ "error": format!("http {status}") }),
+            Err(e) => json!({ "error": e.to_string() }),
+        };
+        out.insert(h.name, v);
+    }
+    Ok(Json(Value::Object(out)))
+}
+
+/// One build on every host, with a state for the whole: `ready` when every
+/// host that has it is ready, `failed` when any failed, else `building`.
+async fn get_build(State(fleet): State<Shared>, Path(name): Path<String>) -> Result<Json<Value>, ApiError> {
+    let mut per_host = serde_json::Map::new();
+    let (mut ready, mut failed, mut building, mut known) = (0, 0, 0, 0);
+    for h in fleet.store.list_hosts()? {
+        let Some(client) = fleet.host(&h.name) else { continue };
+        let v = match client.forward("GET", &format!("/templates/builds/{name}"), None, Bytes::new()).await {
+            Ok((StatusCode::OK, _, bytes)) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            Ok((StatusCode::NOT_FOUND, _, _)) => continue,
+            Ok((status, _, _)) => json!({ "state": "unknown", "error": format!("http {status}") }),
+            Err(e) => json!({ "state": "unknown", "error": e.to_string() }),
+        };
+        known += 1;
+        match v["state"].as_str() {
+            Some("ready") => ready += 1,
+            Some("failed") => failed += 1,
+            _ => building += 1,
+        }
+        per_host.insert(h.name, v);
+    }
+    if known == 0 {
+        return Err(ApiError(StatusCode::NOT_FOUND, format!("no host is building {name:?}")));
+    }
+    let state = if failed > 0 {
+        "failed"
+    } else if building > 0 {
+        "building"
+    } else if ready > 0 {
+        "ready"
+    } else {
+        "unknown"
+    };
+    Ok(Json(json!({ "name": name, "state": state, "hosts": per_host })))
 }
 
 /// Host-shaped, so a typed client reads it: capacity summed over healthy

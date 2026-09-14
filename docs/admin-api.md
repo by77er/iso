@@ -89,6 +89,9 @@ code, so it composes with shell tooling the way `ssh host cmd` does.
 | `PATCH /vms/{id}/policy` | Change `egress`, `principal`, `allow`, `rules` on a running VM. Bumps `policy_gen`; new connections carry it and the proxy closes older ones within a second. A rule that does not parse is a `400`. |
 | `POST /vms/{id}/forwards`, `DELETE /vms/{id}/forwards/{host_port}` | Open or close an ingress forward; the host port is allocated. |
 | `GET /vms/{id}/agent` | Ping the guest agent. |
+| `POST /templates/build` | Build a template from an OCI image: `{ "name", "image", "vcpus"?, "mem_mib"?, "size"? }`. `202` with a build status; the host pulls the image, bakes it with the guest agent as init, and registers the template. One build at a time per host. `501` on a host without `ISO_BAKE_KERNEL` and `ISO_BAKE_AGENT_BIN`. |
+| `GET /templates/builds` | Every build this daemon has run, newest first. |
+| `GET /templates/builds/{name}` | One build: `state` is `building`, `ready` or `failed`, with `error` and the last KiB of the bake's log. |
 
 A VM record carries `signed` when a fleet placed it: the fleet's signature
 over the policy (`{claims, sig}`, both base64). `POST /vms` and

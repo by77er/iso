@@ -121,6 +121,23 @@ echo "$out" | grep -q '"url":"https://postman-echo.com/get"' && ok "TLS passed t
 echo "$out" | grep -q 'x-iso-injected' && bad "a 443 tunnel must not inject" || ok "nothing injected on the 443 tunnel"
 "$ISOCTL" vm rm "$id3"
 
+echo "== a template from an OCI image, built on every host through the fleet"
+img="docker.io/library/python:3.12-slim"
+code=$(api -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -d "{\"name\":\"py312\",\"image\":\"$img\"}" "$ISO_SERVER/templates/build")
+[ "$code" = 202 ] && ok "build accepted on the hosts (202)" || bad "build not accepted: $code"
+for _ in $(seq 1 120); do st=$(api "$ISO_SERVER/templates/builds/py312" | py "print(d['state'])"); [ "$st" = ready ] || [ "$st" = failed ] && break; sleep 5; done
+[ "$st" = ready ] && ok "template py312 ready on the hosts" || bad "build ended as: $st $(api "$ISO_SERVER/templates/builds/py312" | head -c 600)"
+idp=$("$ISOCTL" vm create --template py312 --egress proxy --rule 'allow https://postman-echo.com/**' --quiet)
+for _ in $(seq 1 60); do "$ISOCTL" vm agent "$idp" >/dev/null 2>&1 && break; sleep 2; done
+out=$(vmexec "$idp" 'python3 -c "import sys; print(sys.version.split()[0])"' || true)
+echo "$out" | grep -q '^3\.12' && ok "python 3.12 runs in the image-based VM: $out" || bad "python did not run: $out"
+# (the echo service sits behind a CDN that refuses python's default user agent)
+out=$(vmexec "$idp" 'python3 -c "import urllib.request; r=urllib.request.Request(\"https://postman-echo.com/get\", headers={\"User-Agent\": \"iso-e2e/1\"}); print(urllib.request.urlopen(r, timeout=20).status)"' 2>&1 || true)
+echo "$out" | grep -q '^200' && ok "python's TLS trusts the proxy through the baked CA bundle" || bad "python TLS through the proxy failed: $(echo "$out" | tail -c 200)"
+out=$(vmexec "$idp" 'id -u; pwd' || true)
+echo "$out" | grep -q '^0' && ok "commands run as the image's user (root)" || bad "unexpected user: $out"
+"$ISOCTL" vm rm "$idp"
+
 echo "== a second VM lands on the other host"
 id2=$("$ISOCTL" vm create --template "$TEMPLATE" --egress deny --quiet)
 host2=$(api "$ISO_SERVER/vms/$id2" | py "print(d['host'])")
