@@ -44,15 +44,29 @@ impl From<rusqlite::Error> for ApiError {
     }
 }
 
-/// A VM as the fleet describes it: the host's record when the host answers,
-/// plus where it is and what the fleet knows.
+/// A VM as the fleet describes it: the host's record (live if given, else
+/// the one from the last sync, else one synthesized from the create request
+/// so the shape is always the host's), plus where it is and what the fleet
+/// knows. Typed clients generated from the host API read it unchanged.
 fn view(row: &VmRow, host_view: Option<Value>) -> Value {
-    let mut v = host_view.unwrap_or_else(|| {
+    let mut v = host_view.or_else(|| row.view.clone()).unwrap_or_else(|| {
+        let s = &row.spec;
         json!({
             "id": row.id,
+            "slot": null,
             "template": row.template,
+            "state": row.host_state.clone().unwrap_or_else(|| "creating".into()),
+            "egress": s["egress"].as_str().unwrap_or("deny"),
+            "lifecycle": s["lifecycle"].as_str().unwrap_or("ephemeral"),
+            "restart": s["restart"].as_str().unwrap_or("never"),
             "labels": row.labels,
-            "state": row.host_state,
+            "ingress": [],
+            "tap": null,
+            "rootfs_device": null,
+            "principal": s["principal"],
+            "allow": s["allow"].as_array().cloned().unwrap_or_default(),
+            "rules": s["rules"].as_array().cloned().unwrap_or_default(),
+            "policy_gen": 1,
         })
     });
     if let Some(o) = v.as_object_mut() {
@@ -117,6 +131,15 @@ async fn create(
                     .store
                     .set_vm_state(&id, state::PLACED, Some("creating"), None)?;
                 let _ = fleet.store.host_took_slot(&host.name);
+                // The host's record right away, so a read that follows the
+                // create does not have to wait for the next sync.
+                if let Ok((StatusCode::OK, _, body)) = client
+                    .forward("GET", &format!("/vms/{id}"), None, Bytes::new())
+                    .await
+                    && let Ok(v) = serde_json::from_slice::<Value>(&body)
+                {
+                    let _ = fleet.store.set_vm_view(&id, &v);
+                }
                 tracing::info!("placed vm {id} ({template}) on {}", host.name);
                 return Ok(Json(
                     json!({ "id": resp["id"].as_str().unwrap_or(&id), "host": host.name }),
@@ -195,6 +218,7 @@ async fn get_one(
             .await
         && let Ok(v) = serde_json::from_slice::<Value>(&body)
     {
+        let _ = fleet.store.set_vm_view(&id, &v);
         return Ok(Json(view(&row, Some(v))));
     }
     Ok(Json(view(&row, None)))
@@ -287,6 +311,9 @@ async fn hosts(State(fleet): State<Shared>) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!(fleet.store.list_hosts()?)))
 }
 
+/// Host-shaped, so a typed client reads it: capacity summed over healthy
+/// hosts, pool usage as the worst host's, plus fleet-only fields a host
+/// client ignores.
 async fn stats(State(fleet): State<Shared>) -> Result<Json<Value>, ApiError> {
     let hosts = fleet.store.list_hosts()?;
     let vms = fleet.store.list_vms()?;
@@ -298,12 +325,32 @@ async fn stats(State(fleet): State<Shared>) -> Result<Json<Value>, ApiError> {
             .unwrap_or(0);
         by_state.insert(v.fleet_state.clone(), json!(n + 1));
     }
+    let healthy: Vec<_> = hosts.iter().filter(|h| h.healthy).collect();
+    let slots_total: u32 = healthy.iter().map(|h| h.slots_total).sum();
+    let slots_free: u32 = healthy.iter().map(|h| h.slots_free).sum();
+    let data = healthy
+        .iter()
+        .map(|h| h.pool_data_percent)
+        .fold(0.0_f64, f64::max);
+    let meta = healthy
+        .iter()
+        .map(|h| h.pool_metadata_percent)
+        .fold(0.0_f64, f64::max);
     Ok(Json(json!({
-        "hosts": hosts.len(),
-        "hosts_healthy": hosts.iter().filter(|h| h.healthy).count(),
-        "slots_free": hosts.iter().filter(|h| h.healthy).map(|h| h.slots_free).sum::<u32>(),
-        "slots_total": hosts.iter().map(|h| h.slots_total).sum::<u32>(),
+        "storage_backend": null,
+        "pool_capacity_bytes": null,
+        "pool_used_bytes": null,
+        "snapshot_bytes": null,
+        "filesystem_capacity_bytes": null,
+        "filesystem_available_bytes": null,
+        "data_percent": data,
+        "metadata_percent": meta,
+        "slots_used": slots_total.saturating_sub(slots_free),
+        "slots_total": slots_total,
         "vms": vms.len(),
+        "hosts": hosts.len(),
+        "hosts_healthy": healthy.len(),
+        "slots_free": slots_free,
         "vms_by_state": by_state,
         "orphans": hosts.iter().map(|h| h.orphans).sum::<u32>(),
     })))

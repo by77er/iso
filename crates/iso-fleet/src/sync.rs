@@ -69,12 +69,20 @@ async fn sync_host(fleet: &Fleet, client: crate::hosts::HostClient) {
 
     let slots_total = stats["slots_total"].as_u64().unwrap_or(0) as u32;
     let slots_used = stats["slots_used"].as_u64().unwrap_or(0) as u32;
-    let pool = stats["pool"]["data_percent"].as_f64().unwrap_or(0.0);
+    let pool = stats["data_percent"]
+        .as_f64()
+        .or_else(|| stats["pool"]["data_percent"].as_f64())
+        .unwrap_or(0.0);
+    let meta = stats["metadata_percent"]
+        .as_f64()
+        .or_else(|| stats["pool"]["metadata_percent"].as_f64())
+        .unwrap_or(0.0);
     let _ = fleet.store.host_seen(
         &name,
         slots_total.saturating_sub(slots_used),
         slots_total,
         pool,
+        meta,
         &templates,
     );
 
@@ -105,10 +113,8 @@ async fn sync_host(fleet: &Fleet, client: crate::hosts::HostClient) {
                     }
                     continue;
                 }
-                let host_state = v["state"].as_str();
-                let _ = fleet
-                    .store
-                    .set_vm_state(&r.id, state::PLACED, host_state, None);
+                let _ = fleet.store.set_vm_view(&r.id, v);
+                let _ = fleet.store.set_vm_state(&r.id, state::PLACED, None, None);
             }
             None => match r.fleet_state.as_str() {
                 state::DELETING => {

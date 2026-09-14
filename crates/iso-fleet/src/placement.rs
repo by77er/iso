@@ -51,6 +51,7 @@ mod tests {
             slots_free: free,
             slots_total: total,
             pool_data_percent: 0.0,
+            pool_metadata_percent: 0.0,
             templates: templates.iter().map(|s| s.to_string()).collect(),
             orphans: 0,
             last_error: None,

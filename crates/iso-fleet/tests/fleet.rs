@@ -437,3 +437,51 @@ async fn the_api_is_the_host_api() {
     assert!(doc["paths"]["/vms/{id}/exec"].is_object());
     assert!(doc["paths"]["/vms/{id}/policy"].is_object());
 }
+
+#[tokio::test]
+async fn the_generated_host_client_works_against_the_fleet_unchanged() {
+    let r = Rig::start().await;
+    let c = iso_client::Client::insecure(&r.url);
+    let created = c
+        .create()
+        .body_map(|b| b.template("debian").egress(Some("deny".to_string())))
+        .send()
+        .await
+        .unwrap()
+        .into_inner();
+    let id = created.id.clone();
+
+    // Every read is host-shaped: the typed client deserializes it.
+    let one = c.get_one().id(&id).send().await.unwrap().into_inner();
+    assert_eq!(one.template, "debian");
+    assert_eq!(one.egress, "deny");
+    let list = c.list().send().await.unwrap().into_inner();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, id);
+    let stats = c.stats().send().await.unwrap().into_inner();
+    assert_eq!(stats.slots_total, 16);
+    assert_eq!(stats.vms, 1);
+
+    // And the forwarded calls too.
+    let out = c
+        .guest_exec()
+        .id(&id)
+        .body_map(|b| b.cmd("echo").args(vec!["typed".to_string()]))
+        .send()
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(out.stdout, "typed\n");
+    c.destroy().id(&id).send().await.unwrap();
+    assert!(c.list().send().await.unwrap().into_inner().is_empty());
+
+    // A record without a host view (its host is down) still has the shape.
+    let (id2, _) = r.create("base").await;
+    r.a.down();
+    r.b.down();
+    r.sync().await;
+    let list = c.list().send().await.unwrap().into_inner();
+    assert_eq!(list.iter().filter(|v| v.id == id2).count(), 1);
+    let one = c.get_one().id(&id2).send().await.unwrap().into_inner();
+    assert_eq!(one.template, "base");
+}

@@ -36,6 +36,7 @@ pub struct HostRow {
     pub slots_free: u32,
     pub slots_total: u32,
     pub pool_data_percent: f64,
+    pub pool_metadata_percent: f64,
     pub templates: Vec<String>,
     /// VMs the host has that the fleet did not place.
     pub orphans: u32,
@@ -55,6 +56,9 @@ pub struct VmRow {
     pub labels: serde_json::Value,
     /// The create request as the client sent it, minus the fleet's own fields.
     pub spec: serde_json::Value,
+    /// The host's record of the VM as of the last sync or the last direct
+    /// read: exactly what the host's `GET /vms/{id}` returned.
+    pub view: Option<serde_json::Value>,
 }
 
 pub fn now() -> i64 {
@@ -83,13 +87,13 @@ impl Store {
              CREATE TABLE IF NOT EXISTS hosts (
                 name TEXT PRIMARY KEY, url TEXT NOT NULL, healthy INTEGER NOT NULL DEFAULT 0,
                 last_seen INTEGER, slots_free INTEGER NOT NULL DEFAULT 0, slots_total INTEGER NOT NULL DEFAULT 0,
-                pool_data REAL NOT NULL DEFAULT 0, templates TEXT NOT NULL DEFAULT '[]',
+                pool_data REAL NOT NULL DEFAULT 0, pool_meta REAL NOT NULL DEFAULT 0, templates TEXT NOT NULL DEFAULT '[]',
                 orphans INTEGER NOT NULL DEFAULT 0, last_error TEXT);
              CREATE TABLE IF NOT EXISTS vms (
                 id TEXT PRIMARY KEY, host TEXT NOT NULL, template TEXT NOT NULL,
                 fleet_state TEXT NOT NULL, host_state TEXT, created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL, last_error TEXT, labels TEXT NOT NULL DEFAULT '{}',
-                spec TEXT NOT NULL DEFAULT '{}');
+                spec TEXT NOT NULL DEFAULT '{}', view TEXT);
              CREATE INDEX IF NOT EXISTS vms_host ON vms(host);",
         )?;
         Ok(Self {
@@ -133,7 +137,7 @@ impl Store {
     pub fn list_hosts(&self) -> Result<Vec<HostRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT name, url, healthy, last_seen, slots_free, slots_total, pool_data, templates, orphans, last_error
+            "SELECT name, url, healthy, last_seen, slots_free, slots_total, pool_data, templates, orphans, last_error, pool_meta
              FROM hosts ORDER BY name",
         )?;
         let rows = stmt.query_map([], host_from_row)?;
@@ -143,7 +147,7 @@ impl Store {
     pub fn get_host(&self, name: &str) -> Result<Option<HostRow>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT name, url, healthy, last_seen, slots_free, slots_total, pool_data, templates, orphans, last_error
+            "SELECT name, url, healthy, last_seen, slots_free, slots_total, pool_data, templates, orphans, last_error, pool_meta
              FROM hosts WHERE name=?1",
             params![name],
             host_from_row,
@@ -157,12 +161,13 @@ impl Store {
         slots_free: u32,
         slots_total: u32,
         pool_data: f64,
+        pool_meta: f64,
         templates: &[String],
     ) -> Result<()> {
         self.lock().execute(
-            "UPDATE hosts SET healthy=1, last_seen=?2, slots_free=?3, slots_total=?4, pool_data=?5, templates=?6, last_error=NULL
+            "UPDATE hosts SET healthy=1, last_seen=?2, slots_free=?3, slots_total=?4, pool_data=?5, pool_meta=?7, templates=?6, last_error=NULL
              WHERE name=?1",
-            params![name, now(), slots_free, slots_total, pool_data, serde_json::to_string(templates).unwrap_or_default()],
+            params![name, now(), slots_free, slots_total, pool_data, serde_json::to_string(templates).unwrap_or_default(), pool_meta],
         )?;
         Ok(())
     }
@@ -220,6 +225,16 @@ impl Store {
         Ok(())
     }
 
+    /// Record the host's view of the VM, and its state from it.
+    pub fn set_vm_view(&self, id: &str, view: &serde_json::Value) -> Result<()> {
+        let host_state = view["state"].as_str();
+        self.lock().execute(
+            "UPDATE vms SET view=?2, host_state=COALESCE(?3, host_state), updated_at=?4 WHERE id=?1",
+            params![id, view.to_string(), host_state, now()],
+        )?;
+        Ok(())
+    }
+
     pub fn set_vm_state(
         &self,
         id: &str,
@@ -237,7 +252,7 @@ impl Store {
     pub fn get_vm(&self, id: &str) -> Result<Option<VmRow>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT id, host, template, fleet_state, host_state, created_at, updated_at, last_error, labels, spec FROM vms WHERE id=?1",
+            "SELECT id, host, template, fleet_state, host_state, created_at, updated_at, last_error, labels, spec, view FROM vms WHERE id=?1",
             params![id],
             vm_from_row,
         )
@@ -247,7 +262,7 @@ impl Store {
     pub fn list_vms(&self) -> Result<Vec<VmRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, host, template, fleet_state, host_state, created_at, updated_at, last_error, labels, spec FROM vms ORDER BY created_at",
+            "SELECT id, host, template, fleet_state, host_state, created_at, updated_at, last_error, labels, spec, view FROM vms ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], vm_from_row)?;
         rows.collect()
@@ -256,7 +271,7 @@ impl Store {
     pub fn list_vms_on(&self, host: &str) -> Result<Vec<VmRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, host, template, fleet_state, host_state, created_at, updated_at, last_error, labels, spec FROM vms WHERE host=?1",
+            "SELECT id, host, template, fleet_state, host_state, created_at, updated_at, last_error, labels, spec, view FROM vms WHERE host=?1",
         )?;
         let rows = stmt.query_map(params![host], vm_from_row)?;
         rows.collect()
@@ -279,6 +294,7 @@ fn host_from_row(r: &rusqlite::Row<'_>) -> Result<HostRow> {
         slots_free: r.get(4)?,
         slots_total: r.get(5)?,
         pool_data_percent: r.get(6)?,
+        pool_metadata_percent: r.get(10)?,
         templates: serde_json::from_str(&templates).unwrap_or_default(),
         orphans: r.get(8)?,
         last_error: r.get(9)?,
@@ -288,6 +304,7 @@ fn host_from_row(r: &rusqlite::Row<'_>) -> Result<HostRow> {
 fn vm_from_row(r: &rusqlite::Row<'_>) -> Result<VmRow> {
     let labels: String = r.get(8)?;
     let spec: String = r.get(9)?;
+    let view: Option<String> = r.get(10)?;
     Ok(VmRow {
         id: r.get(0)?,
         host: r.get(1)?,
@@ -300,5 +317,6 @@ fn vm_from_row(r: &rusqlite::Row<'_>) -> Result<VmRow> {
         labels: serde_json::from_str(&labels)
             .unwrap_or(serde_json::Value::Object(Default::default())),
         spec: serde_json::from_str(&spec).unwrap_or(serde_json::Value::Object(Default::default())),
+        view: view.and_then(|v| serde_json::from_str(&v).ok()),
     })
 }
