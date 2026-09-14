@@ -96,3 +96,18 @@ and load, host-enforced capacity, pinning, policy forwarding and validation
 pass-through, exec routed to the right host through the real guest agent,
 delete on both sides, orphan and lost detection, a host going down and
 coming back with its VMs, deferred deletes, and the create grace period.
+
+## Signed policies
+
+The fleet signs the policy of every VM it places or changes, for the host it
+is placed on: `POST /vms` carries a signature at generation 1 for the chosen
+host, `PATCH /vms/{id}/policy` is intercepted, laid over the host's current
+policy exactly as the host will lay it, and signed at the next generation
+(a `signed` field a client sends is ignored). The key is
+`<pki_dir>/policy-signing.pkcs8`, minted on first start; its public half,
+`<pki_dir>/policy-signing.pub`, is what a proxy tier is configured with
+(`[fleet] policy_key_file` in `proxy.toml`). Signatures live
+`policy_ttl_secs` (default a day); the sync loop re-signs a VM's policy when
+a third of that is left, which changes no policy and bumps no generation.
+Hosts store and serve the signature and cannot check it; the tier does, and
+refuses anything else. See the proxy's `DESIGN.md`, "Signed policies".

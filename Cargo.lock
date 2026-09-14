@@ -1148,6 +1148,7 @@ dependencies = [
  "rustls-pki-types",
  "thiserror 2.0.18",
  "time",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1288,6 +1289,7 @@ dependencies = [
  "iso-client",
  "iso-common",
  "iso-controld",
+ "iso-policy",
  "reqwest 0.13.5",
  "rusqlite",
  "rustls",
@@ -1362,7 +1364,11 @@ dependencies = [
 name = "iso-policy"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "iso-common",
+ "ring",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -1409,6 +1415,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "iso-admin-pki",
  "rustls",
  "serde",
  "serde_json",

@@ -96,6 +96,10 @@ struct Rig {
 
 impl Rig {
     async fn start() -> Rig {
+        Self::start_with_ttl(86_400).await
+    }
+    /// `ttl` is how long the fleet's policy signatures live.
+    async fn start_with_ttl(ttl: u64) -> Rig {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let _ = tracing_subscriber::fmt()
             .with_env_filter("info")
@@ -103,7 +107,7 @@ impl Rig {
             .try_init();
         let a = Host::start(&["base"]).await;
         let b = Host::start(&["base", "debian"]).await;
-        let cfg = Config::dev(vec![
+        let mut cfg = Config::dev(vec![
             HostConfig {
                 name: "a".into(),
                 url: a.url(),
@@ -113,6 +117,7 @@ impl Rig {
                 url: b.url(),
             },
         ]);
+        cfg.policy_ttl_secs = ttl;
         let fleet = Fleet::new(cfg).unwrap();
         iso_fleet::sync::sync_once(&fleet).await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -484,4 +489,81 @@ async fn the_generated_host_client_works_against_the_fleet_unchanged() {
     assert_eq!(list.iter().filter(|v| v.id == id2).count(), 1);
     let one = c.get_one().id(&id2).send().await.unwrap().into_inner();
     assert_eq!(one.template, "base");
+}
+
+/// Every policy the fleet places or changes is signed for the VM's host at
+/// the generation the host stores it under; a client cannot supply its own
+/// signature; and the sync loop re-signs an unchanged policy before the
+/// signature expires without bumping the generation.
+#[tokio::test]
+async fn policies_are_signed_for_the_host_and_re_signed_before_they_expire() {
+    use iso_common::identify::SignedPolicy;
+    use iso_policy::signed::Verifier;
+    let r = Rig::start_with_ttl(6).await;
+    let verifier = Verifier::from_b64(&r.fleet.signer.public_key_b64()).unwrap();
+    let signed_of = |v: &Value| -> SignedPolicy {
+        serde_json::from_value(v["signed"].clone()).unwrap_or_else(|e| panic!("no signature on {v}: {e}"))
+    };
+
+    // "debian" is only on host b, so the signature must name b.
+    let (s, v) = r
+        .post("/vms", json!({ "template": "debian", "egress": "proxy", "principal": "alice", "allow": ["api.github.com"] }))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let id = v["id"].as_str().unwrap().to_string();
+    let v = r.host_of(&id).await;
+    let c = verifier.verify(&signed_of(&v)).unwrap();
+    assert_eq!((c.host.as_str(), c.vm.as_str(), c.policy_gen, c.egress.as_str()), ("b", id.as_str(), 1, "proxy"));
+    assert_eq!(c.principal.as_deref(), Some("alice"));
+    assert_eq!(
+        c.rules,
+        iso_policy::RuleSet::from_record(&["api.github.com".to_string()], &[]).unwrap().to_strings(),
+        "the effective rule set, expanded the way the host serves it"
+    );
+    let first_expiry = c.expires;
+
+    // A change is signed at the next generation, laid over the current policy.
+    let (s, body) = r
+        .patch(&format!("/vms/{id}/policy"), json!({ "rules": ["deny https://api.github.com/user/keys"] }))
+        .await;
+    assert_eq!(s, 204, "{body}");
+    let v = r.host_of(&id).await;
+    assert_eq!(v["policy_gen"], 2);
+    let c = verifier.verify(&signed_of(&v)).unwrap();
+    assert_eq!(c.policy_gen, 2);
+    assert_eq!(c.principal.as_deref(), Some("alice"), "kept from the current policy");
+    assert!(c.rules.contains(&"deny https://api.github.com/user/keys".to_string()), "{:?}", c.rules);
+
+    // A signature a client sends is not the fleet's and is replaced.
+    let (s, body) = r
+        .patch(&format!("/vms/{id}/policy"), json!({ "principal": "bob", "signed": { "claims": "AAAA", "sig": "AAAA" } }))
+        .await;
+    assert_eq!(s, 204, "{body}");
+    let v = r.host_of(&id).await;
+    let c = verifier.verify(&signed_of(&v)).unwrap();
+    assert_eq!((c.policy_gen, c.principal.as_deref()), (3, Some("bob")));
+
+    // A signature with a third of its life left is renewed by the sync loop,
+    // at the same generation.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    r.sync().await;
+    let v = r.host_of(&id).await;
+    assert_eq!(v["policy_gen"], 3, "a re-signing changes no policy");
+    let c = verifier.verify(&signed_of(&v)).unwrap();
+    assert!(c.expires > first_expiry + 3, "renewed: {} vs {first_expiry}", c.expires);
+    assert_eq!((c.policy_gen, c.principal.as_deref()), (3, Some("bob")));
+
+    // A change made on the host behind the fleet's back drops the signature,
+    // and the fleet does not bless it on the next pass: only a change made
+    // through the fleet is signed again.
+    let (s, _) = r.b.direct("PATCH", &format!("/vms/{id}/policy"), Some(json!({ "principal": "eve" }))).await;
+    assert_eq!(s, 204);
+    r.sync().await;
+    let v = r.host_of(&id).await;
+    assert_eq!((v["policy_gen"].as_u64(), v["principal"].as_str()), (Some(4), Some("eve")));
+    assert!(v.get("signed").is_none(), "not signed behind the fleet's back: {v}");
+    let (s, _) = r.patch(&format!("/vms/{id}/policy"), json!({ "principal": "alice" })).await;
+    assert_eq!(s, 204);
+    let c = verifier.verify(&signed_of(&r.host_of(&id).await)).unwrap();
+    assert_eq!((c.policy_gen, c.principal.as_deref()), (5, Some("alice")));
 }

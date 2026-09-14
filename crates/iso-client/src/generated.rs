@@ -81,6 +81,8 @@ pub mod types {
         ///`allow wss://host/**`. A rule that does not parse is a 400.
         #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
         pub rules: ::std::vec::Vec<::std::string::String>,
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub signed: ::std::option::Option<SignedPolicyDto>,
         ///A registered template name.
         pub template: ::std::string::String,
         ///Override the template's vCPU count (forces a cold boot).
@@ -299,6 +301,8 @@ pub mod types {
         ///Replace the URI-level rules. A rule that does not parse is a 400.
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub rules: ::std::option::Option<::std::vec::Vec<::std::string::String>>,
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub signed: ::std::option::Option<SignedPolicyDto>,
     }
 
     impl PolicyRequest {
@@ -320,6 +324,20 @@ pub mod types {
 
     impl PortForward {
         pub fn builder() -> builder::PortForward {
+            Default::default()
+        }
+    }
+
+    ///A policy as a fleet signed it: base64 claims and an ed25519 signature
+    ///over those bytes. Opaque here.
+    #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug)]
+    pub struct SignedPolicyDto {
+        pub claims: ::std::string::String,
+        pub sig: ::std::string::String,
+    }
+
+    impl SignedPolicyDto {
+        pub fn builder() -> builder::SignedPolicyDto {
             Default::default()
         }
     }
@@ -422,6 +440,8 @@ pub mod types {
         pub rootfs_device: ::std::option::Option<::std::string::String>,
         ///URI-level rules on top of `allow`, in `iso-policy` syntax.
         pub rules: ::std::vec::Vec<::std::string::String>,
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub signed: ::std::option::Option<SignedPolicyDto>,
         ///Placement slot; absent while a durable VM is stopped.
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub slot: ::std::option::Option<i32>,
@@ -674,6 +694,10 @@ pub mod types {
                 ::std::vec::Vec<::std::string::String>,
                 ::std::string::String,
             >,
+            signed: ::std::result::Result<
+                ::std::option::Option<super::SignedPolicyDto>,
+                ::std::string::String,
+            >,
             template: ::std::result::Result<::std::string::String, ::std::string::String>,
             vcpus: ::std::result::Result<::std::option::Option<i32>, ::std::string::String>,
         }
@@ -691,6 +715,7 @@ pub mod types {
                     principal: Ok(Default::default()),
                     restart: Ok(Default::default()),
                     rules: Ok(Default::default()),
+                    signed: Ok(Default::default()),
                     template: Err("no value supplied for template".to_string()),
                     vcpus: Ok(Default::default()),
                 }
@@ -800,6 +825,16 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for rules: {e}"));
                 self
             }
+            pub fn signed<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<super::SignedPolicyDto>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.signed = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for signed: {e}"));
+                self
+            }
             pub fn template<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<::std::string::String>,
@@ -838,6 +873,7 @@ pub mod types {
                     principal: value.principal?,
                     restart: value.restart?,
                     rules: value.rules?,
+                    signed: value.signed?,
                     template: value.template?,
                     vcpus: value.vcpus?,
                 })
@@ -857,6 +893,7 @@ pub mod types {
                     principal: Ok(value.principal),
                     restart: Ok(value.restart),
                     rules: Ok(value.rules),
+                    signed: Ok(value.signed),
                     template: Ok(value.template),
                     vcpus: Ok(value.vcpus),
                 }
@@ -1459,6 +1496,10 @@ pub mod types {
                 ::std::option::Option<::std::vec::Vec<::std::string::String>>,
                 ::std::string::String,
             >,
+            signed: ::std::result::Result<
+                ::std::option::Option<super::SignedPolicyDto>,
+                ::std::string::String,
+            >,
         }
 
         impl ::std::default::Default for PolicyRequest {
@@ -1468,6 +1509,7 @@ pub mod types {
                     egress: Ok(Default::default()),
                     principal: Ok(Default::default()),
                     rules: Ok(Default::default()),
+                    signed: Ok(Default::default()),
                 }
             }
         }
@@ -1517,6 +1559,16 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for rules: {e}"));
                 self
             }
+            pub fn signed<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<super::SignedPolicyDto>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.signed = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for signed: {e}"));
+                self
+            }
         }
 
         impl ::std::convert::TryFrom<PolicyRequest> for super::PolicyRequest {
@@ -1529,6 +1581,7 @@ pub mod types {
                     egress: value.egress?,
                     principal: value.principal?,
                     rules: value.rules?,
+                    signed: value.signed?,
                 })
             }
         }
@@ -1540,6 +1593,7 @@ pub mod types {
                     egress: Ok(value.egress),
                     principal: Ok(value.principal),
                     rules: Ok(value.rules),
+                    signed: Ok(value.signed),
                 }
             }
         }
@@ -1613,6 +1667,65 @@ pub mod types {
                     host_port: Ok(value.host_port),
                     proto: Ok(value.proto),
                     vm_port: Ok(value.vm_port),
+                }
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct SignedPolicyDto {
+            claims: ::std::result::Result<::std::string::String, ::std::string::String>,
+            sig: ::std::result::Result<::std::string::String, ::std::string::String>,
+        }
+
+        impl ::std::default::Default for SignedPolicyDto {
+            fn default() -> Self {
+                Self {
+                    claims: Err("no value supplied for claims".to_string()),
+                    sig: Err("no value supplied for sig".to_string()),
+                }
+            }
+        }
+
+        impl SignedPolicyDto {
+            pub fn claims<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.claims = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for claims: {e}"));
+                self
+            }
+            pub fn sig<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.sig = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for sig: {e}"));
+                self
+            }
+        }
+
+        impl ::std::convert::TryFrom<SignedPolicyDto> for super::SignedPolicyDto {
+            type Error = super::error::ConversionError;
+            fn try_from(
+                value: SignedPolicyDto,
+            ) -> ::std::result::Result<Self, super::error::ConversionError> {
+                Ok(Self {
+                    claims: value.claims?,
+                    sig: value.sig?,
+                })
+            }
+        }
+
+        impl ::std::convert::From<super::SignedPolicyDto> for SignedPolicyDto {
+            fn from(value: super::SignedPolicyDto) -> Self {
+                Self {
+                    claims: Ok(value.claims),
+                    sig: Ok(value.sig),
                 }
             }
         }
@@ -2078,6 +2191,10 @@ pub mod types {
                 ::std::vec::Vec<::std::string::String>,
                 ::std::string::String,
             >,
+            signed: ::std::result::Result<
+                ::std::option::Option<super::SignedPolicyDto>,
+                ::std::string::String,
+            >,
             slot: ::std::result::Result<::std::option::Option<i32>, ::std::string::String>,
             state: ::std::result::Result<::std::string::String, ::std::string::String>,
             tap: ::std::result::Result<
@@ -2101,6 +2218,7 @@ pub mod types {
                     restart: Err("no value supplied for restart".to_string()),
                     rootfs_device: Ok(Default::default()),
                     rules: Err("no value supplied for rules".to_string()),
+                    signed: Ok(Default::default()),
                     slot: Ok(Default::default()),
                     state: Err("no value supplied for state".to_string()),
                     tap: Ok(Default::default()),
@@ -2222,6 +2340,16 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for rules: {e}"));
                 self
             }
+            pub fn signed<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<super::SignedPolicyDto>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.signed = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for signed: {e}"));
+                self
+            }
             pub fn slot<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<::std::option::Option<i32>>,
@@ -2279,6 +2407,7 @@ pub mod types {
                     restart: value.restart?,
                     rootfs_device: value.rootfs_device?,
                     rules: value.rules?,
+                    signed: value.signed?,
                     slot: value.slot?,
                     state: value.state?,
                     tap: value.tap?,
@@ -2301,6 +2430,7 @@ pub mod types {
                     restart: Ok(value.restart),
                     rootfs_device: Ok(value.rootfs_device),
                     rules: Ok(value.rules),
+                    signed: Ok(value.signed),
                     slot: Ok(value.slot),
                     state: Ok(value.state),
                     tap: Ok(value.tap),

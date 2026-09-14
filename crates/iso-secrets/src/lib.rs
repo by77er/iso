@@ -206,6 +206,7 @@ pub async fn serve_https<P: SecretProvider + ?Sized>(
     provider: Arc<P>,
     listener: tokio::net::TcpListener,
     cfg: Arc<rustls::ServerConfig>,
+    allow: iso_rpc::ClientAllow,
 ) -> std::io::Result<()> {
     iso_rpc::serve_https(
         listener,
@@ -221,6 +222,7 @@ pub async fn serve_https<P: SecretProvider + ?Sized>(
                 }
             }
         }),
+        allow,
     )
     .await
 }

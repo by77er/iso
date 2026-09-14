@@ -1280,6 +1280,14 @@
             },
             "description": "URI-level rules, e.g. `allow https://api.github.com/**` or\n`deny https://api.github.com/user/keys`. Deny wins; nothing matching\nis denied. `allow` hosts are sugar for `allow https://host/**` plus\n`allow wss://host/**`. A rule that does not parse is a 400."
           },
+          "signed": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SignedPolicyDto"
+              }
+            ],
+            "nullable": true
+          },
           "template": {
             "type": "string",
             "description": "A registered template name."
@@ -1518,6 +1526,14 @@
             },
             "description": "Replace the URI-level rules. A rule that does not parse is a 400.",
             "nullable": true
+          },
+          "signed": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SignedPolicyDto"
+              }
+            ],
+            "nullable": true
           }
         }
       },
@@ -1543,6 +1559,22 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          }
+        }
+      },
+      "SignedPolicyDto": {
+        "type": "object",
+        "description": "A policy as a fleet signed it: base64 claims and an ed25519 signature\nover those bytes. Opaque here.",
+        "required": [
+          "claims",
+          "sig"
+        ],
+        "properties": {
+          "claims": {
+            "type": "string"
+          },
+          "sig": {
+            "type": "string"
           }
         }
       },
@@ -1765,6 +1797,14 @@
               "type": "string"
             },
             "description": "URI-level rules on top of `allow`, in `iso-policy` syntax."
+          },
+          "signed": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SignedPolicyDto"
+              }
+            ],
+            "nullable": true
           },
           "slot": {
             "type": "integer",

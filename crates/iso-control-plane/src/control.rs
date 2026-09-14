@@ -159,6 +159,9 @@ where
         }
 
         let id = req.id.unwrap_or_else(random_vmid);
+        if let Some(signed) = &req.signed {
+            check_signed(signed, id, 1, req.egress, req.principal.as_deref(), &req.allow, &req.rules)?;
+        }
         // Hold this VM's lock from the moment its id exists, so a concurrent
         // supervise/handle_exit can't act on the half-created record.
         let lock = self.vm_lock(id);
@@ -214,6 +217,7 @@ where
             allow: req.allow.clone(),
             rules: req.rules.clone(),
             policy_gen: 1,
+            signed: req.signed.clone(),
             // A new VM has never suspended; it resumes from its template.
             snapshot: None,
         };
@@ -636,6 +640,14 @@ where
     /// unchanged. Mutable at runtime (e.g. set per agent turn). Every call
     /// bumps the policy generation, which is what tells the proxy edge to
     /// close connections it holds at the old one. Returns the new generation.
+    ///
+    /// `signed` is the fleet's signature over the resulting policy. It must
+    /// describe this VM at the generation this change produces, or, when
+    /// nothing changes, at the current generation: that is a re-signing
+    /// before the old signature expires, and bumps nothing. A change without
+    /// a signature clears the stored one, since it no longer describes the
+    /// policy; a tier that verifies then refuses the VM until the fleet
+    /// signs again, which is the point.
     pub async fn set_policy(
         &self,
         id: VmId,
@@ -643,6 +655,7 @@ where
         allow: Option<Vec<String>>,
         rules: Option<Vec<String>>,
         egress: Option<EgressMode>,
+        signed: Option<iso_common::identify::SignedPolicy>,
     ) -> Result<u64> {
         let lock = self.vm_lock(id);
         let _guard = lock.lock().await;
@@ -657,12 +670,28 @@ where
         validate_policy(&new_allow, &new_rules)?;
         let new_egress = egress.unwrap_or(rec.egress);
         let egress_changed = new_egress != rec.egress;
+        let unchanged = new_principal == rec.principal
+            && new_allow == rec.allow
+            && new_rules == rec.rules
+            && !egress_changed;
+        if let Some(signed) = &signed {
+            let claimed_gen = iso_policy::signed::claims_unverified(signed)
+                .map_err(|e| Error::SignedMismatch(e.to_string()))?
+                .policy_gen;
+            if unchanged && claimed_gen == rec.policy_gen {
+                check_signed(signed, id, rec.policy_gen, new_egress, new_principal.as_deref(), &new_allow, &new_rules)?;
+                self.store.refresh_signed(id, signed)?;
+                return Ok(rec.policy_gen);
+            }
+            check_signed(signed, id, rec.policy_gen + 1, new_egress, new_principal.as_deref(), &new_allow, &new_rules)?;
+        }
         let new_gen = self.store.update_policy(
             id,
             new_principal.as_deref(),
             &new_allow,
             &new_rules,
             new_egress,
+            signed.as_ref(),
         )?;
 
         // The policy is read live by the proxy/DNS via `identify`; only an
@@ -860,6 +889,43 @@ fn validate_policy(allow: &[String], rules: &[String]) -> Result<()> {
     iso_policy::RuleSet::from_record(allow, rules)
         .map(|_| ())
         .map_err(|e| Error::InvalidRule(e.to_string()))
+}
+
+/// Whether a fleet's signed claims describe exactly the policy this host is
+/// about to store: same VM, generation, mode, principal and effective rules.
+/// The host cannot check the signature (it holds no key, on purpose) but it
+/// can refuse to file a signature under a policy it does not describe, so
+/// what the edge relays and what `identify` answers never disagree.
+fn check_signed(
+    signed: &iso_common::identify::SignedPolicy,
+    id: VmId,
+    policy_gen: u64,
+    egress: EgressMode,
+    principal: Option<&str>,
+    allow: &[String],
+    rules: &[String],
+) -> Result<()> {
+    let c = iso_policy::signed::claims_unverified(signed).map_err(|e| Error::SignedMismatch(e.to_string()))?;
+    let effective = iso_policy::RuleSet::from_record(allow, rules)
+        .map_err(|e| Error::InvalidRule(e.to_string()))?
+        .to_strings();
+    let mut why = Vec::new();
+    if c.vm != id.to_string() {
+        why.push(format!("it names vm {} not {id}", c.vm));
+    }
+    if c.policy_gen != policy_gen {
+        why.push(format!("it is at generation {} not {policy_gen}", c.policy_gen));
+    }
+    if c.egress != crate::types::egress_str(egress) {
+        why.push(format!("egress {:?} not {:?}", c.egress, crate::types::egress_str(egress)));
+    }
+    if c.principal.as_deref() != principal {
+        why.push(format!("principal {:?} not {:?}", c.principal, principal));
+    }
+    if c.rules != effective {
+        why.push(format!("rules {:?} not {:?}", c.rules, effective));
+    }
+    if why.is_empty() { Ok(()) } else { Err(Error::SignedMismatch(why.join("; "))) }
 }
 
 /// Why one `set_clock` attempt did not succeed: the channel was not there yet
@@ -1489,7 +1555,7 @@ mod tests {
 
         let (fwd, pol) = tokio::join!(
             cp.add_forward(id, 90, Protocol::Tcp),
-            cp.set_policy(id, None, None, None, Some(EgressMode::Allow)),
+            cp.set_policy(id, None, None, None, Some(EgressMode::Allow), None),
         );
         fwd.unwrap();
         pol.unwrap();

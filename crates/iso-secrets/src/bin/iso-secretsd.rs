@@ -61,12 +61,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(listen) = std::env::var("ISO_SECRETS_LISTEN") {
         let creds = iso_admin_pki::Creds::from_env()?
             .ok_or("ISO_SECRETS_LISTEN needs ISO_TLS_CA, ISO_TLS_CERT and ISO_TLS_KEY")?;
+        // Only the proxy tier reads headers here; an edge or a host holds a
+        // certificate from the same CA and is refused by name.
+        let allow = iso_rpc::ClientAllow::parse(
+            &std::env::var("ISO_ALLOWED_CLIENTS")
+                .map_err(|_| "ISO_SECRETS_LISTEN needs ISO_ALLOWED_CLIENTS=<name>[,<name>...]: the client certificate names allowed to read headers")?,
+        )?;
         let cfg = creds.server_config()?;
         let listener = tokio::net::TcpListener::bind(iso_rpc::parse_listen(&listen)?).await?;
         tracing::info!("iso-secretsd: https://{listen}/headers (mutual TLS)");
         let provider = provider.clone();
         tokio::spawn(async move {
-            if let Err(e) = iso_secrets::serve_https(provider, listener, cfg).await {
+            if let Err(e) = iso_secrets::serve_https(provider, listener, cfg, allow).await {
                 tracing::error!("iso-secretsd: https listener exited: {e}");
             }
         });

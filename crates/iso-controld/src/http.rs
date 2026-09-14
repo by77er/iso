@@ -56,7 +56,7 @@ impl From<CpError> for ApiError {
             | CpError::PortsExhausted
             | CpError::PoolFull { .. }
             | CpError::InvalidState { .. } => StatusCode::CONFLICT,
-            CpError::InvalidRule(_) => StatusCode::BAD_REQUEST,
+            CpError::InvalidRule(_) | CpError::SignedMismatch(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(code, e.to_string())
@@ -140,6 +140,30 @@ struct CreateVmRequest {
     /// `allow wss://host/**`. A rule that does not parse is a 400.
     #[serde(default)]
     rules: Vec<String>,
+    /// A fleet's signature over exactly this policy at generation 1. Stored
+    /// and served to the proxy edge unchanged; a 400 if it describes
+    /// anything else.
+    #[serde(default)]
+    signed: Option<SignedPolicyDto>,
+}
+
+/// A policy as a fleet signed it: base64 claims and an ed25519 signature
+/// over those bytes. Opaque here.
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+struct SignedPolicyDto {
+    claims: String,
+    sig: String,
+}
+
+impl From<SignedPolicyDto> for iso_common::identify::SignedPolicy {
+    fn from(d: SignedPolicyDto) -> Self {
+        Self { claims: d.claims, sig: d.sig }
+    }
+}
+impl From<iso_common::identify::SignedPolicy> for SignedPolicyDto {
+    fn from(s: iso_common::identify::SignedPolicy) -> Self {
+        Self { claims: s.claims, sig: s.sig }
+    }
 }
 
 /// The id of a newly created VM.
@@ -192,6 +216,9 @@ struct Vm {
     rules: Vec<String>,
     /// Bumped on every policy change.
     policy_gen: u64,
+    /// The fleet's signature over this policy, when a fleet placed the VM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signed: Option<SignedPolicyDto>,
 }
 
 /// Change a running VM's egress policy. Omitted fields are left unchanged.
@@ -207,6 +234,11 @@ struct PolicyRequest {
     /// `allow`, `proxy` or `deny`; anything else leaves the mode unchanged.
     #[serde(default)]
     egress: Option<String>,
+    /// A fleet's signature over the resulting policy at the next generation,
+    /// or over the unchanged policy at the current one (a re-signing, which
+    /// bumps nothing). A 400 if it describes anything else.
+    #[serde(default)]
+    signed: Option<SignedPolicyDto>,
 }
 
 /// Which path inside the guest a file operation targets.
@@ -351,6 +383,7 @@ fn to_req(r: CreateVmRequest, id: Option<VmId>) -> CreateVm {
         principal: r.principal,
         allow: r.allow,
         rules: r.rules,
+        signed: r.signed.map(Into::into),
     }
 }
 
@@ -379,6 +412,7 @@ fn vm_resp(r: &VmRecord) -> Vm {
         allow: r.allow.clone(),
         rules: r.rules.clone(),
         policy_gen: r.policy_gen,
+        signed: r.signed.clone().map(Into::into),
     }
 }
 
@@ -535,7 +569,7 @@ where
     R: iso_common::runtime::VmRuntime + Send + Sync + 'static,
 {
     let egress = req.egress.as_deref().and_then(egress_parse);
-    cp.set_policy(parse_id(&id)?, req.principal, req.allow, req.rules, egress)
+    cp.set_policy(parse_id(&id)?, req.principal, req.allow, req.rules, egress, req.signed.map(Into::into))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -788,7 +822,7 @@ where
     ),
     paths(create, list, get_one, start, stop, suspend, halt, terminate, retire_suspension, destroy, set_policy, add_forward, remove_forward,
         register_template, list_templates, stats, agent_info, guest_exec, read_file, write_file, remove_path, list_dir),
-    components(schemas(ErrorBody, PortForward, CreateVmRequest, CreatedVm, AddForwardRequest, Vm, PolicyRequest,
+    components(schemas(ErrorBody, PortForward, CreateVmRequest, CreatedVm, AddForwardRequest, Vm, PolicyRequest, SignedPolicyDto,
         WriteFileRequest, Written, DirListing, Stats, TemplateRequest, Template,
         ExecRequest, ExecResult, AgentInfo, FileContent, DirEntry, iso_guest_proto::FileKind)),
     tags(
@@ -1028,6 +1062,88 @@ mod guest_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT, "stopped vm has no guest channel");
+    }
+
+    /// The host stores a fleet's signature only when it describes the policy
+    /// the host stores: same VM, generation, mode, principal and rules. A
+    /// re-signing of an unchanged policy replaces the signature and bumps
+    /// nothing; a change without a signature drops the old one.
+    #[tokio::test]
+    async fn a_fleet_signature_is_kept_only_when_it_describes_the_policy() {
+        use iso_policy::signed::{PolicyClaims, Signer, claims_unverified};
+        let app = app();
+        let (signer, _) = Signer::generate().unwrap();
+        let id = iso_common::VmId::from_u128(7).to_string();
+        let claims = |policy_gen: u64, principal: &str| PolicyClaims {
+            host: "host-a".into(),
+            vm: id.clone(),
+            egress: "proxy".into(),
+            principal: Some(principal.into()),
+            rules: iso_policy::RuleSet::from_record(&["api.github.com".to_string()], &[]).unwrap().to_strings(),
+            policy_gen,
+            expires: u64::MAX,
+        };
+        let create = |signed: serde_json::Value| {
+            post("/vms", serde_json::json!({
+                "id": id, "template": "base", "egress": "proxy", "principal": "alice",
+                "allow": ["api.github.com"], "signed": signed
+            }))
+        };
+        let vm = |app: &axum::Router| {
+            let app = app.clone();
+            let path = format!("/vms/{id}");
+            async move { body_json(app.oneshot(get(&path)).await.unwrap()).await }
+        };
+
+        // A signature over some other policy is refused before anything is allocated.
+        let resp = app.clone().oneshot(create(serde_json::to_value(signer.sign(&claims(1, "bob"))).unwrap())).await.unwrap();
+        assert_eq!(resp.status(), 400);
+        let err = body_json(resp).await["error"].as_str().unwrap().to_string();
+        assert!(err.contains("principal"), "{err}");
+        assert_eq!(app.clone().oneshot(get(&format!("/vms/{id}"))).await.unwrap().status(), 404);
+
+        // The matching one is stored and served with the record.
+        let signed = signer.sign(&claims(1, "alice"));
+        let resp = app.clone().oneshot(create(serde_json::to_value(&signed).unwrap())).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(vm(&app).await["signed"], serde_json::to_value(&signed).unwrap());
+
+        // A change must be signed at the generation it produces.
+        let change = |principal: &str, signed: serde_json::Value| {
+            patch(&format!("/vms/{id}/policy"), serde_json::json!({ "principal": principal, "signed": signed }))
+        };
+        let resp = app.clone().oneshot(change("bob", serde_json::to_value(signer.sign(&claims(3, "bob"))).unwrap())).await.unwrap();
+        assert_eq!(resp.status(), 400, "generation 3 is not what this change produces");
+        assert_eq!(vm(&app).await["policy_gen"], 1);
+        let resp = app.clone().oneshot(change("bob", serde_json::to_value(signer.sign(&claims(2, "bob"))).unwrap())).await.unwrap();
+        assert_eq!(resp.status(), 204);
+        let v = vm(&app).await;
+        assert_eq!(v["policy_gen"], 2);
+        let stored: iso_common::identify::SignedPolicy = serde_json::from_value(v["signed"].clone()).unwrap();
+        assert_eq!(claims_unverified(&stored).unwrap().principal.as_deref(), Some("bob"));
+
+        // Re-signing the unchanged policy at the current generation bumps nothing.
+        let fresh = signer.sign(&claims(2, "bob"));
+        let resp = app
+            .clone()
+            .oneshot(patch(&format!("/vms/{id}/policy"), serde_json::json!({ "signed": fresh })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        let v = vm(&app).await;
+        assert_eq!(v["policy_gen"], 2);
+        assert_eq!(v["signed"], serde_json::to_value(&fresh).unwrap());
+
+        // A change with no signature drops the one that no longer describes the policy.
+        let resp = app
+            .clone()
+            .oneshot(patch(&format!("/vms/{id}/policy"), serde_json::json!({ "principal": "carol" })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        let v = vm(&app).await;
+        assert_eq!(v["policy_gen"], 3);
+        assert!(v.get("signed").is_none(), "{v}");
     }
 
     #[tokio::test]

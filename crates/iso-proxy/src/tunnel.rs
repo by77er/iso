@@ -73,6 +73,7 @@ mod tests {
             principal: Some("alice".into()),
             rules: vec!["allow https://api.github.com/**".into(), "deny https://api.github.com/user/keys".into()],
             policy_gen: 7,
+            signed: None,
         };
         let src: SocketAddr = "172.21.0.3:41000".parse().unwrap();
         let h = encode(src, &p).unwrap();

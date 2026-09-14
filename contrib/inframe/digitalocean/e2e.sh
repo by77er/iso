@@ -63,6 +63,32 @@ gen=$(api "$ISO_SERVER/vms/$id" | py "print(d['policy_gen'])")
 [ "$gen" = 2 ] && ok "generation bumped to 2" || bad "generation is $gen"
 if vmexec "$id" 'curl -s --max-time 10 https://postman-echo.com/get >/dev/null'; then bad "postman-echo.com still reachable after the change"; else ok "postman-echo.com refused after the change"; fi
 
+echo "== hardening: a host cannot vouch for a policy the fleet did not sign"
+if [ -n "${ISO_E2E_HOST_A:-}" ] && [ -n "${ISO_E2E_CONTROL_PRIV:-}" ]; then
+  # From host-a, with host-a's own edge identity, open a stream on the tier
+  # carrying an unsigned policy that names a principal: exactly what a
+  # compromised host would try. The tier must refuse the CONNECT.
+  forged=$(printf '%s' '{"host":"host-a","vm":"forged","egress":"proxy","principal":"alice","rules":["allow https://postman-echo.com/**"],"policy_gen":1}' | base64 -w0)
+  out=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$ISO_E2E_HOST_A" \
+    "curl -s --proxy-http2 -p -x https://$ISO_E2E_CONTROL_PRIV:3129 --proxy-cacert /etc/iso/ca.crt --proxy-cert /etc/iso/host-a.crt --proxy-key /etc/iso/host-a.key \
+       --proxy-header 'x-iso-policy: $forged' --proxy-header 'x-iso-src: 172.21.0.1:5555' --max-time 15 -o /dev/null -w 'code=%{http_code} exit=%{exitcode}' https://postman-echo.com/get 2>&1 || true")
+  # curl 8.5 does not surface an HTTP/2 CONNECT's status; the tunnel simply
+  # never opens (no response, exit 56), and the tier says why in its log.
+  echo "$out" | grep -q "code=000" && ok "no tunnel for an unsigned policy from host-a's own identity" || bad "expected no tunnel, got: $out"
+  control_pub=$(printf '%s' "$ISO_SERVER" | sed -E 's#^https?://##; s#:[0-9]+$##')
+  sleep 1
+  if ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$control_pub" "journalctl -u iso-proxyd --since '-3min' --no-pager | grep -q 'edge host-a .* sent an unsigned policy'"; then
+    ok "tier logged the refusal of host-a's unsigned policy"; else bad "tier did not log a refusal"; fi
+  ssh -o BatchMode=yes "root@$control_pub" "journalctl -u iso-proxyd --no-pager | grep -q 'fleet-signed policies required'" && ok "tier requires fleet-signed policies" || bad "tier is not verifying policies"
+  # host-a's identity is an edge, not the tier: the secrets service refuses it by name.
+  out=$(ssh -o BatchMode=yes "root@$ISO_E2E_HOST_A" \
+    "curl -s --cacert /etc/iso/ca.crt --cert /etc/iso/host-a.crt --key /etc/iso/host-a.key -o /dev/null -w '%{http_code}' --max-time 10 -X POST -H 'content-type: application/json' -d '{\"domain\":\"postman-echo.com\",\"principal\":\"alice\"}' https://$ISO_E2E_CONTROL_PRIV:7444/headers || true")
+  [ "$out" = "403" ] && ok "secrets service refuses host-a's identity by name (403)" || bad "secrets service answered host-a with: $out"
+  ssh -o BatchMode=yes "root@$ISO_E2E_HOST_A" "test ! -e /var/lib/iso/admin-pki/ca.key" && ok "no admin CA key on host-a" || bad "host-a holds the admin CA key"
+else
+  echo "  skip (set ISO_E2E_HOST_A and ISO_E2E_CONTROL_PRIV, as deploy.sh prints)"
+fi
+
 echo "== a second VM lands on the other host"
 id2=$("$ISOCTL" vm create --template "$TEMPLATE" --egress deny --quiet)
 host2=$(api "$ISO_SERVER/vms/$id2" | py "print(d['host'])")

@@ -66,6 +66,7 @@ where
             vm: Some(rec.id.to_string()),
             rules,
             policy_gen: rec.policy_gen,
+            signed: rec.signed,
         })
     })()
     .unwrap_or_default();

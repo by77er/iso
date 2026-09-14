@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, get, patch, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 
@@ -23,6 +23,7 @@ pub fn router(fleet: Shared) -> Router {
     Router::new()
         .route("/vms", post(create).get(list))
         .route("/vms/{id}", get(get_one).delete(delete_one))
+        .route("/vms/{id}/policy", patch(set_policy))
         .route("/vms/{id}/{*rest}", any(forward))
         .route("/hosts", get(hosts))
         .route("/stats", get(stats))
@@ -94,6 +95,11 @@ async fn create(
         o.remove("id");
     }
     let labels = body.get("labels").cloned().unwrap_or_else(|| json!({}));
+    // The policy as the client gave it, checked here so a bad rule is a 400
+    // before anything is recorded, and signed below for whichever host takes
+    // the VM.
+    let policy = PolicyFields::from_create(&body);
+    policy.check().map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
 
     let hosts = fleet.store.list_hosts()?;
     let candidates = placement::candidates(&hosts, &template, pin.as_deref());
@@ -125,6 +131,9 @@ async fn create(
         let client = fleet
             .host(&host.name)
             .ok_or_else(|| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "host vanished".into()))?;
+        // Signed for this host by name: the tier accepts it only from the
+        // edge whose certificate carries that name.
+        body["signed"] = json!(policy.sign(&fleet, &host.name, &id, 1)?);
         match client.create(&body).await {
             Ok((status, resp)) if status.is_success() => {
                 fleet
@@ -257,6 +266,167 @@ async fn delete_one(
                 .into_response())
         }
     }
+}
+
+/// The policy fields of a create or a policy change, as the host takes them.
+#[derive(Clone, Debug, Default)]
+struct PolicyFields {
+    egress: String,
+    principal: Option<String>,
+    allow: Vec<String>,
+    rules: Vec<String>,
+}
+
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+impl PolicyFields {
+    /// From a create body: the host's defaults for what is absent.
+    fn from_create(body: &Value) -> Self {
+        let egress = match body["egress"].as_str() {
+            Some(e) if e == "allow" || e == "proxy" || e == "deny" => e.to_string(),
+            _ => "deny".to_string(),
+        };
+        Self {
+            egress,
+            principal: body["principal"].as_str().map(str::to_string),
+            allow: strings(&body["allow"]),
+            rules: strings(&body["rules"]),
+        }
+    }
+
+    /// From a host's record of a VM, as `GET /vms/{id}` returns it.
+    fn from_view(view: &Value) -> Self {
+        Self {
+            egress: view["egress"].as_str().unwrap_or("deny").to_string(),
+            principal: view["principal"].as_str().map(str::to_string),
+            allow: strings(&view["allow"]),
+            rules: strings(&view["rules"]),
+        }
+    }
+
+    /// A policy change laid over the current policy, the way the host merges
+    /// it: given fields replace, absent ones stay. An `egress` the host would
+    /// not recognise leaves the mode unchanged, as on the host.
+    fn patched(&self, change: &Value) -> Self {
+        let mut out = self.clone();
+        if let Some(p) = change["principal"].as_str() {
+            out.principal = Some(p.to_string());
+        }
+        if change["allow"].is_array() {
+            out.allow = strings(&change["allow"]);
+        }
+        if change["rules"].is_array() {
+            out.rules = strings(&change["rules"]);
+        }
+        if let Some(e) = change["egress"].as_str()
+            && (e == "allow" || e == "proxy" || e == "deny")
+        {
+            out.egress = e.to_string();
+        }
+        out
+    }
+
+    fn check(&self) -> Result<(), String> {
+        iso_policy::RuleSet::from_record(&self.allow, &self.rules)
+            .map(|_| ())
+            .map_err(|e| format!("invalid rule: {e}"))
+    }
+
+    fn sign(&self, fleet: &Fleet, host: &str, vm: &str, policy_gen: u64) -> Result<iso_policy::signed::SignedPolicy, ApiError> {
+        fleet
+            .sign_policy(host, vm, &self.egress, self.principal.as_deref(), &self.allow, &self.rules, policy_gen)
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid rule: {e}")))
+    }
+}
+
+/// `PATCH /vms/{id}/policy`, signed. The change is laid over the host's
+/// current policy exactly as the host will lay it, signed at the next
+/// generation for the VM's host, and sent on with the signature. A client's
+/// own `signed` field is ignored: only the fleet signs.
+async fn set_policy(
+    State(fleet): State<Shared>,
+    Path(id): Path<String>,
+    Json(mut change): Json<Value>,
+) -> Result<Response, ApiError> {
+    let row = fleet
+        .store
+        .get_vm(&id)?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no such vm".into()))?;
+    if row.fleet_state != state::PLACED && row.fleet_state != state::CREATING {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!("vm is {} on {}", row.fleet_state, row.host),
+        ));
+    }
+    let client = fleet.host(&row.host).ok_or_else(|| {
+        ApiError(StatusCode::CONFLICT, format!("host {} is no longer configured", row.host))
+    })?;
+    let unreachable = |e: CallError| {
+        let _ = fleet.store.host_unreachable(&row.host, &e.to_string());
+        ApiError(StatusCode::BAD_GATEWAY, format!("{}: {e}", row.host))
+    };
+    // The host's current record, fresh: the generation and the fields the
+    // change is laid over must be the host's, not a stale view.
+    let (status, _, bytes) = client
+        .forward("GET", &format!("/vms/{id}"), None, Bytes::new())
+        .await
+        .map_err(unreachable)?;
+    if status != StatusCode::OK {
+        return Err(ApiError(status, format!("{}: has no vm {id}", row.host)));
+    }
+    let view: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{}: bad record: {e}", row.host)))?;
+    let current_gen = view["policy_gen"].as_u64().unwrap_or(1);
+    let next = PolicyFields::from_view(&view).patched(&change);
+    next.check().map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    if let Some(o) = change.as_object_mut() {
+        o.insert("signed".into(), json!(next.sign(&fleet, &row.host, &id, current_gen + 1)?));
+    }
+    let ct = HeaderValue::from_static("application/json");
+    let (status, ct, bytes) = client
+        .forward("PATCH", &format!("/vms/{id}/policy"), Some(&ct), Bytes::from(change.to_string()))
+        .await
+        .map_err(unreachable)?;
+    if status.is_success()
+        && let Ok((StatusCode::OK, _, body)) = client
+            .forward("GET", &format!("/vms/{id}"), None, Bytes::new())
+            .await
+        && let Ok(v) = serde_json::from_slice::<Value>(&body)
+    {
+        let _ = fleet.store.set_vm_view(&id, &v);
+    }
+    let mut resp = Response::builder().status(status);
+    if let Some(ct) = ct {
+        resp = resp.header(http::header::CONTENT_TYPE, ct);
+    }
+    Ok(resp.body(Body::from(bytes)).unwrap())
+}
+
+/// Renew this fleet's own signature on a VM's policy, for the sync loop
+/// when it is about to expire. What is signed is what the fleet signed
+/// before, with a new expiry: never what the host currently reports, so a
+/// change made behind the fleet's back stays unsigned until it is made
+/// through the fleet. A host whose policy no longer matches answers 400.
+pub(crate) async fn refresh_signature(
+    fleet: &Fleet,
+    client: &crate::hosts::HostClient,
+    claims: &iso_policy::signed::PolicyClaims,
+) -> Result<(), String> {
+    let id = &claims.vm;
+    let body = json!({ "signed": fleet.resign(claims) });
+    let ct = HeaderValue::from_static("application/json");
+    let (status, _, bytes) = client
+        .forward("PATCH", &format!("/vms/{id}/policy"), Some(&ct), Bytes::from(body.to_string()))
+        .await
+        .map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("host answered {status}: {}", String::from_utf8_lossy(&bytes)));
+    }
+    Ok(())
 }
 
 async fn forward(

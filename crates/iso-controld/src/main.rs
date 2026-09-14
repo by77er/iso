@@ -194,6 +194,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Ok(l), false) => {
             let sans = tls::server_sans(control_tcp, &admin_extra_sans);
             let pki = iso_admin_pki::AdminPki::load_or_generate(&admin_tls_dir, &sans)?;
+            if !pki.can_issue() {
+                eprintln!(
+                    "iso-controld: admin identity issued elsewhere (no ca.key in {}); this host cannot mint credentials",
+                    admin_tls_dir.display()
+                );
+                let missing = pki.uncovered_server_sans(&sans);
+                if !missing.is_empty() {
+                    eprintln!(
+                        "iso-controld: warning: the issued server certificate does not name {missing:?}; \
+                         clients dialing those names will fail TLS (reissue with --san to add them)"
+                    );
+                }
+            }
             let acceptor = tls::acceptor(&pki).map_err(|e| e.to_string())?;
             eprintln!(
                 "iso-controld: admin API on {} and https://{control_tcp} — {reach} (client certs from {})",

@@ -32,6 +32,9 @@ pub enum Error {
     },
     /// A policy rule that does not parse (see `iso-policy`).
     InvalidRule(String),
+    /// A fleet-signed policy that does not describe this VM's policy as
+    /// stored: another VM, another generation, other rules.
+    SignedMismatch(String),
     /// Persistence-layer failure.
     Store(String),
     /// A subsystem (network / storage / runtime) failed.
@@ -60,6 +63,7 @@ impl std::fmt::Display for Error {
                 write!(f, "cannot {op} vm {vm} in state {state}")
             }
             Error::InvalidRule(m) => write!(f, "invalid rule: {m}"),
+            Error::SignedMismatch(m) => write!(f, "signed policy does not match: {m}"),
             Error::Store(m) => write!(f, "store error: {m}"),
             Error::Component(e) => write!(f, "{e}"),
         }

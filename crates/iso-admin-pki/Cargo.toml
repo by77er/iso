@@ -12,3 +12,4 @@ rustls-pki-types = "1"
 thiserror = "2"
 time = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+x509-parser = "0.16"

@@ -55,6 +55,7 @@ async fn injects_headers_and_enforces_allowlist() {
         rules: Arc::new(RuleSet::from_allow_list([ECHO]).unwrap()),
         policy_gen: 1,
         vm: None,
+        signed: None,
     }));
     tokio::spawn(run_with_listeners(
         vec![listener],

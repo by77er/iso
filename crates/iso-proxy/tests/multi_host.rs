@@ -27,6 +27,11 @@ struct Split {
 }
 
 async fn start_tier() -> Split {
+    start_tier_with(None).await
+}
+
+/// A tier that, given the fleet's key, serves only policies the fleet signed.
+async fn start_tier_with(verifier: Option<iso_policy::signed::Verifier>) -> Split {
     init();
     let dir = tempdir("split");
     let pki = TestPki::new(&dir);
@@ -47,6 +52,7 @@ async fn start_tier() -> Split {
     cfg.extra_upstream_roots = vec![upstream.ca_der.clone()];
     cfg.upstream_pins
         .insert(UPSTREAM_HOST.into(), upstream.addr);
+    cfg.policy_verifier = verifier;
     tokio::spawn(run_with_listeners(vec![listener], cfg));
     Split {
         tier,
@@ -379,4 +385,66 @@ async fn a_tier_with_a_stranger_identity_cannot_mint_or_inject() {
     let client = guest_client(edge, &s.tier_ca, false);
     assert!(client.get(url("/get")).send().await.is_err());
     assert!(s.upstream.hit_paths().is_empty());
+}
+
+/// With the fleet's key, the tier takes the policy from the fleet's signed
+/// claims and nothing else: an unsigned policy, one signed for another host
+/// than the edge presenting it, an expired one, or one under another key is
+/// refused at the CONNECT, and a principal the edge claims beside the
+/// signature is ignored in favour of the signed one.
+#[tokio::test]
+async fn tier_serves_only_policies_the_fleet_signed_for_this_edge() {
+    use iso_common::identify::SignedPolicy;
+    use iso_policy::signed::{PolicyClaims, Signer, Verifier, now};
+    let (signer, _) = Signer::generate().unwrap();
+    let s = start_tier_with(Some(Verifier::from_b64(&signer.public_key_b64()).unwrap())).await;
+    let rule = format!("allow https://{UPSTREAM_HOST}/**");
+    let claims = |host: &str, expires: u64| PolicyClaims {
+        host: host.into(),
+        vm: "vm-1".into(),
+        egress: "proxy".into(),
+        principal: Some("alice".into()),
+        rules: vec![rule.clone()],
+        policy_gen: 1,
+        expires,
+    };
+    let far = now() + 3600;
+    // TestPki issues the edge's certificate under the name "edge-hostA".
+    let cases: Vec<(&str, Option<SignedPolicy>, bool)> = vec![
+        ("unsigned", None, false),
+        ("signed for this edge", Some(signer.sign(&claims("edge-hostA", far))), true),
+        ("signed for another host", Some(signer.sign(&claims("edge-hostB", far))), false),
+        ("expired", Some(signer.sign(&claims("edge-hostA", now() - 1))), false),
+        ("signed under another key", Some(Signer::generate().unwrap().0.sign(&claims("edge-hostA", far))), false),
+    ];
+    for (what, signed, ok) in cases {
+        let e = start_edge(&s, "hostA", &s.pki.edge, &[&rule], Some("alice"), "proxy").await;
+        let mut p = policy("proxy", Some("alice"), &[&rule]);
+        p.signed = signed;
+        e.resolver.set(Some(p));
+        let client = guest_client(e.addr, &s.tier_ca, false);
+        let r = client.get(url("/get")).send().await;
+        if ok {
+            let body: serde_json::Value = r.unwrap().json().await.unwrap();
+            assert_eq!(body["headers"]["authorization"], "Bearer alice-token", "{what}");
+        } else {
+            assert!(r.is_err(), "{what}: must be refused at the tier");
+        }
+    }
+
+    // The signed claims are the policy. What the edge says beside them
+    // (here, a different principal) is not read.
+    let e = start_edge(&s, "hostA", &s.pki.edge, &[&rule], Some("mallory"), "proxy").await;
+    let mut p = policy("proxy", Some("mallory"), &[&rule]);
+    p.signed = Some(signer.sign(&claims("edge-hostA", far)));
+    e.resolver.set(Some(p));
+    let body: serde_json::Value = guest_client(e.addr, &s.tier_ca, false)
+        .get(url("/get"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["headers"]["authorization"], "Bearer alice-token", "injection follows the signed principal");
 }

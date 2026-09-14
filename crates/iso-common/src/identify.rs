@@ -3,6 +3,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A policy as the fleet signed it: the claims (canonical JSON, base64) and
+/// an ed25519 signature over those exact bytes. Opaque to a host, which
+/// stores and serves it; the edge relays it; the tier verifies it with the
+/// fleet's public key. The crypto lives in `iso_policy::signed`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedPolicy {
+    /// Base64 of the claims JSON, signed byte for byte.
+    pub claims: String,
+    /// Base64 of the 64-byte ed25519 signature.
+    pub sig: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IdentifyRequest {
     /// The connection's source IP (the VM's `vp` address).
@@ -31,4 +43,8 @@ pub struct IdentifyResponse {
     /// mean equal policy; a caller closes what it holds at an older one.
     #[serde(default)]
     pub policy_gen: u64,
+    /// The fleet's signature over this policy, when a fleet placed the VM.
+    /// An edge relays it to the tier, which trusts nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed: Option<SignedPolicy>,
 }

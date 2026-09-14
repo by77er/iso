@@ -9,6 +9,13 @@
 //! This is deliberately **not** the egress proxy's CA (`iso-ca`). That one
 //! is trusted by guests and terminates hostile traffic; sharing a trust root
 //! with it would hand a compromised proxy admin credentials.
+//!
+//! A host in a fleet does not hold the CA key at all: the control host mints
+//! its identity (`isoctl admin issue-server`) and the host loads `ca.crt`,
+//! `server.crt` and `server.key` with no `ca.key` beside them. Such a host
+//! can present its identity and verify clients but can issue nothing, which
+//! is the point: a compromised host cannot mint a credential the other
+//! services would accept.
 
 use std::net::IpAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -31,6 +38,8 @@ pub enum Error {
     Pem(String),
     #[error("invalid name {0:?}: {1}")]
     Name(String, String),
+    #[error("{0}")]
+    NoCaKey(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -60,11 +69,13 @@ impl Identity {
 }
 
 /// The admin CA plus this host's server identity, on disk under one directory:
-/// `ca.crt`, `ca.key`, `server.crt`, `server.key` (keys are mode 0600).
+/// `ca.crt`, `ca.key`, `server.crt`, `server.key` (keys are mode 0600). With
+/// `ca.crt` but no `ca.key`, the identity was issued elsewhere and this
+/// process can verify and present but not issue.
 pub struct AdminPki {
     dir: PathBuf,
-    ca_cert: Certificate,
-    ca_key: KeyPair,
+    /// The issuer, when the key is here.
+    signer: Option<(Certificate, KeyPair)>,
     ca_cert_pem: String,
 }
 
@@ -72,12 +83,20 @@ impl AdminPki {
     /// Load the CA from `dir`, generating a fresh one if it is absent. The
     /// server certificate is (re)issued whenever it is missing or `server_sans`
     /// names something the existing one does not cover.
+    ///
+    /// A directory holding `ca.crt` without `ca.key` is an identity issued
+    /// elsewhere: `server.crt` and `server.key` must be there. Names in
+    /// `server_sans` the certificate does not carry cannot be added here;
+    /// [`Self::uncovered_server_sans`] says which, for the caller to report.
     pub fn load_or_generate(dir: &Path, server_sans: &[String]) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         let ca_crt = dir.join("ca.crt");
         let ca_key = dir.join("ca.key");
-        if !ca_crt.exists() || !ca_key.exists() {
+        if ca_crt.exists() && !ca_key.exists() {
+            return Self::load_issued_elsewhere(dir, server_sans);
+        }
+        if !ca_crt.exists() {
             let key = KeyPair::generate()?;
             let mut params = CertificateParams::new(Vec::<String>::new())?;
             params.distinguished_name.push(DnType::CommonName, "iso admin CA");
@@ -95,7 +114,7 @@ impl AdminPki {
         // Rebuild the issuer from the stored params; only its DN and key ids are
         // read when signing, the served chain uses the stored PEM.
         let ca_cert = CertificateParams::from_ca_cert_pem(&ca_cert_pem)?.self_signed(&ca_key)?;
-        let pki = Self { dir: dir.to_path_buf(), ca_cert, ca_key, ca_cert_pem };
+        let pki = Self { dir: dir.to_path_buf(), signer: Some((ca_cert, ca_key)), ca_cert_pem };
 
         let server_crt = dir.join("server.crt");
         let server_key = dir.join("server.key");
@@ -111,8 +130,43 @@ impl AdminPki {
         Ok(pki)
     }
 
+    fn load_issued_elsewhere(dir: &Path, server_sans: &[String]) -> Result<Self> {
+        let ca_cert_pem = std::fs::read_to_string(dir.join("ca.crt"))?;
+        let server_crt = dir.join("server.crt");
+        let server_key = dir.join("server.key");
+        let how = "issue one on the control host with `isoctl admin issue-server --name <host> --san <ip>` \
+                   and install it as server.crt and server.key, or add ca.key to let this host issue its own";
+        std::fs::read_to_string(&server_crt).map_err(|e| {
+            Error::NoCaKey(format!("{}: {e}; this host has no ca.key, so {how}", server_crt.display()))
+        })?;
+        if !server_key.exists() {
+            return Err(Error::NoCaKey(format!("{} is missing; {how}", server_key.display())));
+        }
+        let _ = server_sans;
+        Ok(Self { dir: dir.to_path_buf(), signer: None, ca_cert_pem })
+    }
+
+    /// The names in `wanted` the stored server certificate does not carry.
+    /// Empty after a load that could reissue; for an identity issued
+    /// elsewhere, what the issuer left out, which clients cannot dial by.
+    pub fn uncovered_server_sans(&self, wanted: &[String]) -> Vec<String> {
+        let Ok(pem) = std::fs::read_to_string(self.dir.join("server.crt")) else {
+            return wanted.to_vec();
+        };
+        wanted
+            .iter()
+            .filter(|w| !sans_covered(&pem, std::slice::from_ref(w)))
+            .cloned()
+            .collect()
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Whether the CA key is here, so certificates can be issued.
+    pub fn can_issue(&self) -> bool {
+        self.signer.is_some()
     }
 
     /// The CA certificate, PEM. Clients pin this.
@@ -153,6 +207,12 @@ impl AdminPki {
     }
 
     fn issue(&self, cn: &str, sans: &[String], eku: &[ExtendedKeyUsagePurpose]) -> Result<Identity> {
+        let Some((ca_cert, ca_key)) = &self.signer else {
+            return Err(Error::NoCaKey(format!(
+                "cannot issue {cn:?}: {} holds no ca.key (this identity was issued elsewhere)",
+                self.dir.display()
+            )));
+        };
         let key = KeyPair::generate()?;
         let mut params = CertificateParams::new(Vec::<String>::new())?;
         params.distinguished_name.push(DnType::CommonName, cn);
@@ -163,9 +223,22 @@ impl AdminPki {
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::hours(1);
         params.not_after = now + time::Duration::days(LEAF_DAYS);
-        let cert = params.signed_by(&key, &self.ca_cert, &self.ca_key)?;
+        let cert = params.signed_by(&key, ca_cert, ca_key)?;
         Ok(Identity { cert_pem: cert.pem(), key_pem: key.serialize_pem() })
     }
+}
+
+/// The common name of the first certificate a TLS peer presented: the name
+/// an identity was issued under. `None` when there is no certificate or it
+/// carries no common name.
+pub fn peer_common_name(chain: &[CertificateDer<'_>]) -> Option<String> {
+    let leaf = chain.first()?;
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref()).ok()?;
+    cert.subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(str::to_string)
 }
 
 fn check_name(name: &str) -> Result<()> {
@@ -343,6 +416,56 @@ mod tests {
         let second = b.server_identity().unwrap().cert_pem;
         assert_ne!(first, second);
         assert!(sans_covered(&second, &["192.168.1.9".into(), "localhost".into()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_identity_issued_elsewhere_loads_without_the_ca_key_and_cannot_issue() {
+        let control = tempdir();
+        let issuer = AdminPki::load_or_generate(&control, &["localhost".into()]).unwrap();
+        let id = issuer.issue_server("host-a", &["10.0.0.4".into()]).unwrap();
+
+        let host = tempdir();
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("ca.crt"), issuer.ca_cert_pem()).unwrap();
+        std::fs::write(host.join("server.crt"), &id.cert_pem).unwrap();
+        std::fs::write(host.join("server.key"), &id.key_pem).unwrap();
+
+        let pki = AdminPki::load_or_generate(&host, &["10.0.0.4".into()]).unwrap();
+        assert!(!pki.can_issue());
+        assert_eq!(pki.ca_cert_pem(), issuer.ca_cert_pem());
+        assert_eq!(pki.server_identity().unwrap().cert_pem, id.cert_pem, "kept as issued");
+        let err = pki.issue_client("anyone").unwrap_err().to_string();
+        assert!(err.contains("no ca.key"), "{err}");
+        assert!(!host.join("ca.key").exists());
+
+        // A name the issued certificate does not carry cannot be added here;
+        // the load says which so the daemon can warn.
+        let pki = AdminPki::load_or_generate(&host, &["10.0.0.4".into(), "10.9.9.9".into()]).unwrap();
+        assert_eq!(pki.uncovered_server_sans(&["10.0.0.4".into(), "10.9.9.9".into()]), vec!["10.9.9.9".to_string()]);
+        assert!(issuer.uncovered_server_sans(&["localhost".into()]).is_empty());
+
+        // Without a server identity at all there is nothing to serve.
+        let bare = tempdir();
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(bare.join("ca.crt"), issuer.ca_cert_pem()).unwrap();
+        let err = AdminPki::load_or_generate(&bare, &[]).err().expect("nothing to serve").to_string();
+        assert!(err.contains("server.crt"), "{err}");
+        let _ = std::fs::remove_dir_all(&control);
+        let _ = std::fs::remove_dir_all(&host);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn peer_common_name_reads_the_name_an_identity_was_issued_under() {
+        let dir = tempdir();
+        let pki = AdminPki::load_or_generate(&dir, &["localhost".into()]).unwrap();
+        let client = pki.issue_client("fleet").unwrap();
+        let der = client.cert_der().unwrap();
+        assert_eq!(peer_common_name(&[der]).as_deref(), Some("fleet"));
+        let server = pki.issue_server("control", &["10.0.0.2".into()]).unwrap();
+        assert_eq!(peer_common_name(&[server.cert_der().unwrap()]).as_deref(), Some("control"));
+        assert_eq!(peer_common_name(&[]), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -115,6 +115,24 @@ async fn sync_host(fleet: &Fleet, client: crate::hosts::HostClient) {
                 }
                 let _ = fleet.store.set_vm_view(&r.id, v);
                 let _ = fleet.store.set_vm_state(&r.id, state::PLACED, None, None);
+                match fleet.own_claims(v) {
+                    Some(c) if c.expires.saturating_sub(now() as u64) <= fleet.cfg.policy_ttl_secs / 3 => {
+                        match crate::api::refresh_signature(fleet, &client, &c).await {
+                            Ok(()) => tracing::info!("vm {}: policy re-signed on {name}", r.id),
+                            Err(e) => tracing::warn!("vm {}: could not re-sign policy on {name}: {e}", r.id),
+                        }
+                    }
+                    Some(_) => {}
+                    // Not this fleet's signature, or none: the policy was
+                    // changed behind the fleet's back (or by an older
+                    // host). It is not blessed here; a tier that verifies
+                    // refuses the VM until the policy is set through the
+                    // fleet again, which is the point.
+                    None => tracing::warn!(
+                        "vm {} on {name} carries no signature of this fleet's; its policy was not set through the fleet",
+                        r.id
+                    ),
+                }
             }
             None => match r.fleet_state.as_str() {
                 state::DELETING => {

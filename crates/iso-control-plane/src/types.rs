@@ -125,6 +125,10 @@ pub struct VmRecord {
     /// Bumped on every policy change. Consumers that cache policy or hold
     /// long-lived connections compare generations, never contents.
     pub policy_gen: u64,
+    /// The fleet's signature over this policy, stored as handed in and served
+    /// to the edge unchanged. `None` for a VM no fleet placed, or after a
+    /// change made behind the fleet's back, which a verifying tier refuses.
+    pub signed: Option<iso_common::identify::SignedPolicy>,
     /// This VM's own snapshot, from the last successful suspend. Preferred over
     /// the template's on resume — the template's is where every clone *starts*,
     /// this is where this one left off. Cleared when the VM is destroyed (the
@@ -150,6 +154,9 @@ pub struct CreateVm {
     pub principal: Option<String>,
     pub allow: Vec<String>,
     pub rules: Vec<String>,
+    /// A fleet's signature over exactly this policy at generation 1; checked
+    /// against the other fields before it is stored.
+    pub signed: Option<iso_common::identify::SignedPolicy>,
 }
 
 impl CreateVm {
@@ -169,6 +176,7 @@ impl CreateVm {
             principal: None,
             allow: Vec::new(),
             rules: Vec::new(),
+            signed: None,
         }
     }
 }

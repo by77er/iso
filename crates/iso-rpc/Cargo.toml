@@ -6,6 +6,7 @@ license.workspace = true
 description = "The two transports iso's side services speak: half-close JSON over a Unix socket, and JSON over HTTPS with mutual TLS"
 
 [dependencies]
+iso-admin-pki = { path = "../iso-admin-pki" }
 bytes = "1"
 http = "1"
 http-body-util = "0.1"

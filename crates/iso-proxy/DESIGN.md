@@ -182,11 +182,34 @@ listen = ["0.0.0.0:3129"]
 `iso-cad` and `iso-secretsd` add the HTTPS listener with `ISO_CA_LISTEN` /
 `ISO_SECRETS_LISTEN` plus the `ISO_TLS_*` identity.
 
+## Signed policies
+
+In the split, the tier learns a connection's policy from the edge. Left
+there, the tier trusts the host: root on a VM host could present any
+principal and any rule set and have credentials injected for it. So the
+fleet signs what it places or changes (`iso_policy::signed`): the claims
+`{host, vm, egress, principal, rules, policy_gen, expires}` as canonical
+JSON under an ed25519 key only the fleet holds. The host stores the
+signature beside the policy (and refuses one that does not describe the
+policy it stores), `identify` serves it, the edge relays it in
+`x-iso-policy`, and a tier configured with the fleet's public key (`[fleet]
+policy_key_file`) accepts a stream only when the signature verifies, the
+claims have not expired, and the `host` claimed is the name on the edge's
+certificate. The policy the tier enforces is then the signed claims; the
+rest of the wire policy is not read. A host can present only policies the
+fleet issued to it, for VMs placed on it, until they expire (the fleet
+re-signs at a third of the life left, without a generation bump). The
+CA and secrets services likewise answer only the tier's certificate name
+(`ISO_ALLOWED_CLIENTS`), and no host holds the admin CA key.
+
 ## Failure modes
 
 - Not TLS / no SNI ⇒ drop. No allow rule for the host ⇒ drop before minting.
 - `:authority != SNI` ⇒ 421. URI rule deny ⇒ 403.
 - Unknown source / deny-mode VM ⇒ refused at the edge.
+- Tier with a fleet key: unsigned, expired, badly signed, or signed for
+  another host ⇒ the CONNECT is answered 403 and the guest's connection is
+  closed before any TLS.
 - SecretProvider down or empty ⇒ forward without injection (fail-open).
 - CertAuthority down ⇒ block (fail-closed). Every replica unreachable ⇒ the
   edge closes the guest connection; one replica down ⇒ the next is used.

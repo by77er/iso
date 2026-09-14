@@ -142,6 +142,11 @@ pub struct ProxyConfig {
     pub metrics: Arc<edge::Metrics>,
     /// Mutual TLS the replica requires from edges (`proxy`).
     pub accept_tls: Option<Arc<rustls::ServerConfig>>,
+    /// The fleet's policy signing key (`proxy`). With it, a stream is served
+    /// only under a policy the fleet signed for the edge presenting it, and
+    /// nothing else the edge says about the policy is read. Without it the
+    /// edge's word is taken, which is only right where there is no fleet.
+    pub policy_verifier: Option<iso_policy::signed::Verifier>,
     /// Roots trusted for upstreams on top of the public webpki set: a private
     /// CA in front of an internal API, or a test upstream.
     pub extra_upstream_roots: Vec<CertificateDer<'static>>,
@@ -169,6 +174,7 @@ impl ProxyConfig {
             tier_pool_size: 2,
             metrics: Arc::new(edge::Metrics::default()),
             accept_tls: None,
+            policy_verifier: None,
             extra_upstream_roots: Vec::new(),
             upstream_pins: std::collections::HashMap::new(),
             handshake_timeout: Duration::from_secs(10),
@@ -205,15 +211,18 @@ impl ProxyConfig {
         }
     }
 
-    /// A replica of the tier.
+    /// A replica of the tier. Edges speak HTTP/2 to it, so that is what it
+    /// offers in ALPN; nothing else is served on this listener.
     pub fn proxy(
         listen: Vec<SocketAddr>,
         accept_tls: Arc<rustls::ServerConfig>,
         ca: iso_rpc::Endpoint,
         secrets: iso_rpc::Endpoint,
     ) -> Self {
+        let mut accept = (*accept_tls).clone();
+        accept.alpn_protocols = vec![b"h2".to_vec()];
         Self {
-            accept_tls: Some(accept_tls),
+            accept_tls: Some(Arc::new(accept)),
             ca: Some(ca),
             secrets: Some(secrets),
             ..Self::base(Role::Proxy, listen)
@@ -262,6 +271,12 @@ pub async fn run(cfg: ProxyConfig) -> std::io::Result<()> {
     for addr in &cfg.listen {
         let l = TcpListener::bind(addr).await?;
         tracing::info!("iso-proxy ({:?}) listening on {addr}", cfg.role);
+    if cfg.role == Role::Proxy {
+        match &cfg.policy_verifier {
+            Some(_) => tracing::info!("proxy: fleet-signed policies required from edges"),
+            None => tracing::warn!("proxy: no fleet policy key configured; policies from edges are taken on faith"),
+        }
+    }
         listeners.push(l);
     }
     run_with_listeners(listeners, cfg).await
@@ -478,11 +493,23 @@ async fn proxy_conn(tcp: TcpStream, peer: SocketAddr, rt: Arc<Runtime>) {
             return;
         }
     };
-    tracing::info!("proxy: tunnel from edge {peer} open");
+    // The name the edge's certificate was issued under: what a signed
+    // policy's `host` must equal.
+    let edge_name: Arc<str> = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(iso_admin_pki::peer_common_name)
+        .unwrap_or_default()
+        .into();
+    tracing::info!("proxy: tunnel from edge {peer} ({edge_name}) open");
     let ctx = rt.ctx.clone().expect("proxy has a ctx");
+    let verifier = rt.cfg.policy_verifier.clone().map(Arc::new);
     let service = service_fn(move |req: Request<Incoming>| {
         let ctx = ctx.clone();
-        async move { Ok::<_, std::convert::Infallible>(accept_stream(req, peer, ctx)) }
+        let edge_name = edge_name.clone();
+        let verifier = verifier.clone();
+        async move { Ok::<_, std::convert::Infallible>(accept_stream(req, peer, &edge_name, verifier.as_deref(), ctx)) }
     });
     let served = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
         .timer(hyper_util::rt::TokioTimer::new())
@@ -499,8 +526,16 @@ async fn proxy_conn(tcp: TcpStream, peer: SocketAddr, rt: Arc<Runtime>) {
 
 /// One CONNECT on a tunnel: validate the identity it carries, answer 200,
 /// and serve the stream as the guest's connection. Anything else on the
-/// tunnel is refused.
-fn accept_stream(mut req: Request<Incoming>, edge: SocketAddr, ctx: Ctx) -> Resp {
+/// tunnel is refused. With a verifier, the policy is the fleet's signed
+/// claims and nothing else: unsigned, badly signed, expired, or signed for
+/// another host than the one this edge is, and the stream is refused.
+fn accept_stream(
+    mut req: Request<Incoming>,
+    edge: SocketAddr,
+    edge_name: &str,
+    verifier: Option<&iso_policy::signed::Verifier>,
+    ctx: Ctx,
+) -> Resp {
     if req.method() != http::Method::CONNECT {
         return simple(405, "the tier speaks CONNECT only");
     }
@@ -512,12 +547,42 @@ fn accept_stream(mut req: Request<Incoming>, edge: SocketAddr, ctx: Ctx) -> Resp
         }
     };
     let src = decoded.src.map(|s| s.ip()).unwrap_or(edge.ip());
-    let policy = match decoded.policy.into_policy() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("proxy: edge {edge} sent an unparsable policy: {e}");
-            return simple(400, "bad policy");
+    let policy = match verifier {
+        Some(v) => {
+            let Some(signed) = decoded.policy.signed else {
+                tracing::warn!("proxy: edge {edge_name} ({edge}) sent an unsigned policy for {src}; refused");
+                return simple(403, "unsigned policy");
+            };
+            let claims = match v.verify(&signed) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("proxy: edge {edge_name} ({edge}) sent a policy that does not verify for {src}: {e}");
+                    return simple(403, "policy does not verify");
+                }
+            };
+            if claims.host != edge_name {
+                tracing::warn!(
+                    "proxy: edge {edge_name} ({edge}) presented a policy signed for host {:?} (vm {}); refused",
+                    claims.host,
+                    claims.vm
+                );
+                return simple(403, "policy is for another host");
+            }
+            match Policy::from_claims(claims, signed) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("proxy: signed policy from {edge_name} has an unparsable rule: {e}");
+                    return simple(400, "bad policy");
+                }
+            }
         }
+        None => match decoded.policy.into_policy() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("proxy: edge {edge} sent an unparsable policy: {e}");
+                return simple(400, "bad policy");
+            }
+        },
     };
     if policy.is_deny_mode() {
         tracing::info!("proxy: refusing deny-mode connection from {src} via {edge}");

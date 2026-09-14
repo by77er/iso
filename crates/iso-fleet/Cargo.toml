@@ -9,6 +9,7 @@ description = "iso-fleetd: one API over many iso hosts. Places VMs, remembers wh
 iso-common = { path = "../iso-common" }
 iso-admin-pki = { path = "../iso-admin-pki" }
 iso-client = { path = "../iso-client" }
+iso-policy = { path = "../iso-policy" }
 axum = "0.8.9"
 bytes = "1"
 http = "1"

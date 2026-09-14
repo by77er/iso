@@ -89,6 +89,13 @@ code, so it composes with shell tooling the way `ssh host cmd` does.
 | `PATCH /vms/{id}/policy` | Change `egress`, `principal`, `allow`, `rules` on a running VM. Bumps `policy_gen`; new connections carry it and the proxy closes older ones within a second. A rule that does not parse is a `400`. |
 | `POST /vms/{id}/forwards`, `DELETE /vms/{id}/forwards/{host_port}` | Open or close an ingress forward; the host port is allocated. |
 | `GET /vms/{id}/agent` | Ping the guest agent. |
+
+A VM record carries `signed` when a fleet placed it: the fleet's signature
+over the policy (`{claims, sig}`, both base64). `POST /vms` and
+`PATCH /vms/{id}/policy` accept `signed`; the host stores it only when it
+describes the policy the host stores, at the generation the call produces
+(or the current one, for a re-signing that changes nothing), and answers
+400 otherwise. A change without `signed` drops the stored signature.
 | `POST /vms/{id}/exec` | Run a program inside the VM. |
 | `GET` / `PUT` / `DELETE /vms/{id}/files?path=` | Read, write, remove a file inside the VM. |
 | `GET /vms/{id}/dir?path=` | List a directory inside the VM. |

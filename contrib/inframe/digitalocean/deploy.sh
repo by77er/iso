@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Turn the three droplets `inframe apply` created into a working iso fleet:
 #
-#   control  iso-fleetd (:7080, mTLS)     the one API clients use
-#            iso-proxyd --role proxy       the tier, :3129 on the private IP
-#            iso-cad, iso-secretsd         :7443 / :7444 on the private IP, mTLS
-#   host-a/b iso-controld (:7070 private, mTLS, shared admin CA)
+#   control  iso-fleetd (:7080, mTLS)     the one API clients use; signs every policy
+#            iso-proxyd --role proxy       the tier, :3129 on the private IP; verifies them
+#            iso-cad, iso-secretsd         :7443 / :7444 on the private IP, mTLS,
+#                                          answering the tier's identity only
+#   host-a/b iso-controld (:7070 private, mTLS, an identity the control host issued;
+#                                          no CA key on the host)
 #            iso-proxyd --role edge        carries guest connections to the tier
 #            one baked Debian template
 #
@@ -95,8 +97,11 @@ say "control: waiting for cloud-init"; wait_cloud_init "$CONTROL"
 ship_bins "$CONTROL"
 rsync -az "$SECRETS_TOML" "root@$CONTROL:/var/lib/iso/secrets.toml"
 
-# One admin CA for every host, minted on the control host, and the identities
-# the control host's services present. The fleet's own API CA is separate.
+# One admin CA for every host, minted on the control host and kept there: a
+# host gets an identity issued under it (its controld server certificate and
+# its edge's client certificate are the same identity), never the key. The
+# control host's services present their own identity, and the CA and secrets
+# services answer that identity alone. The fleet's own API CA is separate.
 "${SSH[@]}" "root@$CONTROL" bash -s "$CONTROL_PRIV" "$HOST_A_PRIV" "$HOST_B_PRIV" "$CONTROL" <<'REMOTE'
 set -euo pipefail
 priv=$1; a=$2; b=$3; pub=$4
@@ -123,6 +128,8 @@ url = "https://$priv:7444"
 ca = "/etc/iso-fleet/svc/ca.crt"
 cert = "/etc/iso-fleet/svc/control.crt"
 key = "/etc/iso-fleet/svc/control.key"
+[fleet]
+policy_key_file = "$P/pki/policy-signing.pub"
 EOT
 cat > /etc/iso-fleet/fleet.toml <<EOT
 listen = "0.0.0.0:7080"
@@ -142,19 +149,21 @@ name = "host-b"
 url = "https://$b:7070"
 EOT
 REMOTE
-TLS_ENV=(ISO_TLS_CA=/etc/iso-fleet/svc/ca.crt ISO_TLS_CERT=/etc/iso-fleet/svc/control.crt ISO_TLS_KEY=/etc/iso-fleet/svc/control.key)
+TLS_ENV=(ISO_TLS_CA=/etc/iso-fleet/svc/ca.crt ISO_TLS_CERT=/etc/iso-fleet/svc/control.crt ISO_TLS_KEY=/etc/iso-fleet/svc/control.key ISO_ALLOWED_CLIENTS=control)
 unit "$CONTROL" iso-cad      /usr/local/bin/iso-cad      ISO_STATE_DIR=/var/lib/iso "ISO_CA_LISTEN=$CONTROL_PRIV:7443" "${TLS_ENV[@]}"
 unit "$CONTROL" iso-secretsd /usr/local/bin/iso-secretsd ISO_STATE_DIR=/var/lib/iso "ISO_SECRETS_LISTEN=$CONTROL_PRIV:7444" "${TLS_ENV[@]}"
-unit "$CONTROL" iso-proxyd   /usr/local/bin/iso-proxyd   ISO_PROXY_CONFIG=/etc/iso-fleet/proxy.toml
+# the fleet first: its policy signing key is what the tier verifies against
 unit "$CONTROL" iso-fleetd   "/usr/local/bin/iso-fleetd /etc/iso-fleet/fleet.toml"
-# the tier CA guests must trust, the hosts admin CA hosts must hold, the edge
-# identities, and the operator's fleet credentials
+for _ in $(seq 1 30); do "${SSH[@]}" "root@$CONTROL" test -f /var/lib/iso-fleet/pki/policy-signing.pub && break; sleep 1; done
+unit "$CONTROL" iso-proxyd   /usr/local/bin/iso-proxyd   ISO_PROXY_CONFIG=/etc/iso-fleet/proxy.toml
+# the tier CA guests must trust, the hosts admin CA certificate (not its key),
+# the host identities, and the operator's fleet credentials
 for _ in $(seq 1 30); do "${SSH[@]}" "root@$CONTROL" test -f /var/lib/iso/ca/ca.crt && break; sleep 1; done
 rsync -az "root@$CONTROL:/var/lib/iso/ca/ca.crt" "$OUT/tier-ca.crt"
-rsync -az "root@$CONTROL:/var/lib/iso-fleet/hosts-pki/ca.crt" "root@$CONTROL:/var/lib/iso-fleet/hosts-pki/ca.key" "$OUT/"
+rsync -az "root@$CONTROL:/var/lib/iso-fleet/hosts-pki/ca.crt" "$OUT/ca.crt"
 rsync -az "root@$CONTROL:/etc/iso-fleet/edges/" "$OUT/edges/"
 rsync -az "root@$CONTROL:/etc/iso-fleet/operator/" "$OUT/creds/"
-say "control: services up; tier CA and host CA fetched"
+say "control: services up; tier CA, host CA certificate and host identities fetched"
 
 # ============================================================== hosts ====
 host() { # name public private
@@ -173,9 +182,13 @@ host() { # name public private
   rsync -az "$OUT/tier-ca.crt" "root@$ip:/var/lib/iso/ca/ca.crt"
   rsync -az "$OUT/tier-ca.crt" "root@$ip:/opt/iso/image/ca.crt"
   rsync -az "$OUT/edges/$name.crt" "$OUT/edges/$name.key" "$OUT/edges/ca.crt" "root@$ip:/etc/iso/"
-  # the shared admin CA, before controld's first start so it is adopted
-  "${SSH[@]}" "root@$ip" "mkdir -p /var/lib/iso/admin-pki && chmod 700 /var/lib/iso/admin-pki"
-  rsync -az --chmod=F600 "$OUT/ca.crt" "$OUT/ca.key" "root@$ip:/var/lib/iso/admin-pki/"
+  # the host's admin identity, issued on the control host: the CA certificate
+  # and the same identity the edge presents, as controld's server cert. No
+  # ca.key: this host verifies and presents, and can mint nothing.
+  "${SSH[@]}" "root@$ip" "mkdir -p /var/lib/iso/admin-pki && chmod 700 /var/lib/iso/admin-pki && rm -f /var/lib/iso/admin-pki/ca.key"
+  rsync -az --chmod=F644 "$OUT/ca.crt" "root@$ip:/var/lib/iso/admin-pki/ca.crt"
+  rsync -az --chmod=F644 "$OUT/edges/$name.crt" "root@$ip:/var/lib/iso/admin-pki/server.crt"
+  rsync -az --chmod=F600 "$OUT/edges/$name.key" "root@$ip:/var/lib/iso/admin-pki/server.key"
   "${SSH[@]}" "root@$ip" "ssh-keygen -q -t ed25519 -N '' -f /opt/iso/guest_ed25519 </dev/null 2>/dev/null || true; cat /opt/iso/guest_ed25519.pub > /opt/iso/authorized_keys"
   "${SSH[@]}" "root@$ip" "cat > /etc/iso/edge.toml" <<EOT
 role = "edge"
@@ -218,6 +231,7 @@ cat <<EOT
 The fleet is up. In your shell:
 
   export ISO_SERVER=https://$CONTROL:7080 ISO_CREDS=$OUT/creds ISO_CLIENT=operator
+  export ISO_E2E_HOST_A=$HOST_A ISO_E2E_CONTROL_PRIV=$CONTROL_PRIV   # for e2e.sh's forged-policy probe
   isoctl vm create --template $TEMPLATE --egress proxy --principal alice --allow api.github.com --quiet
   isoctl vm exec <id> -- curl -sS https://api.github.com/zen
   curl -s --cert \$ISO_CREDS/operator.crt --key \$ISO_CREDS/operator.key --cacert \$ISO_CREDS/ca.crt \$ISO_SERVER/hosts | jq

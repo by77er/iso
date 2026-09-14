@@ -92,6 +92,7 @@ pub fn policy(egress: &str, principal: Option<&str>, rules: &[&str]) -> Policy {
         rules: Arc::new(RuleSet::parse(rules).unwrap()),
         policy_gen: 1,
         vm: Some("vm-test".into()),
+        signed: None,
     }
 }
 
@@ -117,7 +118,7 @@ impl TestCa {
                 let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = l.local_addr().unwrap();
                 let ca = ca.clone();
-                tokio::spawn(async move { iso_ca::serve_https(ca, l, cfg).await });
+                tokio::spawn(async move { iso_ca::serve_https(ca, l, cfg, iso_rpc::ClientAllow::AnyFromCa).await });
                 Some(addr)
             }
             None => None,
@@ -155,7 +156,7 @@ impl TestSecrets {
             Some(cfg) => {
                 let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = l.local_addr().unwrap();
-                tokio::spawn(async move { iso_secrets::serve_https(provider, l, cfg).await });
+                tokio::spawn(async move { iso_secrets::serve_https(provider, l, cfg, iso_rpc::ClientAllow::AnyFromCa).await });
                 Some(addr)
             }
             None => None,

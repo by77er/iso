@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use iso_common::identify::{IdentifyRequest, IdentifyResponse};
+use iso_common::identify::{IdentifyRequest, IdentifyResponse, SignedPolicy};
+use iso_policy::signed::PolicyClaims;
 use iso_policy::RuleSet;
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +33,8 @@ pub struct Policy {
     pub policy_gen: u64,
     /// The VM's id, when the resolver knows it (a static resolver may not).
     pub vm: Option<String>,
+    /// The fleet's signature over this policy, relayed to the tier as is.
+    pub signed: Option<SignedPolicy>,
 }
 
 impl Policy {
@@ -59,6 +62,20 @@ impl Policy {
             rules: Arc::new(rules),
             policy_gen: r.policy_gen,
             vm: r.vm,
+            signed: r.signed,
+        })
+    }
+
+    /// From claims the tier verified: the policy is what the fleet signed,
+    /// and nothing the edge said beside it is consulted.
+    pub fn from_claims(c: PolicyClaims, signed: SignedPolicy) -> Result<Self, iso_policy::ParseError> {
+        Ok(Policy {
+            egress: c.egress,
+            principal: c.principal,
+            rules: Arc::new(RuleSet::parse(&c.rules)?),
+            policy_gen: c.policy_gen,
+            vm: Some(c.vm),
+            signed: Some(signed),
         })
     }
 
@@ -78,6 +95,10 @@ pub struct WirePolicy {
     pub principal: Option<String>,
     pub rules: Vec<String>,
     pub policy_gen: u64,
+    /// The fleet's signature, when the host holds one. A tier that verifies
+    /// reads the policy out of this and ignores the fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed: Option<SignedPolicy>,
 }
 
 impl WirePolicy {
@@ -89,6 +110,7 @@ impl WirePolicy {
             principal: p.principal.clone(),
             rules: p.rules.to_strings(),
             policy_gen: p.policy_gen,
+            signed: p.signed.clone(),
         }
     }
 
@@ -99,6 +121,7 @@ impl WirePolicy {
             rules: Arc::new(RuleSet::parse(&self.rules)?),
             policy_gen: self.policy_gen,
             vm: self.vm,
+            signed: self.signed,
         })
     }
 }

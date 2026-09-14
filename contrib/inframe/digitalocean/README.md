@@ -52,21 +52,26 @@ SECRETS_TOML=./secrets.toml ./deploy.sh
 What it does, in order:
 
 1. **Control host.** Ships the binaries. Mints one admin CA for every host and
-   the identities each service presents: the fleet's client identity, the
-   control host's service identity, one edge identity per host, and an
-   operator client for the fleet's own CA. Writes the tier and fleet
-   configs and starts `iso-cad`, `iso-secretsd`, `iso-proxyd --role proxy`
-   and `iso-fleetd` as systemd units. Fetches the tier CA (for the guests),
-   the host admin CA (for the hosts) and your operator credentials into
-   `.deploy/`.
+   the identities each party presents: the fleet's client identity, the
+   control host's service identity, one identity per host (its controld
+   server certificate and its edge's client certificate are the same one),
+   and an operator client for the fleet's own CA. The CA key stays here.
+   Writes the tier and fleet configs and starts `iso-cad` and `iso-secretsd`
+   (answering the control identity by name and nothing else), `iso-fleetd`
+   (which mints its policy signing key on first start) and then
+   `iso-proxyd --role proxy` with the fleet's public key, so the tier serves
+   only policies the fleet signed. Fetches the tier CA (for the guests), the
+   admin CA certificate, the host identities and your operator credentials
+   into `.deploy/`.
 2. **Each host.** Ships the binaries, the guest kernel and static agent
    (`nix build .#kernel .#iso-guest-agent-static`), the `image/` tree with
-   the tier CA in it, and the edge identity. Installs the shared admin CA
-   before `iso-controld` first starts, so the host adopts it instead of
-   generating its own. Puts the tier CA where `isoctl bake` reads the CA a
-   guest must trust (`/var/lib/iso/ca/ca.crt`, the spot `iso-cad` fills on a
-   single host). Starts controld on the private address and the edge pointed
-   at the tier, bakes a Debian template, and registers it.
+   the tier CA in it, and the host's identity: as the edge's credentials and
+   as `iso-controld`'s server certificate under `/var/lib/iso/admin-pki`,
+   with the CA certificate beside it and no CA key. Puts the tier CA where
+   `isoctl bake` reads the CA a guest must trust (`/var/lib/iso/ca/ca.crt`,
+   the spot `iso-cad` fills on a single host). Starts controld on the private
+   address and the edge pointed at the tier, bakes a Debian template, and
+   registers it.
 3. **You.** The exports it prints at the end make `isoctl vm …` talk to the
    fleet: create places on a host with a free slot, `exec` is routed by id,
    and a proxied request to `api.github.com` comes back with the token
@@ -80,12 +85,15 @@ What it does, in order:
 
 With the exports from `deploy.sh` set, `e2e.sh` drives the rig through the
 fleet API alone: two healthy hosts with the template; a VM placed by the
-fleet whose agent answers; a request to `postman-echo.com` that comes back
-with the headers from `secrets.toml` injected on the control host; a URI
-rule that turns a path into a 403 naming the rule; a host no rule names
-refused at SNI time; a WebSocket upgrade tunnelled through to a 101; a
-policy change that bumps the generation and closes the old connections;
-a second VM landing on the other host; and a clean destroy. It ran green
+fleet whose agent answers and whose clock was set on resume; a request to
+`postman-echo.com` that comes back with the headers from `secrets.toml`
+injected on the control host; a URI rule that turns a path into a 403
+naming the rule; a host no rule names refused at SNI time; a WebSocket
+upgrade tunnelled through to a 101; a policy change that bumps the
+generation and closes the old connections; then, from host-a with its own
+identity, an unsigned policy refused by the tier, the secrets service
+refusing that identity by name, and no CA key on the host; a second VM
+landing on the other host; and a clean destroy. It ran green
 against `nyc3` on 2026-09-14, about 90 seconds end to end, with the guest
 agent answering roughly two seconds after `vm create` on nested KVM.
 
@@ -100,5 +108,5 @@ Then confirm nothing is left billing: `curl -H "Authorization: Bearer
 $DIGITALOCEAN_TOKEN" https://api.digitalocean.com/v2/droplets` should list
 no droplets tagged `iso`.
 
-`.deploy/` holds the host admin CA key and your operator key; it is ignored
-by git. Do not commit it.
+`.deploy/` holds the host identities' keys and your operator key; it is
+ignored by git. Do not commit it.

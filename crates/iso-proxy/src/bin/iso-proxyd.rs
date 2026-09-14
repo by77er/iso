@@ -27,6 +27,10 @@
 //! addrs = ["10.0.0.9:3129"]
 //! server_name = "proxy-tier"       # optional; default: the address
 //!
+//! [fleet]                          # proxy: the fleet's policy signing key, one of
+//! policy_key_file = "/etc/iso-fleet/policy-signing.pub"
+//! policy_key = "base64…"           # without it, an edge's policy is taken on faith
+//!
 //! [tls]                            # edge and proxy: this process's identity
 //! ca = "/etc/iso/creds/ca.crt"     # (isoctl admin issue-server)
 //! cert = "/etc/iso/creds/edge.crt"
@@ -57,6 +61,12 @@ struct File {
     tier: Option<Tier>,
     tls: Option<Tls>,
     upstream: Option<Upstream>,
+    fleet: Option<FleetKey>,
+}
+#[derive(Deserialize, Default)]
+struct FleetKey {
+    policy_key: Option<String>,
+    policy_key_file: Option<PathBuf>,
 }
 #[derive(Deserialize, Default)]
 struct Identify {
@@ -205,6 +215,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Some(h) = file.host_id.or_else(|| env("ISO_HOST_ID")) {
         cfg.host_id = h;
+    }
+    if let Some(f) = &file.fleet {
+        let key = match (&f.policy_key, &f.policy_key_file) {
+            (Some(k), _) => k.clone(),
+            (None, Some(p)) => std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
+            (None, None) => return Err("[fleet] needs policy_key or policy_key_file".into()),
+        };
+        cfg.policy_verifier = Some(iso_policy::signed::Verifier::from_b64(&key).map_err(|e| format!("[fleet] policy key: {e}"))?);
     }
     if let Some(u) = &file.upstream {
         for p in &u.extra_roots {

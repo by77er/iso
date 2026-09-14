@@ -3,6 +3,7 @@
 //! Access is synchronous under a `Mutex<Connection>` — store ops are local and
 //! fast, and we never hold the lock across an `.await`.
 
+use iso_common::identify::SignedPolicy;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -138,6 +139,8 @@ impl Store {
         // have one, and a VM loses it when it is destroyed.
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN snapshot_mem TEXT", []);
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN snapshot_vmstate TEXT", []);
+        // The fleet's signature over the policy, JSON, when a fleet placed it.
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN signed_policy TEXT", []);
         // Migrate the legacy `vms.ingress` JSON blob into `port_forwards`, then
         // drop the column. No-op once migrated and on fresh databases.
         Self::migrate_ingress_blob(&conn)?;
@@ -243,8 +246,8 @@ impl Store {
         self.lock().execute(
             "INSERT INTO vms
                 (id, slot, template, egress, labels, lifecycle, restart,
-                 vcpus, mem_mib, state, rootfs_device, tap, principal, allow, rules, policy_gen)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                 vcpus, mem_mib, state, rootfs_device, tap, principal, allow, rules, policy_gen, signed_policy)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             rusqlite::params![
                 v.id.to_string(),
                 v.slot.map(|s| s.get()),
@@ -262,6 +265,7 @@ impl Store {
                 serde_json::to_string(&v.allow)?,
                 serde_json::to_string(&v.rules)?,
                 v.policy_gen,
+                v.signed.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )?;
         Ok(())
@@ -298,16 +302,18 @@ impl Store {
         allow: &[String],
         rules: &[String],
         egress: EgressMode,
+        signed: Option<&SignedPolicy>,
     ) -> Result<u64> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE vms SET egress=?2, principal=?3, allow=?4, rules=?5, policy_gen=policy_gen+1 WHERE id=?1",
+            "UPDATE vms SET egress=?2, principal=?3, allow=?4, rules=?5, signed_policy=?6, policy_gen=policy_gen+1 WHERE id=?1",
             rusqlite::params![
                 id.to_string(),
                 egress_str(egress),
                 principal,
                 serde_json::to_string(allow)?,
                 serde_json::to_string(rules)?,
+                signed.map(serde_json::to_string).transpose()?,
             ],
         )?;
         let new_gen: u64 = conn.query_row(
@@ -316,6 +322,17 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(new_gen)
+    }
+
+    /// Replace only the signature, for a fleet re-signing an unchanged policy
+    /// before the old signature expires. No generation bump: nothing a
+    /// connection holds has changed.
+    pub fn refresh_signed(&self, id: VmId, signed: &SignedPolicy) -> Result<()> {
+        self.lock().execute(
+            "UPDATE vms SET signed_policy=?2 WHERE id=?1",
+            rusqlite::params![id.to_string(), serde_json::to_string(signed)?],
+        )?;
+        Ok(())
     }
 
     // ---- forwards (normalized desired state) ----
@@ -396,8 +413,8 @@ impl Store {
     }
 }
 
-const VM_SELECT: &str = "SELECT id, slot, template, egress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow, snapshot_mem, snapshot_vmstate, rules, policy_gen FROM vms WHERE id=?1";
-const VM_SELECT_ALL: &str = "SELECT id, slot, template, egress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow, snapshot_mem, snapshot_vmstate, rules, policy_gen FROM vms";
+const VM_SELECT: &str = "SELECT id, slot, template, egress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow, snapshot_mem, snapshot_vmstate, rules, policy_gen, signed_policy FROM vms WHERE id=?1";
+const VM_SELECT_ALL: &str = "SELECT id, slot, template, egress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow, snapshot_mem, snapshot_vmstate, rules, policy_gen, signed_policy FROM vms";
 
 fn template_from_row(r: &rusqlite::Row<'_>) -> Result<TemplateDef> {
     let mem: Option<String> = r.get(2)?;
@@ -441,6 +458,10 @@ fn vm_from_row(r: &rusqlite::Row<'_>) -> Result<VmRecord> {
     let snap_vmstate: Option<String> = r.get(15)?;
     let rules: Vec<String> = serde_json::from_str(&r.get::<_, String>(16)?)?;
     let policy_gen: u64 = r.get(17)?;
+    let signed: Option<SignedPolicy> = r
+        .get::<_, Option<String>>(18)?
+        .map(|j| serde_json::from_str(&j))
+        .transpose()?;
     // Both or neither: half a snapshot is not resumable.
     let snapshot = match (snap_mem, snap_vmstate) {
         (Some(m), Some(v)) => Some(SnapshotRef { mem_file: PathBuf::from(m), vmstate: PathBuf::from(v) }),
@@ -465,6 +486,7 @@ fn vm_from_row(r: &rusqlite::Row<'_>) -> Result<VmRecord> {
         allow,
         rules,
         policy_gen,
+        signed,
         snapshot,
     })
 }
