@@ -4,7 +4,7 @@
 //! `RpcResolver` calls the control-plane `identify` RPC and caches by source
 //! IP with a short TTL. In the single-host and edge roles that is how a
 //! connection is named; in the tier role the edge has already done it and
-//! the answer arrives in the PROXY protocol header.
+//! the answer arrives in the tunnel stream's headers.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -67,7 +67,7 @@ impl Policy {
     }
 }
 
-/// What travels from an edge to a proxy replica inside the PROXY protocol
+/// What travels from an edge to a proxy replica in the CONNECT stream's
 /// header: the connection's identity and its whole policy, so the replica
 /// needs no lookup, no cache and no watch.
 #[derive(Debug, Clone, Serialize, Deserialize)]

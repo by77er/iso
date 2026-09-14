@@ -30,8 +30,8 @@ single   nft DNAT ─▶ iso-proxyd ─┬─ identify.sock (controld)      toda
                                  ├─ ca.sock (iso-cad)             everything on the host
                                  └─ secrets.sock (iso-secretsd)
 
-edge     nft DNAT ─▶ iso-proxyd --role edge ─▶ mTLS + PROXY v2 {vm, principal, rules, gen} ─▶ tier
-                       └─ identify.sock (controld)
+edge     nft DNAT ─▶ iso-proxyd --role edge ─▶ pooled mTLS HTTP/2 tunnel, one CONNECT ─▶ tier
+                       └─ identify.sock (controld)      stream per guest connection, policy in headers
 
 proxy    edges ─mTLS─▶ iso-proxyd --role proxy ─┬─ https://…/sign     (iso-cad, mTLS)
                                                  └─ https://…/headers  (iso-secretsd, mTLS)
@@ -42,27 +42,34 @@ proxy    edges ─mTLS─▶ iso-proxyd --role proxy ─┬─ https://…/sign 
   `iso-up.sh` runs; nothing about it changed.
 - **edge**: the half that stays on a host. Name the connection, refuse what
   should never be proxied (unknown source, deny-mode VM), and carry the raw
-  bytes to a replica over mutual TLS (admin PKI) with the connection's
-  identity **and whole policy** in one custom PROXY protocol v2 TLV
-  (`0xE5`, JSON `WirePolicy`). Round-robins over the tier's addresses. Nothing
-  is terminated at the edge.
+  bytes to a replica as one **HTTP/2 CONNECT stream** on a long-lived
+  mutual-TLS tunnel (admin PKI), the way Envoy tunnels TCP. The stream's
+  headers carry the connection's identity **and whole policy**
+  (`x-iso-policy`: base64 JSON `WirePolicy`; `x-iso-src`). The edge keeps a
+  small pool of tunnels per replica (`tier_pool_size`, default 2) and spreads
+  streams over replicas and pools round-robin; a new guest connection costs
+  a stream open, not a handshake. PINGs every 10 s notice a dead replica.
+  Nothing is terminated at the edge.
 - **proxy**: a stateless replica. Require a client certificate from the admin
-  CA, read the header, serve the connection with the policy it carries. It
-  has no state directory, no policy lookup, no cache and no watch; the only
-  services it calls are the CA and the secrets store, over HTTPS with mutual
-  TLS. Its one cache is leaf certificates, until their `not_after`.
+  CA, speak HTTP/2, and serve every CONNECT stream as one guest connection
+  with the policy its headers carry (anything but CONNECT is 405, a stream
+  without the policy header is 400). It has no state directory, no policy
+  lookup, no cache and no watch; the only services it calls are the CA and
+  the secrets store, over HTTPS with mutual TLS. Its one cache is leaf
+  certificates, until their `not_after`.
 
 The **registry** (edge and single roles) records every live connection under
 its source address and policy generation, tunnels included. A watcher
 re-reads each VM's policy every `watch_every` (1 s) and closes everything held
 at an older generation, or by a VM that became unknown or deny-mode. That is
 how an h2 session or a WebSocket outlives a `PATCH /policy` by at most one
-tick, and the tier never learns it happened.
+tick: at the edge it is a RST_STREAM on the tunnel, and the tier never learns
+why.
 
 ## Data flow (serving a connection, `single` and `proxy`)
 
 ```text
-   1. accept; policy ← identify(src ip) [single] or the PROXY header [proxy]
+   1. accept; policy ← identify(src ip) [single] or the CONNECT headers [proxy]
    2. egress == deny? ──▶ DROP (a deny VM has no egress; reaching the services
       address is not a licence to proxy for it)
    3. peek TLS ClientHello  ── not TLS / no SNI? ──▶ DROP
@@ -181,8 +188,8 @@ listen = ["0.0.0.0:3129"]
 - `:authority != SNI` ⇒ 421. URI rule deny ⇒ 403.
 - Unknown source / deny-mode VM ⇒ refused at the edge.
 - SecretProvider down or empty ⇒ forward without injection (fail-open).
-- CertAuthority down ⇒ block (fail-closed). Tier unreachable ⇒ the edge
-  closes the guest connection.
+- CertAuthority down ⇒ block (fail-closed). Every replica unreachable ⇒ the
+  edge closes the guest connection; one replica down ⇒ the next is used.
 - Policy changed ⇒ the edge closes that VM's connections within one watch
   tick; new ones carry the new generation.
 
@@ -193,6 +200,7 @@ no root and no network: `tests/single_host.rs` (one process, Unix sockets)
 and `tests/multi_host.rs` (two edges, one replica, HTTPS mTLS to the CA and
 secrets services). They cover injection, the host and URI phases, deny-mode
 refusal, WebSocket tunnels with injection on the handshake, close-on-policy-
-change in both roles, the tier refusing non-admin-CA edges, and a replica
-with a stranger identity failing closed at the CA. `tests/e2e.rs` is the
+change in both roles, the tier refusing non-admin-CA edges, a replica with a
+stranger identity failing closed at the CA, and twenty guest connections
+sharing at most two tunnels. `tests/e2e.rs` is the
 `#[ignore]`d real-network check against an external echo service.

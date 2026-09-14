@@ -1,6 +1,6 @@
-//! Multi-host configuration: an `edge` on each host carries connections over
-//! mutual TLS, with the policy in a PROXY protocol v2 header, to a `proxy`
-//! replica that is nowhere near the host. The replica reaches the CA and the
+//! Multi-host configuration: an `edge` on each host carries connections as
+//! CONNECT streams on a pooled mutual-TLS HTTP/2 tunnel, with the policy in
+//! the stream's headers, to a `proxy` replica that is nowhere near the host. The replica reaches the CA and the
 //! secrets service over HTTPS with mutual TLS. Two "hosts" here are two edge
 //! listeners on loopback with their own policy sources; the tier is one
 //! replica listener. No Unix socket is shared between an edge and the tier.
@@ -61,6 +61,7 @@ async fn start_tier() -> Split {
 struct Edge {
     addr: SocketAddr,
     resolver: Arc<TestResolver>,
+    metrics: Arc<iso_proxy::edge::Metrics>,
 }
 
 /// An edge "on host `host_id`" with its own identity and policy source.
@@ -83,8 +84,26 @@ async fn start_edge(
     );
     cfg.host_id = host_id.into();
     cfg.watch_every = Duration::from_millis(50);
+    let metrics = cfg.metrics.clone();
     tokio::spawn(run_with_listeners(vec![listener], cfg));
-    Edge { addr, resolver }
+    Edge { addr, resolver, metrics }
+}
+
+#[tokio::test]
+async fn guest_connections_share_a_pooled_tunnel() {
+    use std::sync::atomic::Ordering;
+    let s = start_tier().await;
+    let e = start_edge(&s, "hostA", &s.pki.edge, &["allow https://api.example.test/**"], None, "proxy").await;
+    // Twenty guest connections: a fresh client each time, so nothing is
+    // pooled on the guest side and each is its own TCP connection to the edge.
+    for i in 0..20 {
+        let client = guest_client(e.addr, &s.tier_ca, false);
+        let resp = client.get(url(&format!("/get?i={i}"))).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+    assert_eq!(e.metrics.tier_streams_opened.load(Ordering::Relaxed), 20, "one stream per guest connection");
+    let conns = e.metrics.tier_connections_opened.load(Ordering::Relaxed);
+    assert!((1..=2).contains(&conns), "at most the pool size of tunnels, got {conns}");
 }
 
 #[tokio::test]

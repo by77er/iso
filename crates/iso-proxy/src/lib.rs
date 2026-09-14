@@ -7,11 +7,13 @@
 //!   to the services address, name each one through the host's identify RPC,
 //!   and serve it here. The CA and secrets services are Unix sockets.
 //! - **edge**: the half that stays on a host. Name the connection, then carry
-//!   it to a proxy replica over mutual TLS with the policy in a PROXY
-//!   protocol v2 header. Nothing is terminated here.
-//! - **proxy**: a stateless replica anywhere. Accept mutual TLS from edges,
-//!   read the header, and serve the connection with the policy it carries.
-//!   The CA and secrets services are reached over HTTPS with mutual TLS.
+//!   it to a proxy replica as one CONNECT stream on a long-lived mutual-TLS
+//!   HTTP/2 tunnel, with the policy in the stream's headers. Nothing is
+//!   terminated here.
+//! - **proxy**: a stateless replica anywhere. Accept mutual TLS HTTP/2 from
+//!   edges, and serve each CONNECT stream as a guest connection with the
+//!   policy it carries. The CA and secrets services are reached over HTTPS
+//!   with mutual TLS.
 //!
 //! Serving a connection is the same in `single` and `proxy`: peek the
 //! ClientHello for the SNI, refuse it unless some allow rule names that host,
@@ -21,7 +23,7 @@
 pub mod ca;
 pub mod edge;
 pub mod policy;
-pub mod proxyproto;
+pub mod tunnel;
 pub mod ws;
 
 pub use policy::{Policy, PolicyResolver, RpcResolver, StaticResolver, WirePolicy};
@@ -119,7 +121,7 @@ pub struct ProxyConfig {
     /// DNS-steer target for Allow mode (`single`, `edge`), or the address
     /// edges dial (`proxy`).
     pub listen: Vec<SocketAddr>,
-    /// This host's name in the PROXY header (`edge`) and in logs.
+    /// This host's name in the tunnel headers (`edge`) and in logs.
     pub host_id: String,
     /// Resolves a connection's source IP to its VM's policy (`single`, `edge`).
     pub resolver: Option<Arc<dyn PolicyResolver>>,
@@ -132,6 +134,12 @@ pub struct ProxyConfig {
     pub tier: Vec<SocketAddr>,
     pub tier_server_name: Option<String>,
     pub tier_tls: Option<Arc<rustls::ClientConfig>>,
+    /// Long-lived HTTP/2 connections per replica. More than one spreads
+    /// guest streams over several TCP connections, which is what keeps one
+    /// lossy connection's head-of-line blocking from stalling every stream.
+    pub tier_pool_size: usize,
+    /// Counters for the edge's tunnels; readable while running.
+    pub metrics: Arc<edge::Metrics>,
     /// Mutual TLS the replica requires from edges (`proxy`).
     pub accept_tls: Option<Arc<rustls::ServerConfig>>,
     /// Roots trusted for upstreams on top of the public webpki set: a private
@@ -158,6 +166,8 @@ impl ProxyConfig {
             tier: Vec::new(),
             tier_server_name: None,
             tier_tls: None,
+            tier_pool_size: 2,
+            metrics: Arc::new(edge::Metrics::default()),
             accept_tls: None,
             extra_upstream_roots: Vec::new(),
             upstream_pins: std::collections::HashMap::new(),
@@ -319,6 +329,8 @@ fn build_runtime(cfg: ProxyConfig) -> std::io::Result<Runtime> {
                 .clone()
                 .ok_or_else(|| invalid("edge needs a TLS client config for the tier"))?,
             cfg.host_id.clone(),
+            cfg.tier_pool_size,
+            cfg.metrics.clone(),
         )?)),
         _ => None,
     };
@@ -381,11 +393,10 @@ async fn accept_loop(listener: TcpListener, rt: Arc<Runtime>) -> std::io::Result
                 continue;
             }
         };
-        let local = tcp.local_addr().unwrap_or(peer);
         let rt = rt.clone();
         match rt.cfg.role {
             Role::Single => tokio::spawn(single_conn(tcp, peer, rt)),
-            Role::Edge => tokio::spawn(edge_conn(tcp, peer, local, rt)),
+            Role::Edge => tokio::spawn(edge_conn(tcp, peer, rt)),
             Role::Proxy => tokio::spawn(proxy_conn(tcp, peer, rt)),
         };
     }
@@ -422,7 +433,7 @@ async fn single_conn(tcp: TcpStream, peer: SocketAddr, rt: Arc<Runtime>) {
 }
 
 /// `edge`: name the connection, carry it to a replica, register it.
-async fn edge_conn(tcp: TcpStream, peer: SocketAddr, local: SocketAddr, rt: Arc<Runtime>) {
+async fn edge_conn(tcp: TcpStream, peer: SocketAddr, rt: Arc<Runtime>) {
     let resolver = rt.cfg.resolver.as_ref().expect("edge has a resolver");
     let policy = match edge::admit(&**resolver, peer.ip()).await {
         Ok(p) => p,
@@ -435,7 +446,7 @@ async fn edge_conn(tcp: TcpStream, peer: SocketAddr, local: SocketAddr, rt: Arc<
     let registry = rt.registry.clone();
     let policy_for_reg = policy.clone();
     let task = tokio::spawn(async move {
-        let mut upstream = match tier.open(peer, local, &policy).await {
+        let mut upstream = match tier.open(peer, &policy).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("edge: tier unreachable for {peer}: {e}");
@@ -452,11 +463,11 @@ async fn edge_conn(tcp: TcpStream, peer: SocketAddr, local: SocketAddr, rt: Arc<
     let _ = task.await;
 }
 
-/// `proxy`: mTLS from an edge, then the header, then the guest's TLS.
+/// `proxy`: mutual TLS from an edge, then an HTTP/2 connection whose every
+/// CONNECT stream is one guest connection with its policy in the headers.
 async fn proxy_conn(tcp: TcpStream, peer: SocketAddr, rt: Arc<Runtime>) {
-    let acceptor =
-        tokio_rustls::TlsAcceptor::from(rt.cfg.accept_tls.clone().expect("proxy has accept tls"));
-    let mut tls = match tokio::time::timeout(rt.cfg.handshake_timeout, acceptor.accept(tcp)).await {
+    let acceptor = tokio_rustls::TlsAcceptor::from(rt.cfg.accept_tls.clone().expect("proxy has accept tls"));
+    let tls = match tokio::time::timeout(rt.cfg.handshake_timeout, acceptor.accept(tcp)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             tracing::info!("proxy: edge {peer} failed mTLS: {e}");
@@ -467,31 +478,68 @@ async fn proxy_conn(tcp: TcpStream, peer: SocketAddr, rt: Arc<Runtime>) {
             return;
         }
     };
-    let decoded =
-        match tokio::time::timeout(rt.cfg.handshake_timeout, proxyproto::read(&mut tls)).await {
-            Ok(Ok(d)) => d,
-            Ok(Err(e)) => {
-                tracing::info!("proxy: edge {peer} sent no usable header: {e}");
-                return;
-            }
-            Err(_) => return,
-        };
-    let src = decoded.src.map(|s| s.ip()).unwrap_or(peer.ip());
+    tracing::info!("proxy: tunnel from edge {peer} open");
+    let ctx = rt.ctx.clone().expect("proxy has a ctx");
+    let service = service_fn(move |req: Request<Incoming>| {
+        let ctx = ctx.clone();
+        async move { Ok::<_, std::convert::Infallible>(accept_stream(req, peer, ctx)) }
+    });
+    let served = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+        .timer(hyper_util::rt::TokioTimer::new())
+        .keep_alive_interval(Some(Duration::from_secs(10)))
+        .keep_alive_timeout(Duration::from_secs(20))
+        .max_concurrent_streams(Some(4096))
+        .serve_connection(TokioIo::new(tls), service)
+        .await;
+    match served {
+        Ok(()) => tracing::info!("proxy: tunnel from edge {peer} closed"),
+        Err(e) => tracing::info!("proxy: tunnel from edge {peer} ended: {e}"),
+    }
+}
+
+/// One CONNECT on a tunnel: validate the identity it carries, answer 200,
+/// and serve the stream as the guest's connection. Anything else on the
+/// tunnel is refused.
+fn accept_stream(mut req: Request<Incoming>, edge: SocketAddr, ctx: Ctx) -> Resp {
+    if req.method() != http::Method::CONNECT {
+        return simple(405, "the tier speaks CONNECT only");
+    }
+    let decoded = match tunnel::decode(req.headers()) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::info!("proxy: edge {edge} sent an unusable stream: {e}");
+            return simple(400, "bad tunnel headers");
+        }
+    };
+    let src = decoded.src.map(|s| s.ip()).unwrap_or(edge.ip());
     let policy = match decoded.policy.into_policy() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("proxy: edge {peer} sent an unparsable policy: {e}");
-            return;
+            tracing::warn!("proxy: edge {edge} sent an unparsable policy: {e}");
+            return simple(400, "bad policy");
         }
     };
     if policy.is_deny_mode() {
-        tracing::info!("proxy: refusing deny-mode connection from {src} via {peer}");
-        return;
+        tracing::info!("proxy: refusing deny-mode connection from {src} via {edge}");
+        return simple(403, "deny-mode vm");
     }
-    let ctx = rt.ctx.clone().expect("proxy has a ctx");
-    if let Err(e) = serve_conn(tls, src, policy, ctx, None).await {
-        tracing::debug!("conn {src} via {peer} ended: {e}");
-    }
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    tokio::spawn(async move {
+        let stream = match on_upgrade.await {
+            Ok(u) => TokioIo::new(u),
+            Err(e) => {
+                tracing::debug!("proxy: stream from {src} via {edge} never opened: {e}");
+                return;
+            }
+        };
+        if let Err(e) = serve_conn(stream, src, policy, ctx, None).await {
+            tracing::debug!("conn {src} via {edge} ended: {e}");
+        }
+    });
+    Response::builder()
+        .status(200)
+        .body(http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}).boxed())
+        .unwrap()
 }
 
 /// Serve one guest connection: SNI gate, mint, terminate, then requests.
