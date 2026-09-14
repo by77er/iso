@@ -5,4 +5,6 @@ pub mod http;
 pub mod identify;
 pub mod metadata;
 pub mod settings;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod tls;

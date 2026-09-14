@@ -49,6 +49,11 @@ pub mod types {
         /// `deny`.
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub egress: ::std::option::Option<::std::string::String>,
+        ///Create under this id (hyphenated UUID or 32 hex digits) instead of a
+        ///generated one. A fleet service records the id before it calls, so a
+        ///retry after a lost reply is a `409`, never a second VM.
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub id: ::std::option::Option<::std::string::String>,
         ///Ports to forward into the VM; host ports are allocated.
         #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
         pub ingress: ::std::vec::Vec<PortForward>,
@@ -355,6 +360,22 @@ pub mod types {
         }
     }
 
+    ///A registered template, as a placer needs to see it.
+    #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug)]
+    pub struct Template {
+        pub mem_mib: i32,
+        pub name: ::std::string::String,
+        pub vcpus: i32,
+        ///Whether a memory snapshot exists, so clones resume rather than boot.
+        pub warm: bool,
+    }
+
+    impl Template {
+        pub fn builder() -> builder::Template {
+            Default::default()
+        }
+    }
+
     ///Register a template built by `isoctl bake`. Paths are host paths.
     #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug)]
     pub struct TemplateRequest {
@@ -626,6 +647,10 @@ pub mod types {
                 ::std::option::Option<::std::string::String>,
                 ::std::string::String,
             >,
+            id: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
             ingress:
                 ::std::result::Result<::std::vec::Vec<super::PortForward>, ::std::string::String>,
             labels: ::std::result::Result<
@@ -658,6 +683,7 @@ pub mod types {
                 Self {
                     allow: Ok(Default::default()),
                     egress: Ok(Default::default()),
+                    id: Ok(Default::default()),
                     ingress: Ok(Default::default()),
                     labels: Ok(Default::default()),
                     lifecycle: Ok(Default::default()),
@@ -690,6 +716,16 @@ pub mod types {
                 self.egress = value
                     .try_into()
                     .map_err(|e| format!("error converting supplied value for egress: {e}"));
+                self
+            }
+            pub fn id<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.id = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for id: {e}"));
                 self
             }
             pub fn ingress<T>(mut self, value: T) -> Self
@@ -794,6 +830,7 @@ pub mod types {
                 Ok(Self {
                     allow: value.allow?,
                     egress: value.egress?,
+                    id: value.id?,
                     ingress: value.ingress?,
                     labels: value.labels?,
                     lifecycle: value.lifecycle?,
@@ -812,6 +849,7 @@ pub mod types {
                 Self {
                     allow: Ok(value.allow),
                     egress: Ok(value.egress),
+                    id: Ok(value.id),
                     ingress: Ok(value.ingress),
                     labels: Ok(value.labels),
                     lifecycle: Ok(value.lifecycle),
@@ -1773,6 +1811,93 @@ pub mod types {
         }
 
         #[derive(Clone, Debug)]
+        pub struct Template {
+            mem_mib: ::std::result::Result<i32, ::std::string::String>,
+            name: ::std::result::Result<::std::string::String, ::std::string::String>,
+            vcpus: ::std::result::Result<i32, ::std::string::String>,
+            warm: ::std::result::Result<bool, ::std::string::String>,
+        }
+
+        impl ::std::default::Default for Template {
+            fn default() -> Self {
+                Self {
+                    mem_mib: Err("no value supplied for mem_mib".to_string()),
+                    name: Err("no value supplied for name".to_string()),
+                    vcpus: Err("no value supplied for vcpus".to_string()),
+                    warm: Err("no value supplied for warm".to_string()),
+                }
+            }
+        }
+
+        impl Template {
+            pub fn mem_mib<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<i32>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.mem_mib = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for mem_mib: {e}"));
+                self
+            }
+            pub fn name<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.name = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for name: {e}"));
+                self
+            }
+            pub fn vcpus<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<i32>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.vcpus = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for vcpus: {e}"));
+                self
+            }
+            pub fn warm<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<bool>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.warm = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for warm: {e}"));
+                self
+            }
+        }
+
+        impl ::std::convert::TryFrom<Template> for super::Template {
+            type Error = super::error::ConversionError;
+            fn try_from(
+                value: Template,
+            ) -> ::std::result::Result<Self, super::error::ConversionError> {
+                Ok(Self {
+                    mem_mib: value.mem_mib?,
+                    name: value.name?,
+                    vcpus: value.vcpus?,
+                    warm: value.warm?,
+                })
+            }
+        }
+
+        impl ::std::convert::From<super::Template> for Template {
+            fn from(value: super::Template) -> Self {
+                Self {
+                    mem_mib: Ok(value.mem_mib),
+                    name: Ok(value.name),
+                    vcpus: Ok(value.vcpus),
+                    warm: Ok(value.warm),
+                }
+            }
+        }
+
+        #[derive(Clone, Debug)]
         pub struct TemplateRequest {
             boot_args: ::std::result::Result<
                 ::std::option::Option<::std::string::String>,
@@ -2432,6 +2557,17 @@ impl Client {
         builder::Stats::new(self)
     }
 
+    ///Sends a `GET` request to `/templates`
+    ///
+    ///```ignore
+    /// let response = client.list_templates()
+    ///    .send()
+    ///    .await;
+    /// ```
+    pub fn list_templates(&self) -> builder::ListTemplates<'_> {
+        builder::ListTemplates::new(self)
+    }
+
     ///Sends a `POST` request to `/templates`
     ///
     ///```ignore
@@ -2797,6 +2933,54 @@ pub mod builder {
         }
     }
 
+    ///Builder for [`Client::list_templates`]
+    ///
+    ///[`Client::list_templates`]: super::Client::list_templates
+    #[derive(Debug, Clone)]
+    pub struct ListTemplates<'a> {
+        client: &'a super::Client,
+    }
+
+    impl<'a> ListTemplates<'a> {
+        pub fn new(client: &'a super::Client) -> Self {
+            Self { client: client }
+        }
+
+        ///Sends a `GET` request to `/templates`
+        pub async fn send(
+            self,
+        ) -> Result<ResponseValue<::std::vec::Vec<types::Template>>, Error<()>> {
+            let Self { client } = self;
+            let url = format!("{}/templates", client.baseurl,);
+            let mut header_map = ::reqwest::header::HeaderMap::with_capacity(1usize);
+            header_map.append(
+                ::reqwest::header::HeaderName::from_static("api-version"),
+                ::reqwest::header::HeaderValue::from_static(super::Client::api_version()),
+            );
+            #[allow(unused_mut)]
+            let mut request = client
+                .client
+                .get(url)
+                .header(
+                    ::reqwest::header::ACCEPT,
+                    ::reqwest::header::HeaderValue::from_static("application/json"),
+                )
+                .headers(header_map)
+                .build()?;
+            let info = OperationInfo {
+                operation_id: "list_templates",
+            };
+            client.pre(&mut request, &info).await?;
+            let result = client.exec(request, &info).await;
+            client.post(&result, &info).await?;
+            let response = result?;
+            match response.status().as_u16() {
+                200u16 => ResponseValue::from_response(response).await,
+                _ => Err(Error::UnexpectedResponse(response)),
+            }
+        }
+    }
+
     ///Builder for [`Client::register_template`]
     ///
     ///[`Client::register_template`]: super::Client::register_template
@@ -2984,6 +3168,9 @@ pub mod builder {
             let response = result?;
             match response.status().as_u16() {
                 200u16 => ResponseValue::from_response(response).await,
+                400u16 => Err(Error::ErrorResponse(
+                    ResponseValue::from_response(response).await?,
+                )),
                 404u16 => Err(Error::ErrorResponse(
                     ResponseValue::from_response(response).await?,
                 )),

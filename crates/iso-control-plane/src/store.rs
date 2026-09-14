@@ -210,6 +210,20 @@ impl Store {
         Ok(())
     }
 
+    pub fn list_templates(&self) -> Result<Vec<TemplateDef>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT name, rootfs_template, snapshot_mem, snapshot_vmstate, vcpus, mem_mib, kernel, boot_args
+             FROM templates ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(template_from_row(r)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
     pub fn get_template(&self, name: &str) -> Result<Option<TemplateDef>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(

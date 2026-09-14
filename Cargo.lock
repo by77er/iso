@@ -1273,6 +1273,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "iso-fleet"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "http",
+ "hyper",
+ "hyper-util",
+ "iso-admin-pki",
+ "iso-client",
+ "iso-common",
+ "iso-controld",
+ "reqwest 0.13.5",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "iso-guest-agent"
 version = "0.1.0"
 dependencies = [

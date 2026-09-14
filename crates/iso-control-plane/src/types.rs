@@ -135,6 +135,10 @@ pub struct VmRecord {
 /// Request to create a VM.
 #[derive(Clone, Debug)]
 pub struct CreateVm {
+    /// The id to create under, when the caller (a fleet service) has already
+    /// recorded it. `None` generates one. Creating an id that exists is an
+    /// error, which is what makes a retried create safe.
+    pub id: Option<VmId>,
     pub template: String,
     pub egress: EgressMode,
     pub ingress: Vec<PortForward>,
@@ -153,6 +157,7 @@ impl CreateVm {
     /// restart, template machine-config).
     pub fn new(template: impl Into<String>) -> Self {
         Self {
+            id: None,
             template: template.into(),
             egress: EgressMode::Deny,
             ingress: Vec::new(),

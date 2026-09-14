@@ -40,6 +40,7 @@ Not TLS, or no SNI: dropped. SNI not on the allow-list: reset. Request host that
 | `iso-firecracker` | Drives Firecracker over its API socket from inside the VM's netns. Snapshot and resume for warm starts. |
 | `iso-proxy` / `iso-ca` / `iso-secrets` | The `proxy` egress mode: `iso-proxyd` (data plane; one binary in `single`, `edge` or `proxy` role), `iso-cad` (sign-only CA, 24 h leaves), `iso-secretsd` (header store behind a provider trait: TOML, `exec`, chain). Each side service speaks a Unix socket and, given a service identity, HTTPS with mutual TLS. |
 | `iso-policy` / `iso-rpc` | The URI-level rule language and matcher (pure), and the two RPC transports the side services share. |
+| `iso-fleet` | `iso-fleetd`: one API over many hosts. Places a VM on a host that has its template and a free slot, remembers where it is, routes every later call by id, and reconciles its record with a sync loop. The API is the host API minus the host, so every client works by changing a URL. [docs/fleet.md](docs/fleet.md). |
 | `iso-dns-server` | Dual-horizon resolver on the services address: `metadata.iso.internal` locally, everything else forwarded. |
 | `iso-guest-agent` / `iso-guest-proto` | The service inside the guest that runs programs and moves files for the host, and its wire protocol. |
 | `iso-admin-pki` | The admin API's own CA: server certificate and client certificates for mutual TLS. |
@@ -155,6 +156,10 @@ pi
 ```
 
 Without `ISO_SERVER` or credentials the extension leaves pi's tools local. `/iso` shows the VM, `ISO_KEEP=1` keeps it, `--no-iso` opts out for one run. `node contrib/pi/test/run.mjs` exercises the extension against a mock of the admin API.
+
+## More than one host
+
+`iso-fleetd` fronts any number of hosts with the same API each host serves, so `isoctl vm`, the pi extension and `iso-client` need only a different `ISO_SERVER`. Point it at hosts that share one admin CA, and it places, routes by id and keeps its record honest; see [docs/fleet.md](docs/fleet.md) and [`contrib/fleet/fleet.example.toml`](contrib/fleet/fleet.example.toml). Hosts stay exactly as above.
 
 ## Master web console
 

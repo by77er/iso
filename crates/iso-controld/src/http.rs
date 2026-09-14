@@ -51,7 +51,8 @@ impl From<CpError> for ApiError {
             CpError::UnknownVm(_)
             | CpError::UnknownTemplate(_)
             | CpError::UnknownForward { .. } => StatusCode::NOT_FOUND,
-            CpError::SlotsExhausted
+            CpError::VmExists(_)
+            | CpError::SlotsExhausted
             | CpError::PortsExhausted
             | CpError::PoolFull { .. }
             | CpError::InvalidState { .. } => StatusCode::CONFLICT,
@@ -99,6 +100,11 @@ struct PortForward {
 /// Create and boot a VM. Only `template` is required.
 #[derive(Deserialize, ToSchema)]
 struct CreateVmRequest {
+    /// Create under this id (hyphenated UUID or 32 hex digits) instead of a
+    /// generated one. A fleet service records the id before it calls, so a
+    /// retry after a lost reply is a `409`, never a second VM.
+    #[serde(default)]
+    id: Option<String>,
     /// A registered template name.
     template: String,
     /// `allow`, `proxy` or `deny` (default). Unrecognized values mean `deny`.
@@ -323,8 +329,9 @@ fn restart_from(s: &str) -> iso_control_plane::RestartPolicy {
     }
 }
 
-fn to_req(r: CreateVmRequest) -> CreateVm {
+fn to_req(r: CreateVmRequest, id: Option<VmId>) -> CreateVm {
     CreateVm {
+        id,
         template: r.template,
         egress: egress_from(&r.egress),
         ingress: r
@@ -380,8 +387,9 @@ fn vm_resp(r: &VmRecord) -> Vm {
 #[utoipa::path(post, path = "/vms", tag = "vms", request_body = CreateVmRequest,
     responses(
         (status = 200, description = "Created and booted", body = CreatedVm),
+        (status = 400, description = "A malformed id or rule", body = ErrorBody),
         (status = 404, description = "Unknown template", body = ErrorBody),
-        (status = 409, description = "No free slot or port, or the pool is over its watermark", body = ErrorBody),
+        (status = 409, description = "The id exists, no free slot or port, or the pool is over its watermark", body = ErrorBody),
     ))]
 async fn create<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
@@ -392,8 +400,38 @@ where
     S: StorageManager + Send + Sync + 'static,
     R: VmRuntime + Send + Sync + 'static,
 {
-    let id = cp.create_vm(to_req(req)).await?;
+    let id = match &req.id {
+        Some(s) => Some(parse_id(s)?),
+        None => None,
+    };
+    let id = cp.create_vm(to_req(req, id)).await?;
     Ok(Json(CreatedVm { id: id.to_string() }))
+}
+
+/// A registered template, as a placer needs to see it.
+#[derive(Serialize, ToSchema)]
+struct Template {
+    name: String,
+    vcpus: u32,
+    mem_mib: u32,
+    /// Whether a memory snapshot exists, so clones resume rather than boot.
+    warm: bool,
+}
+
+#[utoipa::path(get, path = "/templates", tag = "templates",
+    responses((status = 200, description = "Every registered template", body = Vec<Template>)))]
+async fn list_templates<N, S, R>(State(cp): State<Cp<N, S, R>>) -> Result<Json<Vec<Template>>, ApiError>
+where
+    N: NetworkManager + Send + Sync + 'static,
+    S: StorageManager + Send + Sync + 'static,
+    R: VmRuntime + Send + Sync + 'static,
+{
+    Ok(Json(
+        cp.list_templates()?
+            .into_iter()
+            .map(|t| Template { name: t.name, vcpus: t.vcpus, mem_mib: t.mem_mib, warm: t.snapshot.is_some() })
+            .collect(),
+    ))
 }
 
 #[utoipa::path(get, path = "/vms", tag = "vms",
@@ -749,9 +787,9 @@ where
         license(name = "MIT"),
     ),
     paths(create, list, get_one, start, stop, suspend, halt, terminate, retire_suspension, destroy, set_policy, add_forward, remove_forward,
-        register_template, stats, agent_info, guest_exec, read_file, write_file, remove_path, list_dir),
+        register_template, list_templates, stats, agent_info, guest_exec, read_file, write_file, remove_path, list_dir),
     components(schemas(ErrorBody, PortForward, CreateVmRequest, CreatedVm, AddForwardRequest, Vm, PolicyRequest,
-        WriteFileRequest, Written, DirListing, Stats, TemplateRequest,
+        WriteFileRequest, Written, DirListing, Stats, TemplateRequest, Template,
         ExecRequest, ExecResult, AgentInfo, FileContent, DirEntry, iso_guest_proto::FileKind)),
     tags(
         (name = "vms", description = "VM lifecycle, policy and port forwards"),
@@ -795,7 +833,7 @@ where
             get(read_file::<N, S, R>).put(write_file::<N, S, R>).delete(remove_path::<N, S, R>),
         )
         .route("/vms/{id}/dir", get(list_dir::<N, S, R>))
-        .route("/templates", post(register_template::<N, S, R>))
+        .route("/templates", post(register_template::<N, S, R>).get(list_templates::<N, S, R>))
         .route("/stats", get(stats::<N, S, R>))
         .route("/openapi.json", get(openapi_json))
         .with_state(cp)
@@ -804,141 +842,12 @@ where
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use std::time::Duration;
 
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
-    use iso_common::{
-        HostNetwork, InstanceSpec, MacAddr, NetworkFixture, NetworkPolicy, PoolStats,
-        Result as IRes, SlotId, StorageHandle, VmStatus, VolumeSpec,
-    };
-    use iso_control_plane::Config;
-    use std::net::Ipv4Addr;
     use tower::ServiceExt;
 
-    struct MNet;
-    impl NetworkManager for MNet {
-        async fn init(&self) -> IRes<HostNetwork> {
-            Ok(HostNetwork { services_addr: Ipv4Addr::new(172, 22, 0, 1), proxy_port: 3128 })
-        }
-        async fn apply(&self, slot: SlotId, _p: &NetworkPolicy) -> IRes<NetworkFixture> {
-            Ok(NetworkFixture {
-                slot,
-                netns: format!("vm{:04x}", slot.get()),
-                tap: "tap0".into(),
-                veth_host: format!("vm{:04x}", slot.get()),
-                veth_netns: format!("vp{:04x}", slot.get()),
-                vh_ip: Ipv4Addr::new(172, 21, 0, 0),
-                vp_ip: Ipv4Addr::new(172, 21, 0, 1),
-                mac: MacAddr([2, 0, 0, 0, 0, 1]),
-            })
-        }
-        async fn reapply_policy(&self, _slot: SlotId, _p: &NetworkPolicy) -> IRes<()> {
-            Ok(())
-        }
-        async fn teardown(&self, _slot: SlotId) -> IRes<()> {
-            Ok(())
-        }
-        fn address_to_slot(&self, _a: Ipv4Addr) -> Option<SlotId> {
-            None
-        }
-    }
-
-    struct MStore;
-    impl StorageManager for MStore {
-        async fn init(&self) -> IRes<()> {
-            Ok(())
-        }
-        async fn provision(&self, vm: VmId, _s: &VolumeSpec) -> IRes<StorageHandle> {
-            Ok(StorageHandle {
-                vm,
-                device_path: "/dev/iso/x".into(),
-                backing_device: Some("/dev/iso/tpl_x".into()),
-            })
-        }
-        async fn teardown(&self, _vm: VmId) -> IRes<()> {
-            Ok(())
-        }
-        async fn pool_stats(&self) -> IRes<PoolStats> {
-            Ok(PoolStats { data_percent: 10.0, metadata_percent: 5.0, ..Default::default() })
-        }
-    }
-
-    struct MRun(Mutex<std::collections::HashMap<VmId, VmStatus>>);
-    impl VmRuntime for MRun {
-        async fn create(&self, s: &InstanceSpec) -> IRes<()> {
-            self.0.lock().unwrap().insert(s.vm, VmStatus::Created);
-            Ok(())
-        }
-        async fn start(&self, vm: VmId) -> IRes<()> {
-            self.0.lock().unwrap().insert(vm, VmStatus::Running);
-            Ok(())
-        }
-        async fn suspend(&self, vm: VmId) -> IRes<iso_common::SnapshotRef> {
-            self.0.lock().unwrap().insert(vm, VmStatus::Suspended);
-            Ok(iso_common::SnapshotRef {
-                mem_file: format!("/state/{vm}/mem").into(),
-                vmstate: format!("/state/{vm}/vmstate").into(),
-            })
-        }
-        async fn release(&self, vm: VmId) -> IRes<()> {
-            self.0.lock().unwrap().insert(vm, VmStatus::Stopped);
-            Ok(())
-        }
-        async fn stop(&self, vm: VmId) -> IRes<()> {
-            self.0.lock().unwrap().insert(vm, VmStatus::Stopped);
-            Ok(())
-        }
-        async fn halt(&self, vm: VmId) -> IRes<()> {
-            self.0.lock().unwrap().insert(vm, VmStatus::Stopped);
-            Ok(())
-        }
-        async fn destroy(&self, vm: VmId) -> IRes<()> {
-            self.0.lock().unwrap().remove(&vm);
-            Ok(())
-        }
-        async fn status(&self, vm: VmId) -> IRes<VmStatus> {
-            Ok(self.0.lock().unwrap().get(&vm).copied().unwrap_or(VmStatus::Absent))
-        }
-        /// The real guest agent on the far end of a socketpair: the handlers
-        /// under test speak to it exactly as they would to a VM.
-        async fn guest_channel(&self, _vm: VmId, _port: u32) -> IRes<std::os::fd::OwnedFd> {
-            let (host, guest) = std::os::unix::net::UnixStream::pair().map_err(|e| iso_common::Error::Backend(e.to_string()))?;
-            guest.set_nonblocking(true).unwrap();
-            let guest = tokio::net::UnixStream::from_std(guest).unwrap();
-            tokio::spawn(iso_guest_agent::serve_connection(guest));
-            Ok(std::os::fd::OwnedFd::from(host))
-        }
-    }
-
-    pub(crate) fn app() -> Router {
-        let cfg = Config {
-            db_path: ":memory:".into(),
-            default_vcpus: 1,
-            default_mem_mib: 512,
-            pool_watermark_percent: 90.0,
-            graceful_stop: Duration::from_secs(1),
-            slot_capacity: 8,
-            forward_ports: (20000, 30000),
-            vsock_cid: Some(3),
-            guest_agent_port: 5000,
-        };
-        let cp = Arc::new(
-            ControlPlane::new(cfg, MNet, MStore, MRun(Mutex::new(Default::default()))).unwrap(),
-        );
-        cp.register_template(&TemplateDef {
-            name: "base".into(),
-            rootfs_template: "base".into(),
-            snapshot: None,
-            vcpus: 1,
-            mem_mib: 512,
-            kernel: "/k".into(),
-            boot_args: String::new(),
-        })
-        .unwrap();
-        router(cp)
-    }
+    pub(crate) use crate::testing::app;
 
     pub(super) async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
@@ -1183,6 +1092,37 @@ mod guest_tests {
         assert_eq!(vm["allow"], serde_json::json!(["api.github.com"]), "allow is untouched by a rules patch");
     }
 
+    #[tokio::test]
+    async fn a_caller_supplied_id_is_used_once_and_templates_are_listed() {
+        let app = app();
+        let id = "0123456789abcdef0123456789abcdef";
+        let resp = app
+            .clone()
+            .oneshot(post("/vms", serde_json::json!({"template":"base","id":id})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_json(resp).await["id"], "01234567-89ab-cdef-0123-456789abcdef");
+        // The same id again is a conflict, not a second VM: a fleet retry is safe.
+        let resp = app
+            .clone()
+            .oneshot(post("/vms", serde_json::json!({"template":"base","id":id})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let resp = app
+            .clone()
+            .oneshot(post("/vms", serde_json::json!({"template":"base","id":"not-an-id"})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let list = body_json(app.clone().oneshot(get("/vms")).await.unwrap()).await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        let templates = body_json(app.clone().oneshot(get("/templates")).await.unwrap()).await;
+        assert_eq!(templates[0]["name"], "base");
+        assert_eq!(templates[0]["warm"], false);
+    }
+
     pub(super) fn get(path: &str) -> Request<Body> {
         Request::builder().method("GET").uri(path).body(Body::empty()).unwrap()
     }
@@ -1235,7 +1175,7 @@ mod openapi_tests {
         let extra: Vec<_> = documented.difference(&served).collect();
         assert!(missing.is_empty(), "routes without an OpenAPI operation: {missing:?}");
         assert!(extra.is_empty(), "documented operations with no route: {extra:?}");
-        assert_eq!(served.len(), 21, "operation count; update when routes change on purpose");
+        assert_eq!(served.len(), 22, "operation count; update when routes change on purpose");
     }
 
     #[test]

@@ -30,6 +30,27 @@
       }
     },
     "/templates": {
+      "get": {
+        "tags": [
+          "templates"
+        ],
+        "operationId": "list_templates",
+        "responses": {
+          "200": {
+            "description": "Every registered template",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Template"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
       "post": {
         "tags": [
           "templates"
@@ -100,6 +121,16 @@
               }
             }
           },
+          "400": {
+            "description": "A malformed id or rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Unknown template",
             "content": {
@@ -111,7 +142,7 @@
             }
           },
           "409": {
-            "description": "No free slot or port, or the pool is over its watermark",
+            "description": "The id exists, no free slot or port, or the pool is over its watermark",
             "content": {
               "application/json": {
                 "schema": {
@@ -1203,6 +1234,11 @@
             "type": "string",
             "description": "`allow`, `proxy` or `deny` (default). Unrecognized values mean `deny`."
           },
+          "id": {
+            "type": "string",
+            "description": "Create under this id (hyphenated UUID or 32 hex digits) instead of a\ngenerated one. A fleet service records the id before it calls, so a\nretry after a lost reply is a `409`, never a second VM.",
+            "nullable": true
+          },
           "ingress": {
             "type": "array",
             "items": {
@@ -1581,6 +1617,35 @@
             "type": "integer",
             "description": "VM records, in any state.",
             "minimum": 0
+          }
+        }
+      },
+      "Template": {
+        "type": "object",
+        "description": "A registered template, as a placer needs to see it.",
+        "required": [
+          "name",
+          "vcpus",
+          "mem_mib",
+          "warm"
+        ],
+        "properties": {
+          "mem_mib": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "vcpus": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "warm": {
+            "type": "boolean",
+            "description": "Whether a memory snapshot exists, so clones resume rather than boot."
           }
         }
       },

@@ -1,0 +1,30 @@
+# iso-fleetd configuration. Start with `iso-fleetd fleet.toml`.
+
+listen = "0.0.0.0:7080"
+db = "/var/lib/iso-fleet/fleet.db"
+
+# The fleet's own CA. Clients get certificates with
+#   isoctl admin --pki-dir /var/lib/iso-fleet/pki issue-client --name me --out ./creds
+# and then point ISO_SERVER at this service instead of a host.
+pki_dir = "/var/lib/iso-fleet/pki"
+extra_sans = ["fleet.example.internal"]
+
+sync_every_ms = 3000
+create_grace_secs = 60
+
+# The identity the fleet presents to hosts. Every host trusts the same admin
+# CA: copy one ca.crt/ca.key into each host's ISO_ADMIN_TLS_DIR before its
+# controld first starts, then mint this identity from it:
+#   isoctl admin --pki-dir <that dir> issue-client --name fleet --out /etc/iso-fleet/hosts
+[hosts_tls]
+ca = "/etc/iso-fleet/hosts/ca.crt"
+cert = "/etc/iso-fleet/hosts/fleet.crt"
+key = "/etc/iso-fleet/hosts/fleet.key"
+
+[[hosts]]
+name = "hostA"
+url = "https://10.0.0.5:7070"
+
+[[hosts]]
+name = "hostB"
+url = "https://10.0.0.6:7070"

@@ -128,6 +128,10 @@ where
 
     /// Register (or update) a template. Out-of-band; the bake produces the
     /// artifacts, this just records where they are and the machine config.
+    pub fn list_templates(&self) -> Result<Vec<TemplateDef>> {
+        self.store.list_templates()
+    }
+
     pub fn register_template(&self, def: &TemplateDef) -> Result<()> {
         self.store.upsert_template(def)
     }
@@ -154,11 +158,14 @@ where
             });
         }
 
-        let id = random_vmid();
+        let id = req.id.unwrap_or_else(random_vmid);
         // Hold this VM's lock from the moment its id exists, so a concurrent
         // supervise/handle_exit can't act on the half-created record.
         let lock = self.vm_lock(id);
         let _guard = lock.lock().await;
+        if self.store.get_vm(id)?.is_some() {
+            return Err(Error::VmExists(id));
+        }
         let slot = self
             .slots
             .lock()

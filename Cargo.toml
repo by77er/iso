@@ -19,6 +19,7 @@ members = [
     "crates/iso-admin-pki",
     "crates/iso-client",
     "crates/iso-master",
+    "crates/iso-fleet",
 ]
 
 [workspace.package]

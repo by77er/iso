@@ -13,6 +13,8 @@ pub enum Error {
     PortsExhausted,
     /// No VM with this id is known.
     UnknownVm(VmId),
+    /// A VM with this id already exists (a create named it).
+    VmExists(VmId),
     /// No template registered under this name.
     UnknownTemplate(String),
     /// No ingress forward with this `(host_port, proto)` exists on the VM.
@@ -42,6 +44,7 @@ impl std::fmt::Display for Error {
             Error::SlotsExhausted => write!(f, "no free slots remain"),
             Error::PortsExhausted => write!(f, "no free forward ports remain"),
             Error::UnknownVm(id) => write!(f, "unknown vm {id}"),
+            Error::VmExists(id) => write!(f, "vm {id} already exists"),
             Error::UnknownTemplate(n) => write!(f, "unknown template '{n}'"),
             Error::UnknownForward { host_port, proto } => {
                 write!(f, "no ingress forward {proto}/{host_port} on this vm")
