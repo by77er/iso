@@ -183,6 +183,7 @@ async fn sessions(State(web): State<Web>) -> Api<Vec<Session>> {
 }
 #[derive(Deserialize)]
 struct New {
+    #[serde(default)]
     name: String,
     #[serde(flatten)]
     options: CreateOptions,
@@ -216,6 +217,7 @@ async fn swarm(State(web): State<Web>, Path(id): Path<Uuid>) -> Api<Value> {
 }
 #[derive(Deserialize)]
 struct Child {
+    #[serde(default)]
     name: String,
     role: Role,
     task: String,
@@ -310,7 +312,7 @@ async fn events(
         .get(&id)
         .map_err(|_| ApiError(StatusCode::NOT_FOUND, "Session not found".into()))?;
     Ok(Json(
-        json!({"session":session,"events":web.engine.store.events(&id,cursor.after)?}),
+        json!({"session":session,"events":web.engine.store.events(&id,cursor.after)?,"queued":web.engine.store.operator_queue(&id)?}),
     ))
 }
 #[derive(Deserialize)]
@@ -322,13 +324,16 @@ async fn prompt(
     Path(id): Path<Uuid>,
     Json(data): Json<Prompt>,
 ) -> Api<Value> {
-    web.engine.prompt(&id.to_string(), &data.message).await?;
+    web.engine
+        .submit_prompt(&id.to_string(), &data.message)
+        .await?;
     Ok(Json(json!({"ok":true})))
 }
 async fn action(State(web): State<Web>, Path((id, action)): Path<(Uuid, String)>) -> Api<Value> {
     let id = id.to_string();
     match action.as_str() {
         "sleep" => web.engine.sleep(&id).await?,
+        "stop-vm" => web.engine.stop_vm(&id).await?,
         "abort" => web.engine.abort(&id).await?,
         "recover" => {
             web.engine.recover_session(&id).await?;
@@ -352,6 +357,15 @@ async fn close(State(web): State<Web>, Path(id): Path<Uuid>) -> Api<Value> {
     web.engine.close_session(&id.to_string()).await?;
     Ok(Json(json!({"ok":true})))
 }
+async fn cancel_queued(
+    State(web): State<Web>,
+    Path((id, message)): Path<(Uuid, i64)>,
+) -> Api<Value> {
+    web.engine
+        .store
+        .cancel_operator_message(&id.to_string(), message)?;
+    Ok(Json(json!({"ok":true})))
+}
 async fn fleet(State(web): State<Web>) -> Json<Value> {
     Json(json!({"planes":web.engine.fleet().await}))
 }
@@ -369,6 +383,7 @@ pub fn router(web: Web) -> Router {
         .route("/api/sessions/{id}/swarm", get(swarm))
         .route("/api/sessions/{id}/children", post(child))
         .route("/api/sessions/{id}/prompt", post(prompt))
+        .route("/api/sessions/{id}/queue/{message}", delete(cancel_queued))
         .route("/api/sessions/{id}/actions/{action}", post(action))
         .route("/api/fleet", get(fleet))
         .layer(middleware::from_fn_with_state(web.clone(), protect));

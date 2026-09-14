@@ -1,6 +1,111 @@
 import { test, expect } from "@playwright/test";
 test.use({ colorScheme: "dark" });
 
+test("chat restores reading position and can jump to the bottom", async ({ page }, testInfo) => {
+  const name = `Scroll history ${testInfo.repeatEachIndex}`;
+  await page.route("**/api/sessions/*/events?*", async route => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.events = new URL(route.request().url()).searchParams.get("after") === "0"
+      ? Array.from({ length: 80 }, (_, i) => ({ seq: i + 1, type: "message", role: "assistant", text: `History entry ${i}. This is a paragraph of retained conversation.` })) : [];
+    await route.fulfill({ json: body });
+  });
+  await page.goto("/");
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password").fill("browser-test-password");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page.getByRole("button", { name: "New agent", exact: true }).click();
+  await page.getByLabel("Agent name").fill(name);
+  await page.getByRole("button", { name: "Create agent", exact: true }).click();
+  const transcript = page.locator(".transcript");
+  await expect(transcript).toContainText("History entry 79");
+  await expect.poll(() => transcript.evaluate(n => n.scrollHeight - n.clientHeight - n.scrollTop)).toBeLessThan(5);
+  await transcript.evaluate(n => { n.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true })); n.scrollTop = 300; n.dispatchEvent(new Event("scroll")); });
+  await expect(page.getByRole("button", { name: "Go to bottom", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Control planes", exact: true }).click();
+  await page.locator(".sidebar-tree .session-link").filter({ hasText: name }).click();
+  await expect.poll(() => transcript.evaluate(n => n.scrollTop)).toBe(300);
+  await page.getByRole("button", { name: "Go to bottom", exact: true }).click();
+  await expect.poll(() => transcript.evaluate(n => n.scrollHeight - n.clientHeight - n.scrollTop)).toBeLessThan(5);
+});
+
+test("fleet supports backend-specific storage metrics and unknown values", async ({ page }) => {
+  await page.route("**/api/fleet", route => route.fulfill({ json: { planes: [
+    { id: "storage-host", available: true, capacity: 0, count: 0, storage: {
+      storage_backend: "example-backend", pool_capacity_bytes: 100 * 1024 ** 3,
+      pool_used_bytes: 95 * 1024 ** 3, data_percent: 95, snapshot_bytes: 0,
+    } },
+    { id: "legacy-host", available: true, capacity: 0, count: 0 },
+  ] } }));
+  await page.goto("/");
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password").fill("browser-test-password");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page.getByRole("button", { name: "Control planes", exact: true }).click();
+  const card = page.locator(".plane-card").filter({ hasText: "storage-host" });
+  await expect(card).toContainText("example-backend");
+  await expect(card).toContainText("95 GiB / 100 GiB");
+  await expect(card.getByRole("alert")).toBeVisible();
+  await expect(card.locator("dd").nth(2)).toHaveText("0 GiB");
+  await expect(card.locator("dd").nth(3)).toHaveText("Unknown");
+  await expect(page.locator(".plane-card").filter({ hasText: "legacy-host" })).toContainText("Unknown / Unknown");
+});
+
+test("busy agents expose a durable queue preview and cancellation", async ({
+  page,
+}) => {
+  let queued: { id: number; message: string; status: string }[] = [];
+  await page.route("**/api/sessions/*/events?*", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.session.phase = "working";
+    body.queued = queued;
+    await route.fulfill({ json: body });
+  });
+  await page.route("**/api/sessions/*/prompt", async (route) => {
+    queued.push({
+      id: 1,
+      message: route.request().postDataJSON().message,
+      status: "pending",
+    });
+    await route.fulfill({ json: { ok: true } });
+  });
+  await page.route("**/api/sessions/*/queue/1", async (route) => {
+    expect(route.request().method()).toBe("DELETE");
+    queued = [];
+    await route.fulfill({ json: { ok: true } });
+  });
+  await page.goto("/");
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password").fill("browser-test-password");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page.getByRole("button", { name: "New agent", exact: true }).click();
+  await page.getByLabel("Agent name").fill("Queue example");
+  await page.getByRole("button", { name: "Create agent", exact: true }).click();
+  await page.getByLabel("Message your agent").fill("Follow up after this turn");
+  await page
+    .getByRole("button", { name: "Queue message", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Stop", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Queued messages" }),
+  ).toContainText("Follow up after this turn");
+  await page.reload();
+  await page
+    .locator(".sidebar-tree .session-link")
+    .filter({ hasText: "Queue example" })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "Queued messages" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Cancel queued message" }).click();
+  await expect(
+    page.getByRole("region", { name: "Queued messages" }),
+  ).toHaveCount(0);
+});
+
 test("tool calls share an aligned compact group", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.route("**/api/sessions/*/events?*", async (route) => {
@@ -124,6 +229,14 @@ test("agent-first flow, stream, sleep, wake, fleet, and close", async ({
     .fill("Continue where we left off.");
   await page.getByRole("button", { name: "Send message" }).click();
   await expect(page.locator(".message.assistant")).toHaveCount(2);
+  await expect(page.locator(".header-actions .badge")).toHaveText("Ready");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Stop VM", exact: true }).click();
+  await expect(page.locator(".header-actions .badge")).toHaveText(
+    "Needs recovery",
+  );
+  await expect(page.locator(".recovery")).toContainText("VM stopped");
+  await page.getByRole("button", { name: "Recover", exact: true }).click();
   await expect(page.locator(".header-actions .badge")).toHaveText("Ready");
   expect(await page.locator(".workspace-details").textContent()).toBe(vmBefore);
   await expect(page.getByText("Private microVM", { exact: true })).toHaveCount(
@@ -307,6 +420,25 @@ test("swarm has separate models and a navigable planner-worker tree", async ({
   await expect(expand).toBeVisible();
   await expect(page.locator(".tool-card")).toHaveCount(0);
   await page.screenshot({ path: "test-results/swarm.png", fullPage: true });
+  await page
+    .locator(".sidebar-tree .session-link")
+    .filter({ hasText: "Planner root" })
+    .click();
+  page.once("dialog", async (dialog) => {
+    expect(dialog.message()).toContain("EVERY descendant");
+    expect(dialog.message()).toContain("Implementation worker");
+    await dialog.accept();
+  });
+  await page
+    .getByRole("button", { name: "Close entire hierarchy", exact: true })
+    .click();
+  await expect(page.locator(".header-actions .badge")).toHaveText("Closed");
+  await page.getByRole("button", { name: "Show closed", exact: true }).click();
+  await page
+    .locator(".sidebar-tree .session-link")
+    .filter({ hasText: "Implementation worker" })
+    .click();
+  await expect(page.locator(".header-actions .badge")).toHaveText("Closed");
   await page.setViewportSize({ width: 390, height: 844 });
   expect(
     await page.evaluate(

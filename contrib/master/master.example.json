@@ -8,11 +8,12 @@
   "pi_extension": "contrib/master/pi/remote-tools.ts",
   "pi_model": "anthropic/claude-sonnet-4-5",
   "pi_models": ["anthropic/claude-sonnet-4-5"],
-  "swarm_max_depth": 4,
-  "swarm_max_agents": 16,
+  "swarm_max_depth": 5,
+  "swarm_max_agents": 0,
   "pi_env_file": "/etc/iso-master/provider-env.json",
   "idle_seconds": 900,
-  "max_agents": 16,
+  "suspended_seconds": 600,
+  "max_agents": 0,
   "planes": [
     {
       "id": "east",
@@ -28,7 +29,7 @@
         "deb.debian.org",
         "security.debian.org"
       ],
-      "max_vms": 32
+      "max_vms": 0
     },
     {
       "id": "west",
@@ -37,7 +38,7 @@
       "client": "orchestrator",
       "template": "debian",
       "egress": "deny",
-      "max_vms": 32
+      "max_vms": 0
     }
   ]
 }

@@ -86,6 +86,12 @@ scheduler. There is no cross-plane migration of a sleeping or failed session.
 
 ## Models and swarms
 
+While an agent is working, the composer offers **Queue** alongside Stop. Follow-up
+messages are stored in SQLite and delivered in order when the agent is idle.
+Pending messages are shown above the composer and can be cancelled. Interrupted
+agents require explicit recovery before delivery resumes. A dispatch interrupted
+by failure/restart is marked uncertain, never automatically retried.
+
 `pi_models` is the operator-controlled list of `provider/model` IDs offered in
 the UI. `pi_model`, when configured, is also included and is the default. These
 must be models supported by the installed pi version and authenticated on the
@@ -95,8 +101,8 @@ master. For example:
 {
   "pi_model": "openai-codex/gpt-5.5",
   "pi_models": ["openai-codex/gpt-5.5", "openai-codex/gpt-5.6-sol"],
-  "swarm_max_depth": 4,
-  "swarm_max_agents": 16
+  "swarm_max_depth": 5,
+  "swarm_max_agents": 0
 }
 ```
 
@@ -115,18 +121,35 @@ write, or edit. Workers get the normal remote read/write/edit/bash tools and
 messaging/status, but cannot spawn children. These restrictions are implemented
 in the tool registrations and checked by the master for scheduling; they are not
 just prompt instructions. Each node has its own VM: disks are not shared, so
-tasks should include repository/setup instructions and report patches or results
-back to their parent.
+tasks should include shared repository/message-board access instructions and an
+authorized artifact destination. Workers exchange work through reachable commits,
+branches, pull requests, or linked shared records. Swarm messages carry concise
+coordination and references, not whole source files or chunked bundles. Planners
+delegate publishing to workers; external writes still need user authorization.
 
 The sidebar displays the swarm hierarchy with collapsible branches, roles, and
+automatically assigned names when no custom name is supplied (for example Aster,
+Birch, Cedar). Names are stored before startup, unique among existing session
+names, and preserved across recovery. Each agent receives its own name in its
+swarm prompt; message routing still uses session IDs. The sidebar shows node
 phases. Click a node to inspect its chat and model. Parent/child messages appear
 as distinct cards identifying the sender. Planners can schedule children
 themselves, or the operator can open **Coordination** and use **Schedule child**.
-The default maximum is four edges from root
-to leaf and 16 total nodes per tree (including closed nodes), additionally bounded
-by `max_agents` and control-plane capacity. Scheduling returns a capacity error
-when a limit is reached; it does not silently create a second workspace or retry.
-Close descendants before closing their planner.
+The default maximum depth is five edges from root to leaf. VM counts, active
+agents, and total swarm nodes have no configured cap by default. Optional positive
+`max_vms`, `max_agents`, and `swarm_max_agents` values still enforce operator caps;
+zero or omitted means unlimited. Scheduling does not silently retry failures.
+Closing a planner closes its entire descendant hierarchy, deepest first, deleting
+their VM disks and suspension snapshots while keeping readable conversations.
+The confirmation explicitly covers the whole subtree. Partial failures remain
+fenced in Closing and can be retried without restarting completed agents.
+Unresolved allocations must be reconciled before deletion.
+
+**Workspace details → Stop VM** explicitly terminates just that agent's VM,
+discards its execution/suspension state, and preserves the durable workspace disk.
+Use **Recover** for a cold boot; no prompts are replayed. Unlike Sleep, incoming
+messages cannot automatically wake a manually stopped agent. This requires a
+control plane supporting `POST /vms/{id}/terminate`; it is not a host-wide policy.
 
 Messages only travel between direct parents and children. They are stored in
 SQLite, queued while the recipient works, and delivered as a new turn when idle
@@ -236,7 +259,8 @@ ownership/authorization and audit policy.
 - Tool requests still have guest privileges, including passwordless sudo. Configure
   iso's jailer, egress policy and VPC isolation according to your threat model.
 
-Limits: `max_agents` defaults to 16 live pi processes. Tool exec is capped at ten
+Limits: VM/agent/swarm-node counts are unlimited by default, not resource-aware:
+host RAM, CPU, storage, and control-plane resource limits still apply. Tool exec is capped at ten
 minutes and 256 KiB per stdout/stderr stream. Browser events are capped at 256 KiB;
 oversized events are replaced with a notice (full pi history remains on disk).
 The read tool is text-only in this version; use shell tools for search. No file
@@ -279,3 +303,20 @@ RUN_BROWSER_TESTS=1 scripts/check-master.sh
 
 Browser tests use a temporary database and two mock planes; they also check
 transcript replay, no client-side exceptions and mobile horizontal overflow.
+# Storage visibility
+
+The master retires suspended VMs after `suspended_seconds` (default 600; 0
+disables). It resumes only for clean guest shutdown, then releases suspension
+files while preserving disk and conversation. Pending messages take priority.
+Stopped workspaces cold-boot for the next new message; old prompts are not replayed.
+Shutdown uncertainty requires explicit inspection/recovery, never automatic force.
+This requires a control plane supporting `/vms/{id}/retire-suspension`.
+
+Control planes shows backend-reported pool usage/capacity, allocated bytes of
+tracked VM suspension files, and the backing filesystem's total/available bytes.
+These optional `/stats` fields remain unknown when unsupported or unavailable;
+older control planes remain usable. LVM reports pool usage including shared
+template/VM disk blocks; it is not a sum of virtual disk sizes or independently
+reclaimable snapshot sizes. Suspension accounting deduplicates hard links and
+uses allocated blocks, excludes template and untracked files, and becomes unknown
+if a tracked file cannot be inspected. Do not add these overlapping figures.

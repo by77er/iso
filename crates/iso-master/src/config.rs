@@ -18,6 +18,8 @@ pub struct Config {
     pub swarm_max_agents: usize,
     pub pi_env_file: Option<PathBuf>,
     pub idle_seconds: u64,
+    /// Retire suspended execution state after this many seconds; zero disables.
+    pub suspended_seconds: u64,
     pub max_agents: usize,
     pub demo: bool,
     pub planes: Vec<PlaneConfig>,
@@ -34,11 +36,12 @@ impl Default for Config {
             pi_extension: "contrib/master/pi/remote-tools.ts".into(),
             pi_model: None,
             pi_models: vec![],
-            swarm_max_depth: 4,
-            swarm_max_agents: 16,
+            swarm_max_depth: 5,
+            swarm_max_agents: 0,
             pi_env_file: None,
             idle_seconds: 900,
-            max_agents: 16,
+            suspended_seconds: 600,
+            max_agents: 0,
             demo: false,
             planes: vec![],
         }
@@ -69,7 +72,31 @@ fn egress() -> String {
     "deny".into()
 }
 fn capacity() -> usize {
-    32
+    0
+}
+
+/// A zero (or omitted) cap means unlimited; explicit positive caps remain supported.
+pub fn below_limit(count: usize, limit: usize) -> bool {
+    limit == 0 || count < limit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn omitted_caps_are_unlimited_and_positive_caps_remain_explicit() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "demo": true, "planes": [{"id":"test", "server":"demo", "creds":"unused", "template":"debian"}]
+        })).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.max_agents, 0);
+        assert_eq!(cfg.swarm_max_depth, 5);
+        assert_eq!(cfg.swarm_max_agents, 0);
+        assert_eq!(cfg.planes[0].max_vms, 0);
+        assert!(below_limit(usize::MAX, 0));
+        assert!(below_limit(15, 16));
+        assert!(!below_limit(16, 16));
+    }
 }
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
@@ -94,10 +121,7 @@ impl Config {
         Ok(cfg)
     }
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.swarm_max_agents > 0 && self.swarm_max_depth <= 16,
-            "Invalid swarm limits"
-        );
+        ensure!(self.swarm_max_depth <= 16, "Invalid swarm limits");
         for model in self.models() {
             ensure!(
                 model
@@ -107,10 +131,7 @@ impl Config {
                 "Models must use provider/model format"
             );
         }
-        ensure!(
-            self.idle_seconds > 0 && self.max_agents > 0,
-            "idle_seconds/max_agents must be positive"
-        );
+        ensure!(self.idle_seconds > 0, "idle_seconds must be positive");
         ensure!(!self.planes.is_empty(), "Configure at least one plane");
         ensure!(
             self.public_origin.starts_with("https://") || self.public_origin.starts_with("http://"),
@@ -139,10 +160,7 @@ impl Config {
                 matches!(p.egress.as_str(), "deny" | "proxy" | "allow"),
                 "Invalid egress mode"
             );
-            ensure!(
-                p.max_vms > 0 && !p.template.is_empty(),
-                "Invalid plane capacity/template"
-            );
+            ensure!(!p.template.is_empty(), "Invalid plane capacity/template");
         }
         Ok(())
     }

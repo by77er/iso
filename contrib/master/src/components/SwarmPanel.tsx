@@ -91,7 +91,7 @@ export default function SwarmPanel({ session }: { session: Session }) {
               <input
                 value={name}
                 onChange={(event) => setName(event.target.value)}
-                required
+                placeholder="Assigned automatically"
                 maxLength={120}
                 disabled={busy}
               />

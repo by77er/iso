@@ -231,16 +231,29 @@ impl Manager {
             "lvs",
             "--noheadings",
             "--nosuffix",
+            "--units",
+            "b",
             "-o",
-            "data_percent,metadata_percent",
+            "data_percent,metadata_percent,lv_size",
             &self.vg_lv(&self.cfg.thin_pool),
         ]))?;
         let mut fields = out.stdout.split_whitespace();
         let parse = |s: Option<&str>| s.and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-        Ok(PoolStats {
+        let mut stats = PoolStats {
+            backend: Some("lvm-thin"),
             data_percent: parse(fields.next()),
             metadata_percent: parse(fields.next()),
-        })
+            capacity_bytes: fields.next().and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).map(|v| v as u64),
+            ..Default::default()
+        };
+        if let Ok(out) = self.runner.run(&Cmd::new(&[
+            "df", "-B1", "--output=size,avail", &self.cfg.image_path.to_string_lossy(),
+        ])) && let Some(line) = out.stdout.lines().nth(1) {
+                let mut fields = line.split_whitespace();
+                stats.filesystem_capacity_bytes = fields.next().and_then(|v| v.parse().ok());
+                stats.filesystem_available_bytes = fields.next().and_then(|v| v.parse().ok());
+        }
+        Ok(stats)
     }
 
     // ---- async wrappers ----
@@ -315,13 +328,28 @@ mod tests {
 
     #[test]
     fn pool_stats_parses_lvs_output() {
-        let runner = Arc::new(RecordingRunner::with_responder(|_| CmdOut {
+        let runner = Arc::new(RecordingRunner::with_responder(|cmd| CmdOut {
             ok: true,
-            stdout: "  12.50  3.20 \n".to_string(),
+            stdout: if cmd.argv[0] == "df" { "Size Avail\n1000000 500000\n" } else { "  12.50  3.20  100000 \n" }.to_string(),
         }));
         let stats = manager_with(runner).pool_stats_sync().unwrap();
         assert_eq!(stats.data_percent, 12.5);
         assert_eq!(stats.metadata_percent, 3.2);
+        assert_eq!(stats.capacity_bytes, Some(100000));
+        assert_eq!(stats.filesystem_capacity_bytes, Some(1000000));
+        assert_eq!(stats.filesystem_available_bytes, Some(500000));
+    }
+
+    #[test]
+    fn missing_storage_measurements_are_not_zero() {
+        let runner = Arc::new(RecordingRunner::with_responder(|_| CmdOut {
+            ok: true,
+            stdout: "12.50 3.20".to_string(),
+        }));
+        let stats = manager_with(runner).pool_stats_sync().unwrap();
+        assert_eq!(stats.capacity_bytes, None);
+        assert_eq!(stats.filesystem_capacity_bytes, None);
+        assert_eq!(stats.filesystem_available_bytes, None);
     }
 
     #[test]

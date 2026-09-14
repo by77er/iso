@@ -19,6 +19,8 @@ pub enum Phase {
     Working,
     Sleeping,
     Asleep,
+    Stopping,
+    Stopped,
     Waking,
     Interrupted,
     Closing,
@@ -29,6 +31,7 @@ impl Phase {
     pub fn check(self, next: Self) -> Result<()> {
         use Phase::*;
         let valid = self == next
+            || (next == Closing && self != Closed)
             || matches!(
                 (self, next),
                 (Allocating, Starting | AllocationUnknown | Interrupted)
@@ -37,7 +40,9 @@ impl Phase {
                     | (Idle, Working | Sleeping | Interrupted | Closing)
                     | (Working, Idle | Interrupted | Closing)
                     | (Sleeping, Asleep | Interrupted)
-                    | (Asleep, Waking | Closing | Interrupted)
+                    | (Asleep, Waking | Stopping | Closing | Interrupted)
+                    | (Stopping, Stopped | Interrupted)
+                    | (Stopped, Waking | Interrupted)
                     | (Waking, Idle | Interrupted)
                     | (Interrupted, Starting | Closing)
                     | (Closing, Closed | Interrupted)

@@ -905,6 +905,50 @@
         }
       }
     },
+    "/vms/{id}/retire-suspension": {
+      "post": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "retire_suspension",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Resume a suspended durable VM for clean shutdown, then discard suspension files; never force on timeout"
+          },
+          "404": {
+            "description": "Unknown VM",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not valid in the VM's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/vms/{id}/start": {
       "post": {
         "tags": [
@@ -1013,6 +1057,50 @@
         "responses": {
           "204": {
             "description": "Paused and snapshotted in place"
+          },
+          "404": {
+            "description": "Unknown VM",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not valid in the VM's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vms/{id}/terminate": {
+      "post": {
+        "tags": [
+          "vms"
+        ],
+        "operationId": "terminate",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "VM id, as a hyphenated UUID or 32 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Cold-stop a durable VM, discarding suspension state but retaining workspace storage"
           },
           "404": {
             "description": "Unknown VM",
@@ -1413,10 +1501,37 @@
             "format": "double",
             "description": "Thin-pool data usage, percent."
           },
+          "filesystem_available_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true,
+            "minimum": 0
+          },
+          "filesystem_capacity_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Filesystem containing the pool backing image, bytes.",
+            "nullable": true,
+            "minimum": 0
+          },
           "metadata_percent": {
             "type": "number",
             "format": "double",
             "description": "Thin-pool metadata usage, percent."
+          },
+          "pool_capacity_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Thin-pool data capacity, bytes.",
+            "nullable": true,
+            "minimum": 0
+          },
+          "pool_used_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Estimated used data bytes, derived from LVM utilization.",
+            "nullable": true,
+            "minimum": 0
           },
           "slots_total": {
             "type": "integer",
@@ -1425,6 +1540,17 @@
           "slots_used": {
             "type": "integer",
             "minimum": 0
+          },
+          "snapshot_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Allocated bytes of tracked VM suspension files, separate from thin-pool data.",
+            "nullable": true,
+            "minimum": 0
+          },
+          "storage_backend": {
+            "type": "string",
+            "nullable": true
           },
           "vms": {
             "type": "integer",

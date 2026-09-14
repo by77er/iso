@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useId } from "react";
+import { useRef, useEffect, useLayoutEffect, useState, useId } from "react";
 import Markdown from "react-markdown";
 import {
   Terminal,
@@ -8,6 +8,7 @@ import {
   Activity,
   ArrowDownLeft,
   ArrowUpRight,
+  ArrowDown,
 } from "lucide-react";
 import { groupTranscript, presentSwarmSends, type Item } from "../transcript";
 import type { Phase, Session } from "../api";
@@ -74,12 +75,14 @@ function ToolCard({ item }: { item: Item }) {
   );
 }
 export default function Transcript({
+  historyLoaded,
   items,
   phase,
   select,
   session,
   sessions,
 }: {
+  historyLoaded: boolean;
   items: Item[];
   phase: Phase;
   select: (id: string) => void;
@@ -90,9 +93,31 @@ export default function Transcript({
     atBottom = useRef(true),
     following = useRef(false),
     initialized = useRef(false);
+  const [showBottom, setShowBottom] = useState(false);
+  const saved = useRef<{ top: number; bottom: boolean } | null>(null);
+  useLayoutEffect(() => {
+    try {
+      const value = JSON.parse(sessionStorage.getItem(`chat-scroll:${session.id}`) || "null");
+      if (value && Number.isFinite(value.top) && value.top >= 0 && typeof value.bottom === "boolean") saved.current = value;
+    } catch { /* Storage may be unavailable. */ }
+  }, [session.id]);
+  function savePosition() {
+    const node = ref.current;
+    if (!node || !initialized.current) return;
+    try { sessionStorage.setItem(`chat-scroll:${session.id}`, JSON.stringify({ top: node.scrollTop, bottom: atBottom.current })); } catch { /* Optional persistence. */ }
+  }
+  useLayoutEffect(() => {
+    const node = ref.current;
+    if (!node || !historyLoaded || initialized.current) return;
+    atBottom.current = saved.current?.bottom ?? true;
+    node.scrollTop = atBottom.current ? node.scrollHeight : saved.current!.top;
+    initialized.current = true;
+    setShowBottom(!atBottom.current);
+  }, [historyLoaded, items]);
   useEffect(() => {
     const node = ref.current;
-    if (!node || !atBottom.current) return;
+    if (!node || !historyLoaded || !initialized.current || !atBottom.current) return;
+    if (node.scrollHeight - node.clientHeight - node.scrollTop < 1) return;
     if (
       !initialized.current ||
       window.matchMedia("(prefers-reduced-motion: reduce)").matches
@@ -118,11 +143,19 @@ export default function Transcript({
       cancelAnimationFrame(frame);
       following.current = false;
     };
-  }, [items, phase]);
+  }, [items, phase, historyLoaded]);
   return (
+    <div className="transcript-shell">
     <div
       className="transcript"
       ref={ref}
+      onPointerDown={() => { atBottom.current = false; following.current = false; }}
+      onKeyDown={(event) => {
+        if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+          atBottom.current = false;
+          following.current = false;
+        }
+      }}
       onWheel={(event) => {
         if (event.deltaY < 0) {
           atBottom.current = false;
@@ -137,6 +170,8 @@ export default function Transcript({
         if (following.current) return;
         const n = ref.current!;
         atBottom.current = n.scrollHeight - n.scrollTop - n.clientHeight < 100;
+        setShowBottom(!atBottom.current);
+        savePosition();
       }}
     >
       <div className="transcript-inner">
@@ -262,6 +297,15 @@ export default function Transcript({
           </div>
         )}
       </div>
+    </div>
+    {showBottom && <button className="go-to-bottom" onClick={() => {
+      atBottom.current = true;
+      following.current = false;
+      const node = ref.current;
+      if (node) node.scrollTop = node.scrollHeight;
+      setShowBottom(false);
+      savePosition();
+    }}><ArrowDown size={16} />Go to bottom</button>}
     </div>
   );
 }

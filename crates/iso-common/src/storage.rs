@@ -40,8 +40,15 @@ pub struct StorageHandle {
 
 /// Backing-pool utilisation, for monitoring. A thin pool that fills up fails
 /// writes and wedges every VM, so this is watched and gated on.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PoolStats {
+    /// Provider identifier; absent when unsupported by the backend.
+    pub backend: Option<&'static str>,
+    /// Thin-pool data capacity in bytes (not virtual volume sizes).
+    pub capacity_bytes: Option<u64>,
+    /// Capacity and space available to unprivileged users on the backing filesystem.
+    pub filesystem_capacity_bytes: Option<u64>,
+    pub filesystem_available_bytes: Option<u64>,
     /// Percent of the pool's data space in use (0..=100).
     pub data_percent: f64,
     /// Percent of the pool's metadata space in use (0..=100).

@@ -123,6 +123,14 @@ impl Plane {
             Ok(self.demo_vms.lock().await.values().cloned().collect())
         }
     }
+    pub async fn stats(&self) -> Result<Value> {
+        if let Some(c) = &self.client {
+            let r = tokio::time::timeout(Duration::from_secs(5), c.stats().send()).await??;
+            Ok(serde_json::to_value(&*r)?)
+        } else {
+            Ok(json!({}))
+        }
+    }
     pub async fn create(&self, session: &str, name: &str) -> Result<String> {
         let body = json!({"template":self.config.template,"egress":self.config.egress,
             "allow":self.config.allow,"principal":self.config.principal,"lifecycle":"durable","restart":"never",
@@ -170,6 +178,12 @@ impl Plane {
                     "halt" => {
                         c.halt().id(id).send().await?;
                     }
+                    "terminate" => {
+                        c.terminate().id(id).send().await?;
+                    }
+                    "retire-suspension" => {
+                        c.retire_suspension().id(id).send().await?;
+                    }
                     "destroy" => {
                         c.destroy().id(id).send().await?;
                     }
@@ -190,7 +204,7 @@ impl Plane {
             vm["state"] = json!(match action {
                 "start" => "running",
                 "suspend" => "suspended",
-                "halt" => "stopped",
+                "halt" | "terminate" | "retire-suspension" => "stopped",
                 _ => bail!("Invalid action"),
             });
         }

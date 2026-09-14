@@ -315,10 +315,27 @@ pub mod types {
     pub struct Stats {
         ///Thin-pool data usage, percent.
         pub data_percent: f64,
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub filesystem_available_bytes: ::std::option::Option<i64>,
+        ///Filesystem containing the pool backing image, bytes.
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub filesystem_capacity_bytes: ::std::option::Option<i64>,
         ///Thin-pool metadata usage, percent.
         pub metadata_percent: f64,
+        ///Thin-pool data capacity, bytes.
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub pool_capacity_bytes: ::std::option::Option<i64>,
+        ///Estimated used data bytes, derived from LVM utilization.
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub pool_used_bytes: ::std::option::Option<i64>,
         pub slots_total: u64,
         pub slots_used: u64,
+        ///Allocated bytes of tracked VM suspension files, separate from
+        /// thin-pool data.
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub snapshot_bytes: ::std::option::Option<i64>,
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub storage_backend: ::std::option::Option<::std::string::String>,
         ///VM records, in any state.
         pub vms: u64,
     }
@@ -1516,9 +1533,23 @@ pub mod types {
         #[derive(Clone, Debug)]
         pub struct Stats {
             data_percent: ::std::result::Result<f64, ::std::string::String>,
+            filesystem_available_bytes:
+                ::std::result::Result<::std::option::Option<i64>, ::std::string::String>,
+            filesystem_capacity_bytes:
+                ::std::result::Result<::std::option::Option<i64>, ::std::string::String>,
             metadata_percent: ::std::result::Result<f64, ::std::string::String>,
+            pool_capacity_bytes:
+                ::std::result::Result<::std::option::Option<i64>, ::std::string::String>,
+            pool_used_bytes:
+                ::std::result::Result<::std::option::Option<i64>, ::std::string::String>,
             slots_total: ::std::result::Result<u64, ::std::string::String>,
             slots_used: ::std::result::Result<u64, ::std::string::String>,
+            snapshot_bytes:
+                ::std::result::Result<::std::option::Option<i64>, ::std::string::String>,
+            storage_backend: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
             vms: ::std::result::Result<u64, ::std::string::String>,
         }
 
@@ -1526,9 +1557,15 @@ pub mod types {
             fn default() -> Self {
                 Self {
                     data_percent: Err("no value supplied for data_percent".to_string()),
+                    filesystem_available_bytes: Ok(Default::default()),
+                    filesystem_capacity_bytes: Ok(Default::default()),
                     metadata_percent: Err("no value supplied for metadata_percent".to_string()),
+                    pool_capacity_bytes: Ok(Default::default()),
+                    pool_used_bytes: Ok(Default::default()),
                     slots_total: Err("no value supplied for slots_total".to_string()),
                     slots_used: Err("no value supplied for slots_used".to_string()),
+                    snapshot_bytes: Ok(Default::default()),
+                    storage_backend: Ok(Default::default()),
                     vms: Err("no value supplied for vms".to_string()),
                 }
             }
@@ -1545,6 +1582,26 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for data_percent: {e}"));
                 self
             }
+            pub fn filesystem_available_bytes<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<i64>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.filesystem_available_bytes = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for filesystem_available_bytes: {e}")
+                });
+                self
+            }
+            pub fn filesystem_capacity_bytes<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<i64>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.filesystem_capacity_bytes = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for filesystem_capacity_bytes: {e}")
+                });
+                self
+            }
             pub fn metadata_percent<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<f64>,
@@ -1552,6 +1609,26 @@ pub mod types {
             {
                 self.metadata_percent = value.try_into().map_err(|e| {
                     format!("error converting supplied value for metadata_percent: {e}")
+                });
+                self
+            }
+            pub fn pool_capacity_bytes<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<i64>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.pool_capacity_bytes = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for pool_capacity_bytes: {e}")
+                });
+                self
+            }
+            pub fn pool_used_bytes<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<i64>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.pool_used_bytes = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for pool_used_bytes: {e}")
                 });
                 self
             }
@@ -1575,6 +1652,26 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for slots_used: {e}"));
                 self
             }
+            pub fn snapshot_bytes<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<i64>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.snapshot_bytes = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for snapshot_bytes: {e}")
+                });
+                self
+            }
+            pub fn storage_backend<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.storage_backend = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for storage_backend: {e}")
+                });
+                self
+            }
             pub fn vms<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<u64>,
@@ -1594,9 +1691,15 @@ pub mod types {
             ) -> ::std::result::Result<Self, super::error::ConversionError> {
                 Ok(Self {
                     data_percent: value.data_percent?,
+                    filesystem_available_bytes: value.filesystem_available_bytes?,
+                    filesystem_capacity_bytes: value.filesystem_capacity_bytes?,
                     metadata_percent: value.metadata_percent?,
+                    pool_capacity_bytes: value.pool_capacity_bytes?,
+                    pool_used_bytes: value.pool_used_bytes?,
                     slots_total: value.slots_total?,
                     slots_used: value.slots_used?,
+                    snapshot_bytes: value.snapshot_bytes?,
+                    storage_backend: value.storage_backend?,
                     vms: value.vms?,
                 })
             }
@@ -1606,9 +1709,15 @@ pub mod types {
             fn from(value: super::Stats) -> Self {
                 Self {
                     data_percent: Ok(value.data_percent),
+                    filesystem_available_bytes: Ok(value.filesystem_available_bytes),
+                    filesystem_capacity_bytes: Ok(value.filesystem_capacity_bytes),
                     metadata_percent: Ok(value.metadata_percent),
+                    pool_capacity_bytes: Ok(value.pool_capacity_bytes),
+                    pool_used_bytes: Ok(value.pool_used_bytes),
                     slots_total: Ok(value.slots_total),
                     slots_used: Ok(value.slots_used),
+                    snapshot_bytes: Ok(value.snapshot_bytes),
+                    storage_backend: Ok(value.storage_backend),
                     vms: Ok(value.vms),
                 }
             }
@@ -2482,6 +2591,20 @@ impl Client {
         builder::SetPolicy::new(self)
     }
 
+    ///Sends a `POST` request to `/vms/{id}/retire-suspension`
+    ///
+    ///Arguments:
+    /// - `id`: VM id, as a hyphenated UUID or 32 hex digits
+    ///```ignore
+    /// let response = client.retire_suspension()
+    ///    .id(id)
+    ///    .send()
+    ///    .await;
+    /// ```
+    pub fn retire_suspension(&self) -> builder::RetireSuspension<'_> {
+        builder::RetireSuspension::new(self)
+    }
+
     ///Sends a `POST` request to `/vms/{id}/start`
     ///
     ///Arguments:
@@ -2522,6 +2645,20 @@ impl Client {
     /// ```
     pub fn suspend(&self) -> builder::Suspend<'_> {
         builder::Suspend::new(self)
+    }
+
+    ///Sends a `POST` request to `/vms/{id}/terminate`
+    ///
+    ///Arguments:
+    /// - `id`: VM id, as a hyphenated UUID or 32 hex digits
+    ///```ignore
+    /// let response = client.terminate()
+    ///    .id(id)
+    ///    .send()
+    ///    .await;
+    /// ```
+    pub fn terminate(&self) -> builder::Terminate<'_> {
+        builder::Terminate::new(self)
     }
 }
 
@@ -3983,6 +4120,77 @@ pub mod builder {
         }
     }
 
+    ///Builder for [`Client::retire_suspension`]
+    ///
+    ///[`Client::retire_suspension`]: super::Client::retire_suspension
+    #[derive(Debug, Clone)]
+    pub struct RetireSuspension<'a> {
+        client: &'a super::Client,
+        id: Result<::std::string::String, String>,
+    }
+
+    impl<'a> RetireSuspension<'a> {
+        pub fn new(client: &'a super::Client) -> Self {
+            Self {
+                client: client,
+                id: Err("id was not initialized".to_string()),
+            }
+        }
+
+        pub fn id<V>(mut self, value: V) -> Self
+        where
+            V: std::convert::TryInto<::std::string::String>,
+        {
+            self.id = value.try_into().map_err(|_| {
+                "conversion to `:: std :: string :: String` for id failed".to_string()
+            });
+            self
+        }
+
+        ///Sends a `POST` request to `/vms/{id}/retire-suspension`
+        pub async fn send(self) -> Result<ResponseValue<()>, Error<types::ErrorBody>> {
+            let Self { client, id } = self;
+            let id = id.map_err(Error::InvalidRequest)?;
+            let url = format!(
+                "{}/vms/{}/retire-suspension",
+                client.baseurl,
+                encode_path(&id.to_string()),
+            );
+            let mut header_map = ::reqwest::header::HeaderMap::with_capacity(1usize);
+            header_map.append(
+                ::reqwest::header::HeaderName::from_static("api-version"),
+                ::reqwest::header::HeaderValue::from_static(super::Client::api_version()),
+            );
+            #[allow(unused_mut)]
+            let mut request = client
+                .client
+                .post(url)
+                .header(
+                    ::reqwest::header::ACCEPT,
+                    ::reqwest::header::HeaderValue::from_static("application/json"),
+                )
+                .headers(header_map)
+                .build()?;
+            let info = OperationInfo {
+                operation_id: "retire_suspension",
+            };
+            client.pre(&mut request, &info).await?;
+            let result = client.exec(request, &info).await;
+            client.post(&result, &info).await?;
+            let response = result?;
+            match response.status().as_u16() {
+                204u16 => Ok(ResponseValue::empty(response)),
+                404u16 => Err(Error::ErrorResponse(
+                    ResponseValue::from_response(response).await?,
+                )),
+                409u16 => Err(Error::ErrorResponse(
+                    ResponseValue::from_response(response).await?,
+                )),
+                _ => Err(Error::UnexpectedResponse(response)),
+            }
+        }
+    }
+
     ///Builder for [`Client::start`]
     ///
     ///[`Client::start`]: super::Client::start
@@ -4178,6 +4386,77 @@ pub mod builder {
                 .build()?;
             let info = OperationInfo {
                 operation_id: "suspend",
+            };
+            client.pre(&mut request, &info).await?;
+            let result = client.exec(request, &info).await;
+            client.post(&result, &info).await?;
+            let response = result?;
+            match response.status().as_u16() {
+                204u16 => Ok(ResponseValue::empty(response)),
+                404u16 => Err(Error::ErrorResponse(
+                    ResponseValue::from_response(response).await?,
+                )),
+                409u16 => Err(Error::ErrorResponse(
+                    ResponseValue::from_response(response).await?,
+                )),
+                _ => Err(Error::UnexpectedResponse(response)),
+            }
+        }
+    }
+
+    ///Builder for [`Client::terminate`]
+    ///
+    ///[`Client::terminate`]: super::Client::terminate
+    #[derive(Debug, Clone)]
+    pub struct Terminate<'a> {
+        client: &'a super::Client,
+        id: Result<::std::string::String, String>,
+    }
+
+    impl<'a> Terminate<'a> {
+        pub fn new(client: &'a super::Client) -> Self {
+            Self {
+                client: client,
+                id: Err("id was not initialized".to_string()),
+            }
+        }
+
+        pub fn id<V>(mut self, value: V) -> Self
+        where
+            V: std::convert::TryInto<::std::string::String>,
+        {
+            self.id = value.try_into().map_err(|_| {
+                "conversion to `:: std :: string :: String` for id failed".to_string()
+            });
+            self
+        }
+
+        ///Sends a `POST` request to `/vms/{id}/terminate`
+        pub async fn send(self) -> Result<ResponseValue<()>, Error<types::ErrorBody>> {
+            let Self { client, id } = self;
+            let id = id.map_err(Error::InvalidRequest)?;
+            let url = format!(
+                "{}/vms/{}/terminate",
+                client.baseurl,
+                encode_path(&id.to_string()),
+            );
+            let mut header_map = ::reqwest::header::HeaderMap::with_capacity(1usize);
+            header_map.append(
+                ::reqwest::header::HeaderName::from_static("api-version"),
+                ::reqwest::header::HeaderValue::from_static(super::Client::api_version()),
+            );
+            #[allow(unused_mut)]
+            let mut request = client
+                .client
+                .post(url)
+                .header(
+                    ::reqwest::header::ACCEPT,
+                    ::reqwest::header::HeaderValue::from_static("application/json"),
+                )
+                .headers(header_map)
+                .build()?;
+            let info = OperationInfo {
+                operation_id: "terminate",
             };
             client.pre(&mut request, &info).await?;
             let result = client.exec(request, &info).await;

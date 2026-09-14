@@ -62,8 +62,9 @@ impl Engine {
     }
     pub async fn fleet(&self) -> Vec<Value> {
         join_all(self.planes.iter().map(|p|async move {
-            match p.list().await {
-                Ok(vms)=>json!({"id":p.config.id,"available":true,"count":vms.len(),"capacity":p.config.max_vms,"vms":vms}),
+            let (vms, stats) = tokio::join!(p.list(), p.stats());
+            match vms {
+                Ok(vms)=>json!({"id":p.config.id,"available":true,"count":vms.len(),"capacity":p.config.max_vms,"vms":vms,"storage":stats.ok()}),
                 Err(_)=>json!({"id":p.config.id,"available":false,"capacity":p.config.max_vms}),
             }
         })).await
@@ -116,19 +117,44 @@ impl Engine {
         mut swarm: Option<Swarm>,
     ) -> Result<Session> {
         ensure!(
-            !name.trim().is_empty() && name.len() <= 120,
+            (swarm.is_some() || !name.trim().is_empty()) && name.len() <= 120,
             "Name must be 1–120 bytes"
         );
         let _placement = self.placement.lock().await;
+        let name = if name.trim().is_empty() {
+            let sessions = self.store.list()?;
+            let names = [
+                "Aster", "Birch", "Cedar", "Dahlia", "Elm", "Finch", "Grove", "Hazel", "Iris",
+                "Juniper", "Kestrel", "Laurel", "Maple", "Nova", "Orion", "Willow",
+            ];
+            (0..=sessions.len())
+                .map(|index| {
+                    let base = names[index % names.len()];
+                    if index < names.len() {
+                        base.to_string()
+                    } else {
+                        format!("{base}-{}", index / names.len() + 1)
+                    }
+                })
+                .find(|candidate| {
+                    !sessions
+                        .iter()
+                        .any(|s| s.name.eq_ignore_ascii_case(candidate))
+                })
+                .context("Could not assign a swarm name")?
+        } else {
+            name.trim().to_string()
+        };
+        let name = name.as_str();
         ensure!(
-            self.workers.lock().await.len() < self.cfg.max_agents,
+            crate::config::below_limit(self.workers.lock().await.len(), self.cfg.max_agents),
             "Active agent limit reached"
         );
         let mut candidates = join_all(self.planes.iter().map(|p| async move {
             p.list()
                 .await
                 .ok()
-                .filter(|v| v.len() < p.config.max_vms)
+                .filter(|v| crate::config::below_limit(v.len(), p.config.max_vms))
                 .map(|v| (v.len(), p))
         }))
         .await
@@ -189,9 +215,14 @@ impl Engine {
         self.store.get(&id)
     }
     async fn launch(&self, id: &str, recover: bool) -> Result<()> {
-        let _launch = self.launch_gate.lock().await;
+        // Only serialize launches when enforcing a configured active-agent cap.
+        let _launch = if self.cfg.max_agents == 0 {
+            None
+        } else {
+            Some(self.launch_gate.lock().await)
+        };
         ensure!(
-            self.workers.lock().await.len() < self.cfg.max_agents,
+            crate::config::below_limit(self.workers.lock().await.len(), self.cfg.max_agents),
             "Active agent limit reached"
         );
         let s = self.store.get(id)?;
@@ -199,19 +230,29 @@ impl Engine {
         let vm = s.vm.as_deref().context("No workspace allocated")?;
         self.store.phase(
             id,
-            if s.phase == Phase::Asleep {
+            if matches!(s.phase, Phase::Asleep | Phase::Stopped) {
                 Phase::Waking
             } else {
                 Phase::Starting
             },
         )?;
         let info = plane.get(vm).await?;
-        if recover && info["state"] != "stopped" {
-            plane.action(vm, "halt").await?;
+        if recover {
+            self.store.event(id, json!({"type":"notice","text":"Cold recovery: discarding suspended execution state; workspace disk and conversation are retained."}))?;
+            plane
+                .action(vm, "terminate")
+                .await
+                .context("Could not cold-stop the workspace")?;
         }
         if recover || info["state"] != "running" {
+            self.store
+                .event(id, json!({"type":"notice","text":"Starting workspace VM…"}))?;
             plane.action(vm, "start").await?;
         }
+        self.store.event(
+            id,
+            json!({"type":"notice","text":"Checking guest and DNS readiness (up to 60 seconds)…"}),
+        )?;
         if let Err(error) = plane.ready(vm).await {
             self.store.event(id, json!({"type":"notice","text":format!("{error}. Workspace retained; pi was not started and no prompts were replayed.")}))?;
             return Err(error);
@@ -223,7 +264,11 @@ impl Engine {
             .lock()
             .unwrap()
             .insert(id.into(), token.clone());
-        let swarm = s.swarm.as_ref().map(|swarm| json!({"session":id,"token":token,"socket":self.cfg.data_dir.join("swarm.sock"),"role":swarm.role,"parent":swarm.parent,"task":swarm.task}));
+        let swarm = s.swarm.as_ref().map(|swarm| json!({"session":id,"name":s.name,"token":token,"socket":self.cfg.data_dir.join("swarm.sock"),"role":swarm.role,"parent":swarm.parent,"task":swarm.task}));
+        self.store.event(
+            id,
+            json!({"type":"notice","text":"Workspace ready; connecting agent…"}),
+        )?;
         let worker = match Pi::start(&cfg, &plane.config, vm, id, self.store.clone(), swarm).await {
             Ok(worker) => worker,
             Err(e) => {
@@ -235,6 +280,7 @@ impl Engine {
         self.store.phase(id, Phase::Idle)?;
         Ok(())
     }
+    #[cfg(test)]
     pub async fn prompt(&self, id: &str, message: &str) -> Result<()> {
         ensure!(
             !message.trim().is_empty() && message.len() <= 100000,
@@ -248,8 +294,34 @@ impl Engine {
         let _guard = lock.lock().await;
         self.prompt_locked(id, message).await
     }
+    pub async fn submit_prompt(&self, id: &str, message: &str) -> Result<()> {
+        ensure!(
+            !message.trim().is_empty() && message.len() <= 100000,
+            "Message must be 1–100000 bytes"
+        );
+        ensure!(
+            !message.trim_start().starts_with(['/', '!']),
+            "Harness commands are disabled; use natural-language instructions"
+        );
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        let phase = self.store.get(id)?.phase;
+        ensure!(
+            matches!(
+                phase,
+                Phase::Idle | Phase::Asleep | Phase::Stopped | Phase::Working
+            ),
+            "Wait for startup or explicitly recover this agent before sending"
+        );
+        if phase == Phase::Working || self.store.has_pending_message(id)? {
+            self.store.enqueue("operator", id, message)?;
+            Ok(())
+        } else {
+            self.prompt_locked(id, message).await
+        }
+    }
     async fn prompt_locked(&self, id: &str, message: &str) -> Result<()> {
-        if self.store.get(id)?.phase == Phase::Asleep
+        if matches!(self.store.get(id)?.phase, Phase::Asleep | Phase::Stopped)
             && let Err(e) = self.launch(id, false).await
         {
             self.store
@@ -327,6 +399,40 @@ impl Engine {
         let _guard = lock.lock().await;
         self.sleep_locked(id).await
     }
+    pub async fn stop_vm(&self, id: &str) -> Result<()> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        let s = self.store.get(id)?;
+        ensure!(
+            matches!(
+                s.phase,
+                Phase::Idle | Phase::Working | Phase::Asleep | Phase::Stopped | Phase::Interrupted
+            ),
+            "This agent cannot be stopped in its current state"
+        );
+        let vm = s.vm.as_deref().context("No workspace")?;
+        self.store.interrupt(
+            id,
+            "Stopping VM; workspace files and conversation are retained.",
+        );
+        self.stop_worker(id).await;
+        let plane = self.plane(&s.plane)?;
+        if let Err(error) = async {
+            plane.action(vm, "terminate").await?;
+            ensure!(
+                plane.get(vm).await?["state"] == "stopped",
+                "VM stop was not confirmed"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        {
+            self.store.interrupt(id, "VM stop not confirmed. Check the plane and retry Stop VM; no prompts will be replayed.");
+            return Err(error);
+        }
+        self.store.interrupt(id, "VM stopped; workspace files retained. Recover explicitly to cold-boot it. No prompts will be replayed.");
+        Ok(())
+    }
     async fn sleep_locked(&self, id: &str) -> Result<()> {
         let s = self.store.get(id)?;
         ensure!(s.phase == Phase::Idle, "Only idle agents can sleep");
@@ -345,8 +451,46 @@ impl Engine {
         self.store.event(id,json!({"type":"notice","text":"Workspace asleep. Your next message will wake it and resume the conversation."}))?;
         Ok(())
     }
+    async fn retire_suspension_locked(&self, id: &str) -> Result<()> {
+        let s = self.store.get(id)?;
+        if s.phase != Phase::Asleep
+            || self.cfg.suspended_seconds == 0
+            || now().saturating_sub(s.last_active) < self.cfg.suspended_seconds
+            || self.store.has_pending_message(id)?
+        {
+            return Ok(());
+        }
+        let plane = self.plane(&s.plane)?;
+        let vm = s.vm.as_deref().context("No workspace")?;
+        self.store.phase(id, Phase::Stopping)?;
+        let result = async {
+            plane.action(vm, "retire-suspension").await?;
+            ensure!(
+                plane.get(vm).await?["state"] == "stopped",
+                "Shutdown not confirmed"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            self.store.interrupt(id, "Automatic shutdown not confirmed. Workspace retained; inspect the plane before explicit recovery. No prompts replayed.");
+            return Err(error);
+        }
+        self.store.phase(id, Phase::Stopped)?;
+        self.store.event(id, json!({"type":"notice","text":"Workspace shut down cleanly after suspension expiry. Suspension files released; the next new message will cold-boot the retained workspace."}))?;
+        Ok(())
+    }
     pub async fn sweep(&self) {
         for s in self.store.list().unwrap_or_default() {
+            if s.phase == Phase::Asleep
+                && self.cfg.suspended_seconds > 0
+                && now().saturating_sub(s.last_active) >= self.cfg.suspended_seconds
+            {
+                let lock = self.lock(&s.id);
+                if let Ok(_guard) = lock.try_lock() {
+                    let _ = self.retire_suspension_locked(&s.id).await;
+                }
+            }
             if s.phase == Phase::Idle
                 && now().saturating_sub(s.last_active) >= self.cfg.idle_seconds
             {
@@ -363,6 +507,56 @@ impl Engine {
     }
     pub async fn close_session(&self, id: &str) -> Result<()> {
         let _swarm = self.swarm_gate.lock().await;
+        self.store.get(id)?;
+        let sessions = self.store.list()?;
+        let mut ids = std::collections::HashSet::from([id.to_string()]);
+        loop {
+            let before = ids.len();
+            for node in &sessions {
+                if node
+                    .swarm
+                    .as_ref()
+                    .and_then(|s| s.parent.as_ref())
+                    .is_some_and(|p| ids.contains(p))
+                {
+                    ids.insert(node.id.clone());
+                }
+            }
+            if ids.len() == before {
+                break;
+            }
+        }
+        let mut nodes = sessions
+            .into_iter()
+            .filter(|s| ids.contains(&s.id) && s.phase != Phase::Closed)
+            .collect::<Vec<_>>();
+        ensure!(
+            nodes.iter().all(|s| s.vm.is_some()),
+            "Reconcile unresolved allocations before deleting this hierarchy"
+        );
+        nodes.sort_by_key(|s| std::cmp::Reverse(s.swarm.as_ref().map_or(0, |n| n.depth)));
+        // Fence the whole subtree before deleting anything. Closing blocks
+        // delivery, recovery and new scheduling; repeated Close resumes cleanup.
+        for node in &nodes {
+            let lock = self.lock(&node.id);
+            let _guard = lock.lock().await;
+            self.store.phase(&node.id, Phase::Closing)?;
+            self.stop_worker(&node.id).await;
+        }
+        let mut errors = Vec::new();
+        for node in &nodes {
+            if let Err(error) = self.close_one(&node.id).await {
+                errors.push(format!("{}: {error}", node.name));
+            }
+        }
+        ensure!(
+            errors.is_empty(),
+            "Hierarchy cleanup incomplete; retry Close: {}",
+            errors.join("; ")
+        );
+        Ok(())
+    }
+    async fn close_one(&self, id: &str) -> Result<()> {
         let lock = self.lock(id);
         let _guard = lock.lock().await;
         let s = self.store.get(id)?;
@@ -395,10 +589,13 @@ impl Engine {
         }
         .await;
         if let Err(e) = result {
-            self.store.interrupt(
-                id,
-                "Workspace deletion not confirmed. Retry Close after restoring connectivity.",
-            );
+            self.store.update(id, |s| {
+                s.error = Some(
+                    "Workspace deletion not confirmed. Retry Close after restoring connectivity."
+                        .into(),
+                );
+                Ok(())
+            })?;
             return Err(e);
         }
         self.store.phase(id, Phase::Closed)?;
@@ -446,11 +643,11 @@ impl Engine {
             "A VM already has this session label. Use Reconcile; no VM was created."
         );
         ensure!(
-            vms.len() < plane.config.max_vms,
+            crate::config::below_limit(vms.len(), plane.config.max_vms),
             "Control plane is at capacity"
         );
         ensure!(
-            self.workers.lock().await.len() < self.cfg.max_agents,
+            crate::config::below_limit(self.workers.lock().await.len(), self.cfg.max_agents),
             "Active agent limit reached"
         );
         self.store.phase(id, Phase::Allocating)?;
@@ -486,11 +683,21 @@ impl Engine {
         }
     }
     pub async fn timer(self: Arc<Self>) {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            self.deliver_messages().await;
-            self.sweep().await;
-        }
+        // A slow clean shutdown must not stall other agents' queued messages.
+        tokio::join!(
+            async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    self.deliver_messages().await;
+                }
+            },
+            async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    self.sweep().await;
+                }
+            },
+        );
     }
     pub fn worker_identity(&self, token: &str) -> Result<String> {
         let id = self
@@ -552,7 +759,7 @@ impl Engine {
             "Swarm depth limit reached"
         );
         ensure!(
-            self.tree(parent)?.len() < self.cfg.swarm_max_agents,
+            crate::config::below_limit(self.tree(parent)?.len(), self.cfg.swarm_max_agents),
             "Swarm size limit reached"
         );
         let child = self
@@ -599,35 +806,37 @@ impl Engine {
     pub async fn deliver_messages(&self) {
         let sessions = self.store.list().unwrap_or_default();
         // Each recipient runs independently; a sleeping workspace must not block the others.
-        join_all(
-            sessions
-                .into_iter()
-                .filter(|s| s.swarm.is_some())
-                .map(|s| async move {
-                    let lock = self.lock(&s.id);
-                    let Ok(_guard) = lock.try_lock() else {
-                        return;
-                    };
-                    let Ok(current) = self.store.get(&s.id) else {
-                        return;
-                    };
-                    if !matches!(current.phase, Phase::Idle | Phase::Asleep) {
-                        return;
+        join_all(sessions.into_iter().map(|s| async move {
+            let lock = self.lock(&s.id);
+            let Ok(_guard) = lock.try_lock() else {
+                return;
+            };
+            let Ok(current) = self.store.get(&s.id) else {
+                return;
+            };
+            if !matches!(current.phase, Phase::Idle | Phase::Asleep | Phase::Stopped) {
+                return;
+            }
+            if let Ok(Some((mid, sender, text))) = self.store.claim_message(&s.id) {
+                let prompt = if sender == "operator" {
+                    Ok((
+                        text.clone(),
+                        json!({"type":"message","role":"user","text":text}),
+                    ))
+                } else {
+                    self.message_prompt(&sender, &current, &text)
+                };
+                let delivered = match prompt {
+                    Ok((prompt, event)) => {
+                        self.store.stage_delivery(mid, &prompt, &event).is_ok()
+                            && self.prompt_locked(&s.id, &prompt).await.is_ok()
                     }
-                    if let Ok(Some((mid, sender, text))) = self.store.claim_message(&s.id) {
-                        let prompt = self.message_prompt(&sender, &current, &text);
-                        let delivered = match prompt {
-                            Ok((prompt, event)) => {
-                                self.store.stage_delivery(mid, &prompt, &event).is_ok()
-                                    && self.prompt_locked(&s.id, &prompt).await.is_ok()
-                            }
-                            Err(_) => false,
-                        };
-                        let status = if delivered { "delivered" } else { "uncertain" };
-                        let _ = self.store.message_status(mid, status);
-                    }
-                }),
-        )
+                    Err(_) => false,
+                };
+                let status = if delivered { "delivered" } else { "uncertain" };
+                let _ = self.store.message_status(mid, status);
+            }
+        }))
         .await;
     }
     pub async fn set_model(&self, id: &str, model: &str) -> Result<Session> {
@@ -640,7 +849,10 @@ impl Engine {
             "Swarm models are inherited from their root configuration"
         );
         ensure!(
-            matches!(s.phase, Phase::Idle | Phase::Asleep | Phase::Interrupted),
+            matches!(
+                s.phase,
+                Phase::Idle | Phase::Asleep | Phase::Stopped | Phase::Interrupted
+            ),
             "Wait for the agent to finish before changing models"
         );
         if s.phase == Phase::Idle {
@@ -723,6 +935,31 @@ mod tests {
         let store = Arc::new(Store::open(&dir.path().join("db")).unwrap());
         (dir, Engine::new(cfg, store).unwrap())
     }
+    #[tokio::test]
+    async fn suspension_expires_without_replaying_and_wakes_for_new_work() {
+        let (_dir, e) = swarm_fixture();
+        let s = e.create("retirement").await.unwrap();
+        e.sleep(&s.id).await.unwrap();
+        e.sweep().await;
+        assert_eq!(e.store.get(&s.id).unwrap().phase, Phase::Asleep);
+        e.store
+            .update(&s.id, |s| {
+                s.last_active = now() - 601;
+                Ok(())
+            })
+            .unwrap();
+        let mid = e.store.enqueue("operator", &s.id, "pending work").unwrap();
+        e.sweep().await;
+        assert_eq!(e.store.get(&s.id).unwrap().phase, Phase::Asleep);
+        e.store.cancel_operator_message(&s.id, mid).unwrap();
+        e.sweep().await;
+        assert_eq!(e.store.get(&s.id).unwrap().phase, Phase::Stopped);
+        e.store.recover().unwrap();
+        assert_eq!(e.store.get(&s.id).unwrap().phase, Phase::Stopped);
+        assert_eq!(e.store.get(&s.id).unwrap().vm, s.vm);
+        e.submit_prompt(&s.id, "new work").await.unwrap();
+        assert_eq!(e.store.get(&s.id).unwrap().phase, Phase::Working);
+    }
     fn swarm_options() -> CreateOptions {
         CreateOptions {
             swarm: true,
@@ -731,6 +968,34 @@ mod tests {
             ..Default::default()
         }
     }
+    #[tokio::test]
+    async fn unlimited_caps_allow_more_than_32_vms_and_16_swarm_workers() {
+        let (_dir, initial) = swarm_fixture();
+        let mut cfg = initial.cfg.clone();
+        cfg.planes[0].max_vms = 0;
+        let e = Engine::new(cfg, initial.store.clone()).unwrap();
+        let root = e.create_options("", swarm_options()).await.unwrap();
+        assert_eq!(root.name, "Aster");
+        for _ in 0..33 {
+            e.spawn_child(&root.id, "", Role::Worker, "Inspect only")
+                .await
+                .unwrap();
+        }
+        assert_eq!(e.planes[0].list().await.unwrap().len(), 34);
+        assert_eq!(e.workers.lock().await.len(), 34);
+        assert_eq!(e.tree(&root.id).unwrap().len(), 34);
+        let names = e
+            .tree(&root.id)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(names.len(), 34);
+        e.store.phase(&root.id, Phase::Interrupted).unwrap();
+        assert_eq!(e.recover_session(&root.id).await.unwrap().name, "Aster");
+        e.shutdown().await;
+    }
+
     #[tokio::test]
     async fn swarm_inherits_models_and_enforces_vertical_relationships() {
         let (_dir, e) = swarm_fixture();
@@ -760,7 +1025,6 @@ mod tests {
         assert!(e.send_message(&worker.id, &root.id, "skip parent").is_err());
         assert!(e.send_message(&sub.id, &sibling.id, "sibling").is_err());
         assert!(e.send_message(&worker.id, &sub.id, "Result").is_ok());
-        assert!(e.close_session(&root.id).await.is_err());
         let other = e.create_options("other", swarm_options()).await.unwrap();
         assert!(e.send_message(&sub.id, &other.id, "cross swarm").is_err());
         assert!(e.set_model(&root.id, "test/worker").await.is_err());
@@ -784,6 +1048,17 @@ mod tests {
                 .await
                 .is_err()
         );
+        e.close_session(&sub.id).await.unwrap();
+        for node in [&sub, &worker, &deep] {
+            assert_eq!(e.store.get(&node.id).unwrap().phase, Phase::Closed);
+            assert!(!e.worker_tokens.lock().unwrap().contains_key(&node.id));
+        }
+        assert_eq!(e.store.get(&root.id).unwrap().phase, Phase::Idle);
+        e.close_session(&root.id).await.unwrap();
+        e.close_session(&root.id).await.unwrap();
+        assert_eq!(e.store.get(&sibling.id).unwrap().phase, Phase::Closed);
+        assert_eq!(e.store.get(&other.id).unwrap().phase, Phase::Idle);
+        assert_eq!(e.planes[0].list().await.unwrap().len(), 1);
         e.shutdown().await;
     }
     #[tokio::test]
@@ -1045,5 +1320,96 @@ mod tests {
                 .any(|e| e["type"] == "message")
         );
         e.close_session(&s.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_vm_retains_workspace_and_requires_explicit_recovery() {
+        let (_dir, e) = fixture();
+        let s = e.create("stop test").await.unwrap();
+        e.sleep(&s.id).await.unwrap();
+        e.stop_vm(&s.id).await.unwrap();
+        e.stop_vm(&s.id).await.unwrap();
+        assert_eq!(
+            e.planes[0].get(s.vm.as_deref().unwrap()).await.unwrap()["state"],
+            "stopped"
+        );
+        assert_eq!(e.store.get(&s.id).unwrap().vm, s.vm);
+        assert_eq!(e.store.get(&s.id).unwrap().phase, Phase::Interrupted);
+        assert!(e.prompt(&s.id, "do not replay").await.is_err());
+        assert!(e.workers.lock().await.is_empty());
+        assert_eq!(e.recover_session(&s.id).await.unwrap().vm, s.vm);
+        e.close_session(&s.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_queue_waits_preserves_order_and_supports_cancellation() {
+        let (_dir, e) = fixture();
+        let s = e.create("queued").await.unwrap();
+        e.store.phase(&s.id, Phase::Working).unwrap();
+        e.submit_prompt(&s.id, "First follow-up").await.unwrap();
+        e.submit_prompt(&s.id, "Cancel me").await.unwrap();
+        e.submit_prompt(&s.id, "Last follow-up").await.unwrap();
+        let queue = e.store.operator_queue(&s.id).unwrap();
+        assert_eq!(queue.len(), 3);
+        let cancelled = queue[1]["id"].as_i64().unwrap();
+        assert!(
+            e.store
+                .cancel_operator_message("another-session", cancelled)
+                .is_err()
+        );
+        e.store.cancel_operator_message(&s.id, cancelled).unwrap();
+        e.deliver_messages().await;
+        assert_eq!(e.store.operator_queue(&s.id).unwrap().len(), 2);
+        e.store.phase(&s.id, Phase::Idle).unwrap();
+        e.deliver_messages().await;
+        let remaining = e.store.operator_queue(&s.id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["message"], "Last follow-up");
+        assert!(
+            e.store
+                .cancel_operator_message(&s.id, queue[0]["id"].as_i64().unwrap())
+                .is_err()
+        );
+        e.store.phase(&s.id, Phase::Interrupted).unwrap();
+        e.deliver_messages().await;
+        assert_eq!(e.store.operator_queue(&s.id).unwrap().len(), 1);
+        assert!(e.submit_prompt(&s.id, "/command").await.is_err());
+        e.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hierarchy_close_failure_stays_fenced_and_can_be_retried() {
+        let (_dir, e) = swarm_fixture();
+        let root = e.create_options("root", swarm_options()).await.unwrap();
+        let child = e
+            .spawn_child(&root.id, "child", Role::Worker, "Inspect")
+            .await
+            .unwrap();
+        e.store
+            .update(&child.id, |s| {
+                s.plane = "unavailable".into();
+                Ok(())
+            })
+            .unwrap();
+        assert!(e.close_session(&root.id).await.is_err());
+        assert_eq!(e.store.get(&root.id).unwrap().phase, Phase::Closing);
+        assert_eq!(e.store.get(&child.id).unwrap().phase, Phase::Closing);
+        assert!(e.workers.lock().await.is_empty());
+        assert!(e.worker_tokens.lock().unwrap().is_empty());
+        assert!(
+            e.spawn_child(&root.id, "late", Role::Worker, "Task")
+                .await
+                .is_err()
+        );
+        e.deliver_messages().await;
+        assert_eq!(e.store.get(&child.id).unwrap().phase, Phase::Closing);
+        e.store
+            .update(&child.id, |s| {
+                s.plane = child.plane.clone();
+                Ok(())
+            })
+            .unwrap();
+        e.close_session(&root.id).await.unwrap();
+        assert!(e.planes[0].list().await.unwrap().is_empty());
     }
 }

@@ -15,6 +15,12 @@ import { reduceEvents, type Item, type Event } from "../transcript";
 import { Badge, ErrorBanner } from "./shared";
 import Transcript from "./Transcript";
 
+type QueuedMessage = {
+  id: number;
+  message: string;
+  status: "pending" | "dispatching" | "uncertain";
+};
+
 export default function Chat({
   id,
   onUpdate,
@@ -27,6 +33,7 @@ export default function Chat({
   sessions: Session[];
 }) {
   const [session, setSession] = useState<Session | null>(null),
+    [queued, setQueued] = useState<QueuedMessage[]>([]),
     [items, setItems] = useState<Item[]>([]),
     [error, setError] = useState(""),
     [text, setText] = useState(""),
@@ -34,6 +41,7 @@ export default function Chat({
     [details, setDetails] = useState(false);
   const updateRef = useRef(onUpdate);
   const [models, setModels] = useState<string[]>([]);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
   useEffect(() => {
     let stopped = false;
     api<ModelCatalog>("/models")
@@ -51,22 +59,28 @@ export default function Chat({
       cursor = 0;
     let timer: ReturnType<typeof setTimeout>;
     setSession(null);
+    setHistoryLoaded(false);
     setItems([]);
+    setQueued([]);
     setText("");
     setError("");
     setBusy(false);
     async function poll() {
       try {
-        const r = await api<{ session: Session; events: Event[] }>(
-          `/sessions/${id}/events?after=${cursor}`,
-        );
+        const r = await api<{
+          session: Session;
+          events: Event[];
+          queued?: QueuedMessage[];
+        }>(`/sessions/${id}/events?after=${cursor}`);
         if (stopped) return;
         setSession(r.session);
+        setQueued(r.queued || []);
         updateRef.current(r.session);
         if (r.events.length) {
           cursor = r.events.at(-1)!.seq;
           setItems((old) => reduceEvents(old, r.events));
         }
+        if (r.events.length < 500) setHistoryLoaded(true);
         timer = setTimeout(
           poll,
           r.events.length === 500
@@ -100,9 +114,21 @@ export default function Chat({
     }
   }
   async function close() {
+    const subtree = new Set([id]);
+    for (let size = -1; size !== subtree.size;) {
+      size = subtree.size;
+      for (const node of sessions)
+        if (node.swarm?.parent && subtree.has(node.swarm.parent))
+          subtree.add(node.id);
+    }
+    const names = sessions
+      .filter((node) => subtree.has(node.id) && node.phase !== "closed")
+      .map((node) => node.name);
     if (
       !confirm(
-        "Close this agent and permanently delete its workspace? The conversation will remain readable.",
+        session?.swarm?.role === "planner"
+          ? `Close this planner and EVERY descendant, and permanently delete all their VM disks and snapshots? This includes any descendants not yet shown in the sidebar. Conversations remain readable.\n\nCurrently listed: ${names.join(", ")}`
+          : "Close this agent and permanently delete its workspace? The conversation will remain readable.",
       )
     )
       return;
@@ -121,7 +147,7 @@ export default function Chat({
       !text.trim() ||
       busy ||
       !session ||
-      !["idle", "asleep"].includes(session.phase)
+      !["idle", "asleep", "stopped", "working"].includes(session.phase)
     )
       return;
     setBusy(true);
@@ -143,7 +169,8 @@ export default function Chat({
         <ErrorBanner error={error} clear={() => setError("")} />
       </div>
     );
-  const canSend = ["idle", "asleep"].includes(session.phase) && !busy;
+  const canSend =
+    ["idle", "asleep", "stopped", "working"].includes(session.phase) && !busy;
   return (
     <div className="chat">
       <header className="workspace-header">
@@ -163,13 +190,29 @@ export default function Chat({
           </button>
           <button
             className="icon danger"
-            aria-label="Close agent"
-            title="Close agent"
+            aria-label={
+              session.swarm?.role === "planner"
+                ? "Close entire hierarchy"
+                : "Close agent"
+            }
+            title={
+              session.swarm?.role === "planner"
+                ? "Close entire hierarchy"
+                : "Close agent"
+            }
             disabled={
               busy ||
-              !["idle", "working", "asleep", "interrupted"].includes(
-                session.phase,
-              )
+              ![
+                "idle",
+                "working",
+                "asleep",
+                "stopped",
+                "stopping",
+                "interrupted",
+                "closing",
+                "starting",
+                "waking",
+              ].includes(session.phase)
             }
             onClick={close}
           >
@@ -189,7 +232,7 @@ export default function Chat({
             models={models}
             value={session.model || ""}
             disabled={
-              busy || !["idle", "asleep", "interrupted"].includes(session.phase)
+              busy || !["idle", "asleep", "stopped", "interrupted"].includes(session.phase)
             }
             onChange={async (model) => {
               setBusy(true);
@@ -233,6 +276,25 @@ export default function Chat({
           >
             <Moon size={14} />
             Sleep now
+          </button>
+          <button
+            className="secondary"
+            disabled={
+              busy ||
+              !["idle", "working", "asleep", "stopped", "interrupted"].includes(
+                session.phase,
+              )
+            }
+            onClick={() => {
+              if (
+                confirm(
+                  "Stop this agent's VM and discard its running/suspended execution state? Workspace files and conversation are retained. Recovery requires an explicit cold boot. Other swarm agents are unaffected.",
+                )
+              )
+                void act("stop-vm");
+            }}
+          >
+            <Square size={14} /> Stop VM
           </button>
         </div>
       )}
@@ -285,6 +347,8 @@ export default function Chat({
         </div>
       )}
       <Transcript
+        key={id}
+        historyLoaded={historyLoaded}
         items={items}
         phase={session.phase}
         select={select}
@@ -292,10 +356,55 @@ export default function Chat({
         sessions={sessions}
       />
       <div className="composer-area">
-        {session.phase === "asleep" && (
+        {queued.length > 0 && (
+          <section className="queued-messages" aria-label="Queued messages">
+            <strong>
+              {queued.length} queued message{queued.length === 1 ? "" : "s"}
+            </strong>
+            {queued.map((message) => (
+              <div key={message.id} className="queued-message">
+                <details>
+                  <summary>
+                    {message.status === "uncertain"
+                      ? "Delivery unconfirmed — inspect chat before resending"
+                      : message.status === "dispatching"
+                        ? "Sending"
+                        : "Queued"}
+                    : {message.message.slice(0, 100)}
+                    {message.message.length > 100 ? "…" : ""}
+                  </summary>
+                  <p>{message.message}</p>
+                </details>
+                {message.status === "pending" && (
+                  <button
+                    type="button"
+                    className="secondary"
+                    aria-label="Cancel queued message"
+                    onClick={async () => {
+                      try {
+                        await api(
+                          `/sessions/${id}/queue/${message.id}`,
+                          "DELETE",
+                        );
+                        setQueued((old) =>
+                          old.filter((entry) => entry.id !== message.id),
+                        );
+                      } catch (error) {
+                        setError((error as Error).message);
+                      }
+                    }}
+                  >
+                    Cancel
+                  </button>
+                )}
+              </div>
+            ))}
+          </section>
+        )}
+        {["asleep", "stopped"].includes(session.phase) && (
           <div className="wake-hint">
             <Moon size={14} />
-            Workspace asleep. Send a message to pick up where you left off.
+            Workspace {session.phase}. Send a new message to wake it.
           </div>
         )}
         <form className="composer" onSubmit={send}>
@@ -323,7 +432,7 @@ export default function Chat({
             }}
           />
           <div className="composer-bottom">
-            {session.phase === "working" ? (
+            {session.phase === "working" && (
               <button
                 type="button"
                 className="stop"
@@ -340,20 +449,27 @@ export default function Chat({
                 <Square size={13} />
                 Stop
               </button>
-            ) : (
-              <button
-                className="send"
-                aria-label="Send message"
-                disabled={!canSend || !text.trim()}
-              >
-                {busy ? (
-                  <LoaderCircle size={17} className="spin" />
-                ) : (
-                  <ArrowUp size={18} />
-                )}
-                Send
-              </button>
             )}
+            <button
+              className="send"
+              aria-label={
+                session.phase === "working" ||
+                queued.some((m) => m.status === "pending")
+                  ? "Queue message"
+                  : "Send message"
+              }
+              disabled={!canSend || !text.trim()}
+            >
+              {busy ? (
+                <LoaderCircle size={17} className="spin" />
+              ) : (
+                <ArrowUp size={18} />
+              )}
+              {session.phase === "working" ||
+              queued.some((m) => m.status === "pending")
+                ? "Queue"
+                : "Send"}
+            </button>
           </div>
         </form>
         <div className="composer-footnote">

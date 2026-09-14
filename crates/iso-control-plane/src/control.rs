@@ -360,6 +360,56 @@ where
         self.finalize_stop(rec).await
     }
 
+    /// Explicit cold stop: discard execution/suspension state, retaining a
+    /// durable workspace and its stable ingress ports. No automatic policy.
+    pub async fn terminate_vm(&self, id: VmId) -> Result<()> {
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
+        self.terminate_vm_locked(id).await
+    }
+
+    /// Resume only to request clean guest shutdown. Never force on timeout.
+    pub async fn retire_suspension(&self, id: VmId) -> Result<()> {
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
+        let rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
+        if rec.lifecycle != Lifecycle::Durable || rec.state != VmState::Suspended {
+            return Err(iso_common::Error::Backend("Suspension retirement requires a suspended durable VM".into()).into());
+        }
+        self.start_vm_locked(id).await?;
+        self.runtime.stop(id).await?;
+        if !self.wait_exit(id, self.cfg.graceful_stop).await {
+            return Err(iso_common::Error::Backend("Clean shutdown not confirmed; suspension files retained, inspect VM before recovery".into()).into());
+        }
+        self.terminate_vm_locked(id).await
+    }
+
+    async fn terminate_vm_locked(&self, id: VmId) -> Result<()> {
+        let mut rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
+        if rec.lifecycle != Lifecycle::Durable {
+            return Err(iso_common::Error::Backend("Terminate requires a durable workspace".into()).into());
+        }
+        self.runtime.destroy(id).await?;
+        if let Some(snapshot) = &rec.snapshot {
+            for path in [&snapshot.mem_file, &snapshot.vmstate] {
+                match std::fs::symlink_metadata(path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(iso_common::Error::Backend(format!("Check suspension cleanup: {e}")).into()),
+                    Ok(_) => return Err(iso_common::Error::Backend("Suspension snapshot cleanup not confirmed".into()).into()),
+                }
+            }
+        }
+        if let Some(slot) = rec.slot { self.net.teardown(slot).await?; }
+        let slot = rec.slot;
+        rec.slot = None;
+        rec.tap = None;
+        rec.snapshot = None;
+        rec.state = VmState::Stopped;
+        self.store.update_placement(&rec)?;
+        if let Some(slot) = slot { self.slots.lock().unwrap().free(slot); }
+        Ok(())
+    }
+
     /// Poll until the VMM reports the instance gone, or `timeout` elapses.
     /// Returns whether it exited.
     async fn wait_exit(&self, id: VmId, timeout: Duration) -> bool {
@@ -694,15 +744,30 @@ where
     /// Aggregate host stats (admin-only; never exposed to guests).
     pub async fn stats(&self) -> Result<Stats> {
         let pool = self.storage.pool_stats().await?;
+        let records = self.store.list_vms()?;
+        let paths: std::collections::HashSet<_> = records.iter()
+            .filter_map(|r| r.snapshot.as_ref())
+            .flat_map(|s| [s.mem_file.clone(), s.vmstate.clone()]).collect();
+        let snapshot_bytes = tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::MetadataExt;
+            let mut inodes = std::collections::HashSet::new();
+            paths.into_iter().try_fold(0u64, |total, path| {
+                let metadata = std::fs::metadata(path).ok()?;
+                if inodes.insert((metadata.dev(), metadata.ino())) {
+                    total.checked_add(metadata.blocks().checked_mul(512)?)
+                } else { Some(total) }
+            })
+        }).await.ok().flatten();
         let (used, total) = {
             let s = self.slots.lock().unwrap();
             (s.in_use(), s.capacity())
         };
         Ok(Stats {
+            snapshot_bytes,
             pool,
             slots_used: used,
             slots_total: total,
-            vms: self.store.list_vms()?.len(),
+            vms: records.len(),
         })
     }
 }
@@ -809,6 +874,7 @@ mod tests {
     struct MockRuntime {
         log: Log,
         fail_start: bool,
+        hang_stop: bool,
         states: States,
     }
     impl MockRuntime {
@@ -846,7 +912,7 @@ mod tests {
         }
         async fn stop(&self, vm: VmId) -> IRes<()> {
             self.log.push("rt.stop");
-            self.set(vm, VmStatus::Stopped);
+            if !self.hang_stop { self.set(vm, VmStatus::Stopped); }
             Ok(())
         }
         async fn halt(&self, vm: VmId) -> IRes<()> {
@@ -888,6 +954,7 @@ mod tests {
             PoolStats {
                 data_percent: pool,
                 metadata_percent: pool,
+                ..Default::default()
             },
         )
     }
@@ -904,6 +971,7 @@ mod tests {
                 pool: pstats,
             },
             MockRuntime {
+                hang_stop: false,
                 log: log.clone(),
                 fail_start,
                 states: states.clone(),
@@ -1022,6 +1090,50 @@ mod tests {
         cp.start_vm(id).await.unwrap();
         assert_eq!(cp.get_vm(id).unwrap().unwrap().state, VmState::Running);
         assert!(log.has("rt.suspend"));
+    }
+
+    #[tokio::test]
+    async fn suspension_retirement_requires_clean_shutdown() {
+        let (mut cp, log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp.create_vm(req(Lifecycle::Durable, RestartPolicy::Never)).await.unwrap();
+        assert!(cp.retire_suspension(id).await.is_err());
+        cp.suspend_vm(id).await.unwrap();
+        cp.runtime.hang_stop = true;
+        cp.cfg.graceful_stop = Duration::from_millis(5);
+        assert!(cp.retire_suspension(id).await.is_err());
+        assert!(!log.has("rt.halt"));
+        assert!(!log.has("rt.destroy"));
+        assert!(cp.get_vm(id).unwrap().unwrap().snapshot.is_some());
+        cp.runtime.hang_stop = false;
+        cp.suspend_vm(id).await.unwrap();
+        cp.retire_suspension(id).await.unwrap();
+        let rec = cp.get_vm(id).unwrap().unwrap();
+        assert_eq!(rec.state, VmState::Stopped);
+        assert!(rec.snapshot.is_none());
+        assert!(rec.slot.is_none());
+        assert!(!log.has("storage.teardown"));
+    }
+
+    #[tokio::test]
+    async fn explicit_termination_retains_disk_and_discards_execution_state() {
+        let (cp, log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp.create_vm(req(Lifecycle::Durable, RestartPolicy::Always)).await.unwrap();
+        cp.suspend_vm(id).await.unwrap();
+        cp.terminate_vm(id).await.unwrap();
+        cp.terminate_vm(id).await.unwrap();
+        let rec = cp.get_vm(id).unwrap().unwrap();
+        assert_eq!(rec.state, VmState::Stopped);
+        assert!(rec.slot.is_none());
+        assert!(rec.snapshot.is_none());
+        assert!(rec.rootfs_device.is_some());
+        assert!(log.has("rt.destroy"));
+        assert!(!log.has("storage.teardown"));
+        cp.supervise_tick().await.unwrap();
+        assert_eq!(cp.get_vm(id).unwrap().unwrap().state, VmState::Stopped);
+        cp.start_vm(id).await.unwrap();
+        assert_eq!(cp.get_vm(id).unwrap().unwrap().state, VmState::Running);
     }
 
     #[tokio::test]

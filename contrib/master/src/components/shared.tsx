@@ -8,6 +8,8 @@ export const phaseLabel: Record<Phase, string> = {
   working: "Working",
   sleeping: "Going to sleep",
   asleep: "Asleep",
+  stopping: "Shutting down",
+  stopped: "Stopped",
   waking: "Waking workspace",
   interrupted: "Needs recovery",
   closing: "Closing",

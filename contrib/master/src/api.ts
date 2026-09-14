@@ -6,6 +6,8 @@ export type Phase =
   | "working"
   | "sleeping"
   | "asleep"
+  | "stopping"
+  | "stopped"
   | "waking"
   | "interrupted"
   | "closing"
@@ -40,6 +42,16 @@ export interface User {
   idle_seconds: number;
 }
 export interface Plane {
+  storage?: {
+    storage_backend?: string | null;
+    pool_capacity_bytes?: number | null;
+    pool_used_bytes?: number | null;
+    snapshot_bytes?: number | null;
+    filesystem_capacity_bytes?: number | null;
+    filesystem_available_bytes?: number | null;
+    data_percent?: number | null;
+    metadata_percent?: number | null;
+  } | null;
   id: string;
   available: boolean;
   capacity: number;

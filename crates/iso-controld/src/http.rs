@@ -234,6 +234,16 @@ struct DirListing {
 /// Host capacity.
 #[derive(Serialize, ToSchema)]
 struct Stats {
+    storage_backend: Option<String>,
+    /// Thin-pool data capacity, bytes.
+    pool_capacity_bytes: Option<u64>,
+    /// Estimated used data bytes, derived from LVM utilization.
+    pool_used_bytes: Option<u64>,
+    /// Allocated bytes of tracked VM suspension files, separate from thin-pool data.
+    snapshot_bytes: Option<u64>,
+    /// Filesystem containing the pool backing image, bytes.
+    filesystem_capacity_bytes: Option<u64>,
+    filesystem_available_bytes: Option<u64>,
     /// Thin-pool data usage, percent.
     data_percent: f64,
     /// Thin-pool metadata usage, percent.
@@ -422,6 +432,8 @@ lifecycle_handler!(start, start_vm, post, "/vms/{id}/start", "Booted a stopped d
 lifecycle_handler!(stop, stop_vm, post, "/vms/{id}/stop", "Shut down gracefully; an ephemeral VM is then deleted");
 lifecycle_handler!(suspend, suspend_vm, post, "/vms/{id}/suspend", "Paused and snapshotted in place");
 lifecycle_handler!(halt, halt_vm, post, "/vms/{id}/halt", "Killed; an ephemeral VM is then deleted");
+lifecycle_handler!(terminate, terminate_vm, post, "/vms/{id}/terminate", "Cold-stop a durable VM, discarding suspension state but retaining workspace storage");
+lifecycle_handler!(retire_suspension, retire_suspension, post, "/vms/{id}/retire-suspension", "Resume a suspended durable VM for clean shutdown, then discard suspension files; never force on timeout");
 lifecycle_handler!(destroy, destroy_vm, delete, "/vms/{id}", "Destroyed with its storage and placement, whatever its lifecycle");
 
 #[utoipa::path(post, path = "/templates", tag = "templates", request_body = TemplateRequest,
@@ -527,6 +539,12 @@ where
 {
     let s = cp.stats().await?;
     Ok(Json(Stats {
+        storage_backend: s.pool.backend.map(str::to_owned),
+        pool_capacity_bytes: s.pool.capacity_bytes,
+        pool_used_bytes: s.pool.capacity_bytes.map(|n| (n as f64 * s.pool.data_percent / 100.0) as u64),
+        snapshot_bytes: s.snapshot_bytes,
+        filesystem_capacity_bytes: s.pool.filesystem_capacity_bytes,
+        filesystem_available_bytes: s.pool.filesystem_available_bytes,
         data_percent: s.pool.data_percent,
         metadata_percent: s.pool.metadata_percent,
         slots_used: s.slots_used,
@@ -713,7 +731,7 @@ where
             certificate issued by the host's admin CA (`isoctl admin issue-client`) is required.",
         license(name = "MIT"),
     ),
-    paths(create, list, get_one, start, stop, suspend, halt, destroy, set_policy, add_forward, remove_forward,
+    paths(create, list, get_one, start, stop, suspend, halt, terminate, retire_suspension, destroy, set_policy, add_forward, remove_forward,
         register_template, stats, agent_info, guest_exec, read_file, write_file, remove_path, list_dir),
     components(schemas(ErrorBody, PortForward, CreateVmRequest, CreatedVm, AddForwardRequest, Vm, PolicyRequest,
         WriteFileRequest, Written, DirListing, Stats, TemplateRequest,
@@ -745,6 +763,8 @@ where
         .route("/vms/{id}/stop", post(stop::<N, S, R>))
         .route("/vms/{id}/suspend", post(suspend::<N, S, R>))
         .route("/vms/{id}/halt", post(halt::<N, S, R>))
+        .route("/vms/{id}/terminate", post(terminate::<N, S, R>))
+        .route("/vms/{id}/retire-suspension", post(retire_suspension::<N, S, R>))
         .route("/vms/{id}/policy", patch(set_policy::<N, S, R>))
         .route("/vms/{id}/forwards", post(add_forward::<N, S, R>))
         .route(
@@ -824,7 +844,7 @@ pub(crate) mod tests {
             Ok(())
         }
         async fn pool_stats(&self) -> IRes<PoolStats> {
-            Ok(PoolStats { data_percent: 10.0, metadata_percent: 5.0 })
+            Ok(PoolStats { data_percent: 10.0, metadata_percent: 5.0, ..Default::default() })
         }
     }
 
@@ -1123,7 +1143,7 @@ mod openapi_tests {
         let extra: Vec<_> = documented.difference(&served).collect();
         assert!(missing.is_empty(), "routes without an OpenAPI operation: {missing:?}");
         assert!(extra.is_empty(), "documented operations with no route: {extra:?}");
-        assert_eq!(served.len(), 19, "operation count; update when routes change on purpose");
+        assert_eq!(served.len(), 21, "operation count; update when routes change on purpose");
     }
 
     #[test]

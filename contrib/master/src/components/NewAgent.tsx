@@ -45,7 +45,7 @@ export default function NewAgent({
     try {
       onCreated(
         await api<Session>("/sessions", "POST", {
-          name: name.trim() || "New agent",
+          name: name.trim() || (swarm ? "" : "New agent"),
           model: model || null,
           swarm,
           planner_model: plannerModel || null,
@@ -90,7 +90,9 @@ export default function NewAgent({
             value={name}
             onChange={(e) => setName(e.target.value)}
             maxLength={120}
-            placeholder="e.g. Build my dashboard"
+            placeholder={
+              swarm ? "Assigned automatically" : "e.g. Build my dashboard"
+            }
             disabled={busy}
           />
         </label>

@@ -95,7 +95,10 @@ impl Store {
     }
     pub fn interrupt(&self, id: &str, error: &str) {
         let _ = self.update(id, |s| {
-            if s.phase != Phase::Closed && s.phase != Phase::AllocationUnknown {
+            if !matches!(
+                s.phase,
+                Phase::Closed | Phase::Closing | Phase::AllocationUnknown
+            ) {
                 s.phase = Phase::Interrupted;
                 s.error = Some(error.into());
             }
@@ -113,7 +116,11 @@ impl Store {
                 self.phase(&s.id, Phase::AllocationUnknown)?;
             } else if !matches!(
                 s.phase,
-                Phase::Closed | Phase::Asleep | Phase::AllocationUnknown | Phase::Interrupted
+                Phase::Closed
+                    | Phase::Asleep
+                    | Phase::Stopped
+                    | Phase::AllocationUnknown
+                    | Phase::Interrupted
             ) {
                 self.interrupt(&s.id,"Master restarted during a live session. Recover will reboot the workspace without replaying prompts.");
             }
@@ -223,6 +230,27 @@ impl Store {
                 id
             ],
         )?;
+        Ok(())
+    }
+    pub fn operator_queue(&self, recipient: &str) -> Result<Vec<Value>> {
+        let db = self.0.lock().unwrap();
+        let mut query = db.prepare("SELECT id,message,status FROM mailbox WHERE recipient=? AND sender='operator' AND status IN ('pending','dispatching','uncertain') ORDER BY id")?;
+        let rows = query.query_map([recipient], |row| Ok(json!({"id":row.get::<_,i64>(0)?,"message":row.get::<_,String>(1)?,"status":row.get::<_,String>(2)?})))?;
+        rows.map(|row| Ok(row?)).collect()
+    }
+    pub fn has_pending_message(&self, recipient: &str) -> Result<bool> {
+        Ok(self.0.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM mailbox WHERE recipient=? AND status='pending')",
+            [recipient],
+            |row| row.get(0),
+        )?)
+    }
+    pub fn cancel_operator_message(&self, recipient: &str, id: i64) -> Result<()> {
+        let changed = self.0.lock().unwrap().execute("UPDATE mailbox SET status='cancelled' WHERE id=? AND recipient=? AND sender='operator' AND status='pending'", params![id,recipient])?;
+        anyhow::ensure!(
+            changed == 1,
+            "Message is no longer pending or does not belong to this agent"
+        );
         Ok(())
     }
     fn record_swarm_event(&self, recipient: &str, prompt: &str) -> Result<bool> {

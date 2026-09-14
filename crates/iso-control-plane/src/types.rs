@@ -163,6 +163,8 @@ impl CreateVm {
 /// Aggregate host statistics (admin-only; never exposed to guests).
 #[derive(Clone, Copy, Debug)]
 pub struct Stats {
+    /// Allocated host bytes for VM suspension files; None if accounting failed.
+    pub snapshot_bytes: Option<u64>,
     pub pool: iso_common::PoolStats,
     pub slots_used: usize,
     pub slots_total: usize,
