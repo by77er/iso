@@ -34,11 +34,12 @@ where
     fn redirect(&self, src: IpAddr, name: &str) -> Option<Ipv4Addr> {
         let IpAddr::V4(v4) = src else { return None };
         let rec = self.cp.identify(v4).ok()??;
-        if rec.egress == EgressMode::Allow && rec.allow.iter().any(|d| d == name) {
-            Some(self.proxy_ip)
-        } else {
-            None
+        if rec.egress != EgressMode::Allow {
+            return None;
         }
+        // Steer any name some allow rule could match, wildcards included.
+        let rules = iso_policy::RuleSet::from_record(&rec.allow, &rec.rules).ok()?;
+        rules.host_allowed(name).then_some(self.proxy_ip)
     }
 }
 

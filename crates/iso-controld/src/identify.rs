@@ -48,11 +48,24 @@ where
         let req: IdentifyRequest = serde_json::from_slice(req).ok()?;
         let ip: Ipv4Addr = req.ip.parse().ok()?;
         let rec = cp.identify(ip).ok()??;
+        // The stored policy was validated on the way in; a record that still
+        // fails to compile is served as "no rules" rather than as "no VM", so
+        // the failure is a denied connection and a log line, not a mystery.
+        let rules = match iso_policy::RuleSet::from_record(&rec.allow, &rec.rules) {
+            Ok(rs) => rs.to_strings(),
+            Err(e) => {
+                eprintln!("iso-controld: identify: vm {} has an invalid policy: {e}", rec.id);
+                Vec::new()
+            }
+        };
         Some(IdentifyResponse {
             found: true,
             egress: egress_str(rec.egress).to_string(),
             principal: rec.principal,
             allow: rec.allow,
+            vm: Some(rec.id.to_string()),
+            rules,
+            policy_gen: rec.policy_gen,
         })
     })()
     .unwrap_or_default();

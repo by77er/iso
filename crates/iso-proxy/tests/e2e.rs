@@ -4,12 +4,12 @@
 //! run manually:
 //!   cargo test -p iso-proxy --test e2e -- --ignored --nocapture
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use iso_ca::Ca;
-use iso_proxy::{Policy, ProxyConfig, StaticResolver, run_with_listener};
+use iso_policy::RuleSet;
+use iso_proxy::{Policy, ProxyConfig, StaticResolver, run_with_listeners};
 use iso_secrets::TomlSecretProvider;
 use tokio::net::TcpListener;
 
@@ -49,18 +49,21 @@ async fn injects_headers_and_enforces_allowlist() {
     // Proxy on an ephemeral port, allowing only the echo domain.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
-    tokio::spawn(run_with_listener(
-        listener,
-        ProxyConfig {
-            listen: vec![proxy_addr], // unused by run_with_listener
-            ca_sock,
-            secrets_sock,
-            resolver: Arc::new(StaticResolver(Policy {
-                egress: "proxy".into(),
-                principal: Some("default".into()),
-                allow: HashSet::from([ECHO.to_string()]),
-            })),
-        },
+    let resolver = Arc::new(StaticResolver(Policy {
+        egress: "proxy".into(),
+        principal: Some("default".into()),
+        rules: Arc::new(RuleSet::from_allow_list([ECHO]).unwrap()),
+        policy_gen: 1,
+        vm: None,
+    }));
+    tokio::spawn(run_with_listeners(
+        vec![listener],
+        ProxyConfig::single(
+            vec![proxy_addr],
+            resolver,
+            iso_rpc::Endpoint::unix(ca_sock),
+            iso_rpc::Endpoint::unix(secrets_sock),
+        ),
     ));
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -82,7 +85,11 @@ async fn injects_headers_and_enforces_allowlist() {
         .await
         .expect("json");
     let reflected = body["headers"]["x-iso-injected"].as_str();
-    assert_eq!(reflected, Some("hello-from-iso"), "injected header reflected");
+    assert_eq!(
+        reflected,
+        Some("hello-from-iso"),
+        "injected header reflected"
+    );
 
     // 2. not in allow-list → proxy drops the connection.
     let denied = reqwest::Client::builder()

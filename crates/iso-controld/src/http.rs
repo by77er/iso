@@ -55,6 +55,7 @@ impl From<CpError> for ApiError {
             | CpError::PortsExhausted
             | CpError::PoolFull { .. }
             | CpError::InvalidState { .. } => StatusCode::CONFLICT,
+            CpError::InvalidRule(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(code, e.to_string())
@@ -127,6 +128,12 @@ struct CreateVmRequest {
     /// Domains routed through the egress proxy.
     #[serde(default)]
     allow: Vec<String>,
+    /// URI-level rules, e.g. `allow https://api.github.com/**` or
+    /// `deny https://api.github.com/user/keys`. Deny wins; nothing matching
+    /// is denied. `allow` hosts are sugar for `allow https://host/**` plus
+    /// `allow wss://host/**`. A rule that does not parse is a 400.
+    #[serde(default)]
+    rules: Vec<String>,
 }
 
 /// The id of a newly created VM.
@@ -175,6 +182,10 @@ struct Vm {
     rootfs_device: Option<String>,
     principal: Option<String>,
     allow: Vec<String>,
+    /// URI-level rules on top of `allow`, in `iso-policy` syntax.
+    rules: Vec<String>,
+    /// Bumped on every policy change.
+    policy_gen: u64,
 }
 
 /// Change a running VM's egress policy. Omitted fields are left unchanged.
@@ -184,6 +195,9 @@ struct PolicyRequest {
     principal: Option<String>,
     #[serde(default)]
     allow: Option<Vec<String>>,
+    /// Replace the URI-level rules. A rule that does not parse is a 400.
+    #[serde(default)]
+    rules: Option<Vec<String>>,
     /// `allow`, `proxy` or `deny`; anything else leaves the mode unchanged.
     #[serde(default)]
     egress: Option<String>,
@@ -329,6 +343,7 @@ fn to_req(r: CreateVmRequest) -> CreateVm {
         mem_mib: r.mem_mib,
         principal: r.principal,
         allow: r.allow,
+        rules: r.rules,
     }
 }
 
@@ -355,6 +370,8 @@ fn vm_resp(r: &VmRecord) -> Vm {
         rootfs_device: r.rootfs_device.as_ref().map(|p| p.to_string_lossy().into_owned()),
         principal: r.principal.clone(),
         allow: r.allow.clone(),
+        rules: r.rules.clone(),
+        policy_gen: r.policy_gen,
     }
 }
 
@@ -468,7 +485,7 @@ where
 
 #[utoipa::path(patch, path = "/vms/{id}/policy", tag = "vms", params(("id" = String, Path, description = "VM id, as a hyphenated UUID or 32 hex digits")),
     request_body = PolicyRequest,
-    responses((status = 204, description = "Applied to new connections"), (status = 404, description = "Unknown VM", body = ErrorBody)))]
+    responses((status = 204, description = "Applied to new connections; connections at the old policy generation are closed by the proxy edge"), (status = 400, description = "A rule does not parse", body = ErrorBody), (status = 404, description = "Unknown VM", body = ErrorBody)))]
 async fn set_policy<N, S, R>(
     State(cp): State<Cp<N, S, R>>,
     Path(id): Path<String>,
@@ -480,7 +497,7 @@ where
     R: iso_common::runtime::VmRuntime + Send + Sync + 'static,
 {
     let egress = req.egress.as_deref().and_then(egress_parse);
-    cp.set_policy(parse_id(&id)?, req.principal, req.allow, egress)
+    cp.set_policy(parse_id(&id)?, req.principal, req.allow, req.rules, egress)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1102,6 +1119,81 @@ mod guest_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT, "stopped vm has no guest channel");
+    }
+
+    #[tokio::test]
+    async fn rules_are_validated_and_every_policy_change_bumps_the_generation() {
+        let app = app();
+        // A rule that does not parse is a 400 before anything is allocated.
+        let resp = app
+            .clone()
+            .oneshot(post("/vms", serde_json::json!({"template":"base","egress":"proxy","rules":["permit https://x/"]})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        assert!(body_json(resp).await["error"].as_str().unwrap().contains("invalid rule"));
+        assert_eq!(app.clone().oneshot(get("/vms")).await.map(|r| r.status()).unwrap(), 200);
+
+        // A good one is stored at generation 1, with `allow` kept as sugar.
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/vms",
+                serde_json::json!({
+                    "template":"base","egress":"proxy","principal":"alice",
+                    "allow":["api.github.com"],
+                    "rules":["deny https://api.github.com/user/keys","allow wss://*.example.com/ws"]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+        let vm = body_json(app.clone().oneshot(get(&format!("/vms/{id}"))).await.unwrap()).await;
+        assert_eq!(vm["policy_gen"], 1);
+        assert_eq!(vm["allow"], serde_json::json!(["api.github.com"]));
+        assert_eq!(vm["rules"].as_array().unwrap().len(), 2);
+
+        // A bad patch changes nothing; a good one bumps the generation.
+        let resp = app
+            .clone()
+            .oneshot(patch(&format!("/vms/{id}/policy"), serde_json::json!({"rules":["allow https://x.com/a/**/b"]})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let vm = body_json(app.clone().oneshot(get(&format!("/vms/{id}"))).await.unwrap()).await;
+        assert_eq!(vm["policy_gen"], 1);
+
+        let resp = app
+            .clone()
+            .oneshot(patch(&format!("/vms/{id}/policy"), serde_json::json!({"principal":"bob"})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        let resp = app
+            .clone()
+            .oneshot(patch(&format!("/vms/{id}/policy"), serde_json::json!({"rules":["allow https://api.github.com/**"]})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        let vm = body_json(app.clone().oneshot(get(&format!("/vms/{id}"))).await.unwrap()).await;
+        assert_eq!(vm["policy_gen"], 3, "two accepted changes, two bumps");
+        assert_eq!(vm["principal"], "bob");
+        assert_eq!(vm["rules"], serde_json::json!(["allow https://api.github.com/**"]));
+        assert_eq!(vm["allow"], serde_json::json!(["api.github.com"]), "allow is untouched by a rules patch");
+    }
+
+    pub(super) fn get(path: &str) -> Request<Body> {
+        Request::builder().method("GET").uri(path).body(Body::empty()).unwrap()
+    }
+
+    pub(super) fn patch(path: &str, json: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("PATCH")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(json.to_string()))
+            .unwrap()
     }
 }
 

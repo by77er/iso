@@ -1,30 +1,106 @@
-//! Per-connection policy resolution: source IP → the VM's current egress policy.
+//! Per-connection policy resolution: source IP → the VM's current egress
+//! policy, and the identity a connection carries through the proxy.
 //!
-//! `RpcResolver` calls the control-plane `identify` RPC and caches by source IP
-//! with a short TTL, so a mutable principal (pushed per agent turn) takes effect
-//! within the TTL without a lookup per connection.
+//! `RpcResolver` calls the control-plane `identify` RPC and caches by source
+//! IP with a short TTL. In the single-host and edge roles that is how a
+//! connection is named; in the tier role the edge has already done it and
+//! the answer arrives in the PROXY protocol header.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use iso_common::identify::{IdentifyRequest, IdentifyResponse};
+use iso_policy::RuleSet;
+use serde::{Deserialize, Serialize};
 
-use crate::rpc::call;
-
-/// A VM's resolved egress policy.
+/// A VM's resolved egress policy, as the proxy uses it.
 #[derive(Clone)]
 pub struct Policy {
-    /// `"allow" | "proxy" | "deny"` (informational; the proxy only sees traffic
-    /// that was steered to it either way).
+    /// `"allow" | "proxy" | "deny"`. `deny` is refused outright: such a VM
+    /// has no egress, and the services address being reachable from it is
+    /// not a licence to proxy for it.
     pub egress: String,
     /// Opaque principal selecting per-principal injected credentials.
     pub principal: Option<String>,
-    /// Domains this VM may reach through the proxy.
-    pub allow: HashSet<String>,
+    /// The compiled rule set: host phase and URI phase.
+    pub rules: Arc<RuleSet>,
+    /// Policy generation. Connections are closed when it moves.
+    pub policy_gen: u64,
+    /// The VM's id, when the resolver knows it (a static resolver may not).
+    pub vm: Option<String>,
+}
+
+impl Policy {
+    /// From the control plane's answer. A response with `rules` uses them; an
+    /// older control plane that only sends `allow` gets the sugar expansion.
+    pub fn from_identify(r: IdentifyResponse) -> Option<Self> {
+        if !r.found {
+            return None;
+        }
+        let rules = if r.rules.is_empty() {
+            RuleSet::from_allow_list(&r.allow)
+        } else {
+            RuleSet::parse(&r.rules)
+        };
+        let rules = match rules {
+            Ok(rs) => rs,
+            Err(e) => {
+                tracing::warn!("identify answered with an unparsable policy ({e}); denying");
+                RuleSet::default()
+            }
+        };
+        Some(Policy {
+            egress: r.egress,
+            principal: r.principal,
+            rules: Arc::new(rules),
+            policy_gen: r.policy_gen,
+            vm: r.vm,
+        })
+    }
+
+    pub fn is_deny_mode(&self) -> bool {
+        self.egress == "deny"
+    }
+}
+
+/// What travels from an edge to a proxy replica inside the PROXY protocol
+/// header: the connection's identity and its whole policy, so the replica
+/// needs no lookup, no cache and no watch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WirePolicy {
+    pub host: String,
+    pub vm: Option<String>,
+    pub egress: String,
+    pub principal: Option<String>,
+    pub rules: Vec<String>,
+    pub policy_gen: u64,
+}
+
+impl WirePolicy {
+    pub fn from_policy(host: &str, p: &Policy) -> Self {
+        Self {
+            host: host.to_string(),
+            vm: p.vm.clone(),
+            egress: p.egress.clone(),
+            principal: p.principal.clone(),
+            rules: p.rules.to_strings(),
+            policy_gen: p.policy_gen,
+        }
+    }
+
+    pub fn into_policy(self) -> Result<Policy, iso_policy::ParseError> {
+        Ok(Policy {
+            egress: self.egress,
+            principal: self.principal,
+            rules: Arc::new(RuleSet::parse(&self.rules)?),
+            policy_gen: self.policy_gen,
+            vm: self.vm,
+        })
+    }
 }
 
 #[async_trait]
@@ -72,18 +148,13 @@ impl PolicyResolver for RpcResolver {
             }
         }
 
-        let pol = match call::<_, IdentifyResponse>(
+        let pol = match iso_rpc::call_unix::<_, IdentifyResponse>(
             &self.sock,
             &IdentifyRequest { ip: ip.to_string() },
         )
         .await
         {
-            Ok(resp) if resp.found => Some(Policy {
-                egress: resp.egress,
-                principal: resp.principal,
-                allow: resp.allow.into_iter().collect(),
-            }),
-            Ok(_) => None,
+            Ok(resp) => Policy::from_identify(resp),
             Err(e) => {
                 tracing::warn!("identify rpc failed for {ip}: {e}");
                 None

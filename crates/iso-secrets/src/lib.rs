@@ -1,8 +1,19 @@
-//! iso-secrets — the SecretProvider: header injections keyed by (domain, principal).
+//! iso-secrets — the SecretProvider: header injections keyed by (domain,
+//! principal, path).
 //!
-//! Backed by a static TOML (`$ISO_STATE_DIR/secrets.toml`). The provider merges
+//! The service owns a two-call contract, [`SecretProvider::headers`] and
+//! [`SecretProvider::names`], and nothing else: every backend is an adapter
+//! behind that trait. [`TomlSecretProvider`] is the reference adapter, backed
+//! by `$ISO_STATE_DIR/secrets.toml`; [`ExecProvider`] runs an operator's
+//! program and is the escape hatch to any secret manager without a native
+//! adapter; [`ChainProvider`] composes adapters. The TOML provider merges
 //! **global OVER per-principal** and returns the effective header set. See
 //! `iso-proxy/DESIGN.md`.
+//!
+//! Two rules hold across adapters. `names` never mints: it is answered from
+//! metadata, so describing the environment cannot drive issuance. And the
+//! service is served on a Unix socket (single host) or over HTTPS with mutual
+//! TLS (a proxy tier elsewhere) from the same handler.
 //!
 //! A header value is either a literal string (used verbatim) or a structured
 //! token table that secretsd renders into the final value. The token form lets
@@ -30,8 +41,6 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -122,26 +131,129 @@ impl HeadersResponse {
     }
 }
 
-/// SecretProvider RPC client: one connection per call — write JSON, half-close,
-/// read the JSON reply. Fail-open, matching the daemon: any error answers as
-/// though nothing is configured, so a provider that is down degrades to "no
-/// injection" rather than blocking egress.
+/// The RPC method name, over both transports.
+pub const METHOD: &str = "headers";
+
+/// A backend that answers the two questions the proxy and the control plane
+/// ask. Implementations are adapters; the service adds nothing on top.
+#[async_trait::async_trait]
+pub trait SecretProvider: Send + Sync + 'static {
+    /// The effective headers to set/override for a request to `domain` at
+    /// `path` (query stripped) as `principal`. Empty means inject nothing.
+    /// May mint or exchange on demand.
+    async fn headers(
+        &self,
+        domain: &str,
+        principal: Option<&str>,
+        path: Option<&str>,
+    ) -> HashMap<String, String>;
+
+    /// Which header **names** `headers` would produce, without producing a
+    /// value. Must never mint.
+    async fn names(&self, domain: &str, principal: Option<&str>, path: Option<&str>)
+    -> Vec<String>;
+}
+
+/// The RPC handler shared by both transports: a JSON [`HeadersRequest`] in,
+/// a JSON [`HeadersResponse`] out. Malformed input answers as "nothing
+/// configured" (fail-open), matching the client.
+pub async fn handle<P: SecretProvider + ?Sized>(provider: &P, body: &[u8]) -> Vec<u8> {
+    let out = match serde_json::from_slice::<HeadersRequest>(body) {
+        Ok(r) => {
+            if r.names_only {
+                let mut names = provider
+                    .names(&r.domain, r.principal.as_deref(), r.path.as_deref())
+                    .await;
+                names.sort();
+                names.dedup();
+                HeadersResponse {
+                    names,
+                    ..Default::default()
+                }
+            } else {
+                let headers = provider
+                    .headers(&r.domain, r.principal.as_deref(), r.path.as_deref())
+                    .await;
+                HeadersResponse {
+                    headers,
+                    ..Default::default()
+                }
+            }
+        }
+        Err(_) => Default::default(),
+    };
+    serde_json::to_vec(&out).unwrap_or_default()
+}
+
+/// Serve the SecretProvider RPC on `sock` (JSON, half-close delimited).
+pub async fn serve_unix<P: SecretProvider + ?Sized>(
+    provider: Arc<P>,
+    sock: &Path,
+) -> std::io::Result<()> {
+    iso_rpc::serve_unix(
+        sock,
+        METHOD,
+        Arc::new(move |_m: &str, body: Vec<u8>| {
+            let provider = provider.clone();
+            async move { handle(&*provider, &body).await }
+        }),
+    )
+    .await
+}
+
+/// Serve the SecretProvider RPC over HTTPS with mutual TLS: `POST /headers`.
+pub async fn serve_https<P: SecretProvider + ?Sized>(
+    provider: Arc<P>,
+    listener: tokio::net::TcpListener,
+    cfg: Arc<rustls::ServerConfig>,
+) -> std::io::Result<()> {
+    iso_rpc::serve_https(
+        listener,
+        cfg,
+        Arc::new(move |m: &str, body: Vec<u8>| {
+            let provider = provider.clone();
+            let ok = m == METHOD;
+            async move {
+                if ok {
+                    handle(&*provider, &body).await
+                } else {
+                    serde_json::to_vec(&HeadersResponse::default()).unwrap_or_default()
+                }
+            }
+        }),
+    )
+    .await
+}
+
+/// SecretProvider RPC client. Fail-open, matching the daemon: any error
+/// answers as though nothing is configured, so a provider that is down
+/// degrades to "no injection" rather than blocking egress.
+#[derive(Clone)]
 pub struct Client {
-    sock: PathBuf,
+    endpoint: iso_rpc::Endpoint,
 }
 
 impl Client {
+    /// A Unix-socket client (the single-host form).
     pub fn new(sock: impl Into<PathBuf>) -> Self {
-        Self { sock: sock.into() }
+        Self {
+            endpoint: iso_rpc::Endpoint::unix(sock),
+        }
+    }
+
+    /// An HTTPS client with mutual TLS, `base` like `https://host:port`.
+    pub fn https(base: &str, cfg: Arc<rustls::ClientConfig>) -> Self {
+        Self {
+            endpoint: iso_rpc::Endpoint::https(base, cfg),
+        }
+    }
+
+    pub fn from_endpoint(endpoint: iso_rpc::Endpoint) -> Self {
+        Self { endpoint }
     }
 
     async fn call(&self, req: &HeadersRequest) -> std::io::Result<HeadersResponse> {
-        let mut conn = UnixStream::connect(&self.sock).await?;
-        conn.write_all(&serde_json::to_vec(req)?).await?;
-        conn.shutdown().await?; // half-close: end of request
-        let mut buf = Vec::new();
-        conn.read_to_end(&mut buf).await?;
-        Ok(serde_json::from_slice(&buf)?)
+        self.endpoint.call(METHOD, req).await
     }
 
     /// Headers to inject for this request. `path` may be `None` when the caller
@@ -312,49 +424,179 @@ impl TomlSecretProvider {
     }
 }
 
-/// Serve the SecretProvider RPC on `sock` (JSON, half-close delimited).
-pub async fn serve_unix(provider: Arc<TomlSecretProvider>, sock: &Path) -> std::io::Result<()> {
-    // Watch the config file: reload on change even when idle.
-    {
-        let provider = provider.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                provider.reload_if_changed();
-            }
-        });
+/// Keep a TOML provider's file fresh while idle: re-read on change every
+/// couple of seconds, on top of the per-request check.
+pub fn spawn_reload_watcher(provider: Arc<TomlSecretProvider>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            provider.reload_if_changed();
+        }
+    });
+}
+
+#[async_trait::async_trait]
+impl SecretProvider for TomlSecretProvider {
+    // The TOML file is keyed by domain alone, so `path` has nothing to narrow
+    // here; it exists for providers whose rules are path-scoped.
+    async fn headers(
+        &self,
+        domain: &str,
+        principal: Option<&str>,
+        _path: Option<&str>,
+    ) -> HashMap<String, String> {
+        TomlSecretProvider::headers(self, domain, principal)
     }
 
-    let _ = std::fs::remove_file(sock);
-    let listener = UnixListener::bind(sock)?;
-    loop {
-        let (mut conn, _) = listener.accept().await?;
-        let provider = provider.clone();
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if conn.read_to_end(&mut buf).await.is_err() {
-                return;
+    // Nothing is minted either way, so names are a projection of headers.
+    async fn names(
+        &self,
+        domain: &str,
+        principal: Option<&str>,
+        _path: Option<&str>,
+    ) -> Vec<String> {
+        TomlSecretProvider::headers(self, domain, principal)
+            .into_keys()
+            .collect()
+    }
+}
+
+/// The escape hatch: an operator-supplied program answers both calls.
+///
+/// It is run as `program [args…] <op> <domain> <principal|-> <path|->` with
+/// `op` being `headers` or `names`, and must print JSON on stdout: for
+/// `headers` an object of header name to value (or `{"headers": {…}}`), for
+/// `names` an array of names (or `{"names": […]}`). A non-zero exit, a
+/// timeout or unparsable output answers as "nothing" (fail-open), and is
+/// logged. This is how a secret manager with no native adapter is reached:
+/// the program talks to it, iso does not.
+pub struct ExecProvider {
+    program: PathBuf,
+    args: Vec<String>,
+    timeout: Duration,
+}
+
+impl ExecProvider {
+    pub fn new(program: impl Into<PathBuf>, args: Vec<String>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    async fn run(
+        &self,
+        op: &str,
+        domain: &str,
+        principal: Option<&str>,
+        path: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        let mut cmd = tokio::process::Command::new(&self.program);
+        cmd.args(&self.args)
+            .arg(op)
+            .arg(domain)
+            .arg(principal.unwrap_or("-"))
+            .arg(path.unwrap_or("-"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true);
+        let out = match tokio::time::timeout(self.timeout, cmd.output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                tracing::warn!("secrets exec {}: {e}", self.program.display());
+                return None;
             }
-            // The TOML file is keyed by domain alone, so `path` has nothing to
-            // narrow here; it exists for providers whose rules are path-scoped.
-            // Nothing is minted either way, so `names_only` is just a projection.
-            let out = match serde_json::from_slice::<HeadersRequest>(&buf) {
-                Ok(r) => {
-                    let headers = provider.headers(&r.domain, r.principal.as_deref());
-                    if r.names_only {
-                        let mut names: Vec<String> = headers.into_keys().collect();
-                        names.sort();
-                        HeadersResponse { names, ..Default::default() }
-                    } else {
-                        HeadersResponse { headers, ..Default::default() }
-                    }
-                }
-                Err(_) => Default::default(), // fail-open
-            };
-            let resp = serde_json::to_vec(&out).unwrap_or_default();
-            let _ = conn.write_all(&resp).await;
-            let _ = conn.shutdown().await;
-        });
+            Err(_) => {
+                tracing::warn!("secrets exec {}: timed out", self.program.display());
+                return None;
+            }
+        };
+        if !out.status.success() {
+            tracing::warn!(
+                "secrets exec {} {op}: exit {}",
+                self.program.display(),
+                out.status
+            );
+            return None;
+        }
+        match serde_json::from_slice(&out.stdout) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    "secrets exec {} {op}: bad json: {e}",
+                    self.program.display()
+                );
+                None
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SecretProvider for ExecProvider {
+    async fn headers(
+        &self,
+        domain: &str,
+        principal: Option<&str>,
+        path: Option<&str>,
+    ) -> HashMap<String, String> {
+        let v = self
+            .run("headers", domain, principal, path)
+            .await
+            .unwrap_or(serde_json::Value::Null);
+        let obj = v.get("headers").cloned().unwrap_or(v);
+        serde_json::from_value(obj).unwrap_or_default()
+    }
+
+    async fn names(
+        &self,
+        domain: &str,
+        principal: Option<&str>,
+        path: Option<&str>,
+    ) -> Vec<String> {
+        let v = self
+            .run("names", domain, principal, path)
+            .await
+            .unwrap_or(serde_json::Value::Null);
+        let arr = v.get("names").cloned().unwrap_or(v);
+        serde_json::from_value(arr).unwrap_or_default()
+    }
+}
+
+/// Several adapters as one: later providers override earlier ones on the
+/// same header name, names are the union.
+pub struct ChainProvider(pub Vec<Arc<dyn SecretProvider>>);
+
+#[async_trait::async_trait]
+impl SecretProvider for ChainProvider {
+    async fn headers(
+        &self,
+        domain: &str,
+        principal: Option<&str>,
+        path: Option<&str>,
+    ) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for p in &self.0 {
+            out.extend(p.headers(domain, principal, path).await);
+        }
+        out
+    }
+
+    async fn names(
+        &self,
+        domain: &str,
+        principal: Option<&str>,
+        path: Option<&str>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        for p in &self.0 {
+            out.extend(p.names(domain, principal, path).await);
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 }
 
@@ -399,7 +641,9 @@ mod tests {
     fn principal_only_domain() {
         let p = TomlSecretProvider::from_toml(TOML).unwrap();
         assert_eq!(
-            p.headers("api.github.com", Some("default")).get("authorization").unwrap(),
+            p.headers("api.github.com", Some("default"))
+                .get("authorization")
+                .unwrap(),
             "Bearer gh"
         );
         // no principal => no per-principal headers, only (absent) global.
@@ -411,22 +655,30 @@ mod tests {
         let p = TomlSecretProvider::from_toml(TOML).unwrap();
         // bearer token table -> "Bearer <token>".
         assert_eq!(
-            p.headers("api.github.com", Some("default")).get("authorization").unwrap(),
+            p.headers("api.github.com", Some("default"))
+                .get("authorization")
+                .unwrap(),
             "Bearer gh"
         );
         // basic token table -> "Basic base64(x-access-token:<token>)" (default user).
         assert_eq!(
-            p.headers("github.com", Some("default")).get("authorization").unwrap(),
+            p.headers("github.com", Some("default"))
+                .get("authorization")
+                .unwrap(),
             "Basic eC1hY2Nlc3MtdG9rZW46Z2g=" // base64("x-access-token:gh")
         );
         // basic with explicit user.
         assert_eq!(
-            p.headers("example.test", Some("default")).get("authorization").unwrap(),
+            p.headers("example.test", Some("default"))
+                .get("authorization")
+                .unwrap(),
             "Basic YWxpY2U6dG9r" // base64("alice:tok")
         );
         // a plain string is still used verbatim.
         assert_eq!(
-            p.headers("verbatim.test", Some("default")).get("authorization").unwrap(),
+            p.headers("verbatim.test", Some("default"))
+                .get("authorization")
+                .unwrap(),
             "Bearer literal"
         );
     }
@@ -451,7 +703,8 @@ mod tests {
     #[test]
     fn with_path_drops_the_query_string() {
         // Query strings carry tokens and identifiers; no path rule needs them.
-        let r = HeadersRequest::new("api.example.com", None).with_path(Some("/v1/x?token=sk-secret"));
+        let r =
+            HeadersRequest::new("api.example.com", None).with_path(Some("/v1/x?token=sk-secret"));
         assert_eq!(r.path.as_deref(), Some("/v1/x"));
     }
 
@@ -492,10 +745,17 @@ mod tests {
         }
 
         let client = Client::new(&sock);
-        let headers = client.headers("api.anthropic.com", Some("default"), None).await;
-        assert_eq!(headers.get("x-api-key").map(String::as_str), Some("global-key"));
+        let headers = client
+            .headers("api.anthropic.com", Some("default"), None)
+            .await;
+        assert_eq!(
+            headers.get("x-api-key").map(String::as_str),
+            Some("global-key")
+        );
 
-        let names = client.names("api.anthropic.com", Some("default"), None).await;
+        let names = client
+            .names("api.anthropic.com", Some("default"), None)
+            .await;
         assert!(names.contains(&"x-api-key".to_string()));
         assert!(!names.contains(&"global-key".to_string()));
 
@@ -506,6 +766,55 @@ mod tests {
             .unwrap();
         assert!(resp.headers.is_empty(), "names_only must not return values");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn exec_provider_runs_a_program_and_fails_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("iso-secrets-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("provider.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nop=$1; domain=$2; principal=$3; path=$4\n\
+             case \"$op\" in\n\
+               headers) printf '{\"x-domain\":\"%s\",\"x-principal\":\"%s\",\"x-path\":\"%s\"}' \"$domain\" \"$principal\" \"$path\";;\n\
+               names) printf '{\"names\":[\"x-domain\",\"x-principal\",\"x-path\"]}';;\n\
+             esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let p = ExecProvider::new(&script, vec![]);
+        let h = p.headers("api.test", Some("alice"), Some("/v1/x")).await;
+        assert_eq!(h.get("x-domain").map(String::as_str), Some("api.test"));
+        assert_eq!(h.get("x-principal").map(String::as_str), Some("alice"));
+        assert_eq!(h.get("x-path").map(String::as_str), Some("/v1/x"));
+        let h = p.headers("api.test", None, None).await;
+        assert_eq!(h.get("x-principal").map(String::as_str), Some("-"));
+        let mut n = p.names("api.test", None, None).await;
+        n.sort();
+        assert_eq!(n, vec!["x-domain", "x-path", "x-principal"]);
+
+        // A program that fails answers as nothing configured.
+        let broken = ExecProvider::new("/bin/false", vec![]);
+        assert!(broken.headers("api.test", None, None).await.is_empty());
+        assert!(broken.names("api.test", None, None).await.is_empty());
+
+        // The handler routes names_only to `names`, and chains merge.
+        let chain = ChainProvider(vec![
+            Arc::new(TomlSecretProvider::from_toml(TOML).unwrap()),
+            Arc::new(ExecProvider::new(&script, vec![])),
+        ]);
+        let body = serde_json::to_vec(
+            &HeadersRequest::new("api.anthropic.com", Some("default")).names_only(),
+        )
+        .unwrap();
+        let resp: HeadersResponse = serde_json::from_slice(&handle(&chain, &body).await).unwrap();
+        assert!(resp.headers.is_empty());
+        assert!(resp.names.contains(&"x-api-key".to_string()));
+        assert!(resp.names.contains(&"x-domain".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

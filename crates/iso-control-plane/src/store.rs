@@ -109,6 +109,8 @@ impl Store {
                 tap           TEXT,
                 principal     TEXT,
                 allow         TEXT NOT NULL DEFAULT '[]',
+                rules         TEXT NOT NULL DEFAULT '[]',
+                policy_gen    INTEGER NOT NULL DEFAULT 1,
                 created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
             -- Ingress forwards, normalized: one row per forward (the desired
@@ -130,6 +132,8 @@ impl Store {
         // Migrate pre-policy databases (idempotent; errors = column exists).
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN principal TEXT", []);
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN allow TEXT NOT NULL DEFAULT '[]'", []);
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN rules TEXT NOT NULL DEFAULT '[]'", []);
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN policy_gen INTEGER NOT NULL DEFAULT 1", []);
         // A VM's own snapshot, written by suspend. Nullable: most VMs never
         // have one, and a VM loses it when it is destroyed.
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN snapshot_mem TEXT", []);
@@ -225,8 +229,8 @@ impl Store {
         self.lock().execute(
             "INSERT INTO vms
                 (id, slot, template, egress, labels, lifecycle, restart,
-                 vcpus, mem_mib, state, rootfs_device, tap, principal, allow)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                 vcpus, mem_mib, state, rootfs_device, tap, principal, allow, rules, policy_gen)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             rusqlite::params![
                 v.id.to_string(),
                 v.slot.map(|s| s.get()),
@@ -242,6 +246,8 @@ impl Store {
                 v.tap,
                 v.principal,
                 serde_json::to_string(&v.allow)?,
+                serde_json::to_string(&v.rules)?,
+                v.policy_gen,
             ],
         )?;
         Ok(())
@@ -268,25 +274,34 @@ impl Store {
         Ok(())
     }
 
-    /// Update only the *policy* columns (egress + the proxy's principal/allow).
-    /// Disjoint from placement and forwards (see [`Self::update_placement`]).
+    /// Update only the *policy* columns (egress + the proxy's principal, allow
+    /// and rules), and bump the policy generation. Disjoint from placement and
+    /// forwards (see [`Self::update_placement`]). Returns the new generation.
     pub fn update_policy(
         &self,
         id: VmId,
         principal: Option<&str>,
         allow: &[String],
+        rules: &[String],
         egress: EgressMode,
-    ) -> Result<()> {
-        self.lock().execute(
-            "UPDATE vms SET egress=?2, principal=?3, allow=?4 WHERE id=?1",
+    ) -> Result<u64> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE vms SET egress=?2, principal=?3, allow=?4, rules=?5, policy_gen=policy_gen+1 WHERE id=?1",
             rusqlite::params![
                 id.to_string(),
                 egress_str(egress),
                 principal,
                 serde_json::to_string(allow)?,
+                serde_json::to_string(rules)?,
             ],
         )?;
-        Ok(())
+        let new_gen: u64 = conn.query_row(
+            "SELECT policy_gen FROM vms WHERE id=?1",
+            rusqlite::params![id.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(new_gen)
     }
 
     // ---- forwards (normalized desired state) ----
@@ -367,8 +382,8 @@ impl Store {
     }
 }
 
-const VM_SELECT: &str = "SELECT id, slot, template, egress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow, snapshot_mem, snapshot_vmstate FROM vms WHERE id=?1";
-const VM_SELECT_ALL: &str = "SELECT id, slot, template, egress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow, snapshot_mem, snapshot_vmstate FROM vms";
+const VM_SELECT: &str = "SELECT id, slot, template, egress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow, snapshot_mem, snapshot_vmstate, rules, policy_gen FROM vms WHERE id=?1";
+const VM_SELECT_ALL: &str = "SELECT id, slot, template, egress, labels, lifecycle, restart, vcpus, mem_mib, state, rootfs_device, tap, principal, allow, snapshot_mem, snapshot_vmstate, rules, policy_gen FROM vms";
 
 fn template_from_row(r: &rusqlite::Row<'_>) -> Result<TemplateDef> {
     let mem: Option<String> = r.get(2)?;
@@ -410,6 +425,8 @@ fn vm_from_row(r: &rusqlite::Row<'_>) -> Result<VmRecord> {
     let allow: Vec<String> = serde_json::from_str(&r.get::<_, String>(13)?)?;
     let snap_mem: Option<String> = r.get(14)?;
     let snap_vmstate: Option<String> = r.get(15)?;
+    let rules: Vec<String> = serde_json::from_str(&r.get::<_, String>(16)?)?;
+    let policy_gen: u64 = r.get(17)?;
     // Both or neither: half a snapshot is not resumable.
     let snapshot = match (snap_mem, snap_vmstate) {
         (Some(m), Some(v)) => Some(SnapshotRef { mem_file: PathBuf::from(m), vmstate: PathBuf::from(v) }),
@@ -432,6 +449,8 @@ fn vm_from_row(r: &rusqlite::Row<'_>) -> Result<VmRecord> {
         tap,
         principal,
         allow,
+        rules,
+        policy_gen,
         snapshot,
     })
 }

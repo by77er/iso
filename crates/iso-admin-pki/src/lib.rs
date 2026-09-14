@@ -104,7 +104,7 @@ impl AdminPki {
             Err(_) => true,
         };
         if stale || !server_key.exists() {
-            let id = pki.issue("iso-controld", server_sans, ExtendedKeyUsagePurpose::ServerAuth)?;
+            let id = pki.issue("iso-controld", server_sans, &[ExtendedKeyUsagePurpose::ServerAuth])?;
             write_private(&server_key, id.key_pem.as_bytes())?;
             std::fs::write(&server_crt, id.cert_pem)?;
         }
@@ -135,25 +135,115 @@ impl AdminPki {
     /// Mint a client certificate whose common name is `name`. The key never
     /// touches disk here; the caller decides where it goes.
     pub fn issue_client(&self, name: &str) -> Result<Identity> {
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@')) {
-            return Err(Error::Name(name.into(), "use letters, digits, '-', '_', '.', '@'".into()));
-        }
-        self.issue(name, &[], ExtendedKeyUsagePurpose::ClientAuth)
+        check_name(name)?;
+        self.issue(name, &[], &[ExtendedKeyUsagePurpose::ClientAuth])
     }
 
-    fn issue(&self, cn: &str, sans: &[String], eku: ExtendedKeyUsagePurpose) -> Result<Identity> {
+    /// Mint a service identity: a certificate good as a TLS **server** for
+    /// `sans` and as a TLS **client** to the other services. One identity per
+    /// process is enough: a proxy replica presents it to edges and to the CA
+    /// and secrets services alike.
+    pub fn issue_server(&self, name: &str, sans: &[String]) -> Result<Identity> {
+        check_name(name)?;
+        self.issue(
+            name,
+            sans,
+            &[ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth],
+        )
+    }
+
+    fn issue(&self, cn: &str, sans: &[String], eku: &[ExtendedKeyUsagePurpose]) -> Result<Identity> {
         let key = KeyPair::generate()?;
         let mut params = CertificateParams::new(Vec::<String>::new())?;
         params.distinguished_name.push(DnType::CommonName, cn);
         params.is_ca = IsCa::NoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyEncipherment];
-        params.extended_key_usages = vec![eku];
+        params.extended_key_usages = eku.to_vec();
         params.subject_alt_names = sans.iter().map(|s| san(s)).collect::<Result<Vec<_>>>()?;
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::hours(1);
         params.not_after = now + time::Duration::days(LEAF_DAYS);
         let cert = params.signed_by(&key, &self.ca_cert, &self.ca_key)?;
         Ok(Identity { cert_pem: cert.pem(), key_pem: key.serialize_pem() })
+    }
+}
+
+fn check_name(name: &str) -> Result<()> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@')) {
+        return Err(Error::Name(name.into(), "use letters, digits, '-', '_', '.', '@'".into()));
+    }
+    Ok(())
+}
+
+/// The CA to trust plus the identity to present: what a service loads from
+/// disk to talk mutual TLS with the others. Written by `isoctl admin
+/// issue-server --out DIR` as `ca.crt`, `<name>.crt` and `<name>.key`.
+#[derive(Clone, Debug)]
+pub struct Creds {
+    pub ca_pem: String,
+    pub identity: Identity,
+}
+
+impl Creds {
+    pub fn from_dir(dir: &Path, name: &str) -> Result<Self> {
+        Ok(Self {
+            ca_pem: std::fs::read_to_string(dir.join("ca.crt"))?,
+            identity: Identity {
+                cert_pem: std::fs::read_to_string(dir.join(format!("{name}.crt")))?,
+                key_pem: std::fs::read_to_string(dir.join(format!("{name}.key")))?,
+            },
+        })
+    }
+
+    /// From three files.
+    pub fn from_files(ca: &Path, cert: &Path, key: &Path) -> Result<Self> {
+        Ok(Self {
+            ca_pem: std::fs::read_to_string(ca)?,
+            identity: Identity {
+                cert_pem: std::fs::read_to_string(cert)?,
+                key_pem: std::fs::read_to_string(key)?,
+            },
+        })
+    }
+
+    /// From `ISO_TLS_CA`, `ISO_TLS_CERT`, `ISO_TLS_KEY` (file paths). `None`
+    /// when none of the three is set; an error when only some are.
+    pub fn from_env() -> Result<Option<Self>> {
+        let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        match (get("ISO_TLS_CA"), get("ISO_TLS_CERT"), get("ISO_TLS_KEY")) {
+            (None, None, None) => Ok(None),
+            (Some(ca), Some(cert), Some(key)) => {
+                Self::from_files(Path::new(&ca), Path::new(&cert), Path::new(&key)).map(Some)
+            }
+            _ => Err(Error::Pem("set all of ISO_TLS_CA, ISO_TLS_CERT and ISO_TLS_KEY, or none".into())),
+        }
+    }
+
+    /// A rustls server config that presents this identity and requires a
+    /// client certificate from the CA.
+    pub fn server_config(&self) -> Result<std::sync::Arc<rustls::ServerConfig>> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(pem_to_der(&self.ca_pem)?)).map_err(|e| Error::Pem(e.to_string()))?;
+        let verifier = rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots))
+            .build()
+            .map_err(|e| Error::Pem(e.to_string()))?;
+        let cfg = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![self.identity.cert_der()?], self.identity.key_der()?)
+            .map_err(|e| Error::Pem(e.to_string()))?;
+        Ok(std::sync::Arc::new(cfg))
+    }
+
+    /// A rustls client config that trusts only the CA and presents this
+    /// identity.
+    pub fn client_config(&self) -> Result<std::sync::Arc<rustls::ClientConfig>> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(pem_to_der(&self.ca_pem)?)).map_err(|e| Error::Pem(e.to_string()))?;
+        let cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(vec![self.identity.cert_der()?], self.identity.key_der()?)
+            .map_err(|e| Error::Pem(e.to_string()))?;
+        Ok(std::sync::Arc::new(cfg))
     }
 }
 

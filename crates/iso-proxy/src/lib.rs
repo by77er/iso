@@ -1,14 +1,34 @@
 //! iso-proxy — credential-injecting, policy-enforcing transparent MITM HTTPS
 //! proxy. The backend for the `Proxy` egress mode. See `DESIGN.md`.
+//!
+//! One binary, three roles:
+//!
+//! - **single**: today's deployment. Accept the connections nftables steers
+//!   to the services address, name each one through the host's identify RPC,
+//!   and serve it here. The CA and secrets services are Unix sockets.
+//! - **edge**: the half that stays on a host. Name the connection, then carry
+//!   it to a proxy replica over mutual TLS with the policy in a PROXY
+//!   protocol v2 header. Nothing is terminated here.
+//! - **proxy**: a stateless replica anywhere. Accept mutual TLS from edges,
+//!   read the header, and serve the connection with the policy it carries.
+//!   The CA and secrets services are reached over HTTPS with mutual TLS.
+//!
+//! Serving a connection is the same in `single` and `proxy`: peek the
+//! ClientHello for the SNI, refuse it unless some allow rule names that host,
+//! mint a leaf, terminate, and per request check the authority, evaluate the
+//! URI rules, inject credentials, and forward or tunnel.
 
-mod policy;
-mod rpc;
+pub mod ca;
+pub mod edge;
+pub mod policy;
+pub mod proxyproto;
+pub mod ws;
 
-pub use policy::{Policy, PolicyResolver, RpcResolver, StaticResolver};
+pub use policy::{Policy, PolicyResolver, RpcResolver, StaticResolver, WirePolicy};
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::HOST;
@@ -20,45 +40,243 @@ use hyper::{Request, Response};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::dns::{GaiResolver, Name};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use iso_policy::{Decision, Scheme};
+use rustls_pki_types::CertificateDer;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::LazyConfigAcceptor;
 
-use rpc::CaClient;
+use ca::CaClient;
+use edge::Registry;
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-type Resp = Response<BoxBody<Bytes, BoxError>>;
-type UpstreamClient = Client<HttpsConnector<HttpConnector>, Incoming>;
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub type Resp = Response<BoxBody<Bytes, BoxError>>;
+pub type UpstreamClient = Client<HttpsConnector<HttpConnector<PinResolver>>, Incoming>;
 
-/// Proxy configuration.
-pub struct ProxyConfig {
-    /// Addresses to accept redirected egress on: the nft Proxy-mode DNAT target
-    /// (`:3128`) and the DNS-redirect target for Allow mode (`:443`).
-    pub listen: Vec<SocketAddr>,
-    pub ca_sock: PathBuf,
-    pub secrets_sock: PathBuf,
-    /// Resolves a connection's source IP to its VM's egress policy.
-    pub resolver: Arc<dyn PolicyResolver>,
+/// DNS for upstreams: pinned hosts answer from the table, everything else
+/// goes to the system resolver. A pinned address keeps its port when the
+/// request names none, which is how a test upstream on an ephemeral port is
+/// reached as `https://host/`.
+#[derive(Clone)]
+pub struct PinResolver {
+    pins: Arc<std::collections::HashMap<String, SocketAddr>>,
+    gai: GaiResolver,
 }
 
-/// Shared, cheap-to-clone request context.
+impl tower_service::Service<Name> for PinResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = BoxError;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        tower_service::Service::poll_ready(&mut self.gai, cx).map_err(|e| Box::new(e) as BoxError)
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        if let Some(addr) = self.pins.get(name.as_str()).copied() {
+            return Box::pin(async move { Ok(vec![addr].into_iter()) });
+        }
+        let fut = tower_service::Service::call(&mut self.gai, name);
+        Box::pin(async move {
+            let addrs = fut.await.map_err(|e| Box::new(e) as BoxError)?;
+            Ok(addrs.collect::<Vec<_>>().into_iter())
+        })
+    }
+}
+
+/// Which half of the proxy this process is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Single,
+    Edge,
+    Proxy,
+}
+
+impl std::str::FromStr for Role {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "single" => Ok(Role::Single),
+            "edge" => Ok(Role::Edge),
+            "proxy" => Ok(Role::Proxy),
+            other => Err(format!("unknown role {other:?} (single | edge | proxy)")),
+        }
+    }
+}
+
+/// Proxy configuration. Which fields matter depends on `role`; the
+/// constructors below fill in the right ones.
+pub struct ProxyConfig {
+    pub role: Role,
+    /// Addresses to accept on: the nft Proxy-mode DNAT target and the
+    /// DNS-steer target for Allow mode (`single`, `edge`), or the address
+    /// edges dial (`proxy`).
+    pub listen: Vec<SocketAddr>,
+    /// This host's name in the PROXY header (`edge`) and in logs.
+    pub host_id: String,
+    /// Resolves a connection's source IP to its VM's policy (`single`, `edge`).
+    pub resolver: Option<Arc<dyn PolicyResolver>>,
+    /// How often the edge re-reads the policy of VMs with live connections.
+    pub watch_every: Duration,
+    /// The CA and secrets services (`single`, `proxy`).
+    pub ca: Option<iso_rpc::Endpoint>,
+    pub secrets: Option<iso_rpc::Endpoint>,
+    /// The tier to carry connections to (`edge`).
+    pub tier: Vec<SocketAddr>,
+    pub tier_server_name: Option<String>,
+    pub tier_tls: Option<Arc<rustls::ClientConfig>>,
+    /// Mutual TLS the replica requires from edges (`proxy`).
+    pub accept_tls: Option<Arc<rustls::ServerConfig>>,
+    /// Roots trusted for upstreams on top of the public webpki set: a private
+    /// CA in front of an internal API, or a test upstream.
+    pub extra_upstream_roots: Vec<CertificateDer<'static>>,
+    /// Upstream hosts dialled at a fixed address instead of what DNS says,
+    /// like `curl --resolve`: an internal API on a private address, or a
+    /// test upstream on an ephemeral port. The TLS name and the certificate
+    /// check are still the host's.
+    pub upstream_pins: std::collections::HashMap<String, SocketAddr>,
+    pub handshake_timeout: Duration,
+}
+
+impl ProxyConfig {
+    fn base(role: Role, listen: Vec<SocketAddr>) -> Self {
+        Self {
+            role,
+            listen,
+            host_id: hostname(),
+            resolver: None,
+            watch_every: Duration::from_secs(1),
+            ca: None,
+            secrets: None,
+            tier: Vec::new(),
+            tier_server_name: None,
+            tier_tls: None,
+            accept_tls: None,
+            extra_upstream_roots: Vec::new(),
+            upstream_pins: std::collections::HashMap::new(),
+            handshake_timeout: Duration::from_secs(10),
+        }
+    }
+
+    /// Today's deployment: everything in one process on the host.
+    pub fn single(
+        listen: Vec<SocketAddr>,
+        resolver: Arc<dyn PolicyResolver>,
+        ca: iso_rpc::Endpoint,
+        secrets: iso_rpc::Endpoint,
+    ) -> Self {
+        Self {
+            resolver: Some(resolver),
+            ca: Some(ca),
+            secrets: Some(secrets),
+            ..Self::base(Role::Single, listen)
+        }
+    }
+
+    /// The on-host half of the split.
+    pub fn edge(
+        listen: Vec<SocketAddr>,
+        resolver: Arc<dyn PolicyResolver>,
+        tier: Vec<SocketAddr>,
+        tier_tls: Arc<rustls::ClientConfig>,
+    ) -> Self {
+        Self {
+            resolver: Some(resolver),
+            tier,
+            tier_tls: Some(tier_tls),
+            ..Self::base(Role::Edge, listen)
+        }
+    }
+
+    /// A replica of the tier.
+    pub fn proxy(
+        listen: Vec<SocketAddr>,
+        accept_tls: Arc<rustls::ServerConfig>,
+        ca: iso_rpc::Endpoint,
+        secrets: iso_rpc::Endpoint,
+    ) -> Self {
+        Self {
+            accept_tls: Some(accept_tls),
+            ca: Some(ca),
+            secrets: Some(secrets),
+            ..Self::base(Role::Proxy, listen)
+        }
+    }
+}
+
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "iso".to_string())
+}
+
+/// Registers a task spawned on behalf of a connection (a WebSocket tunnel)
+/// with whatever owns that connection's lifetime, so a policy change ends it
+/// too. `None` where nothing local owns lifetime: on a tier replica, the
+/// edge's TCP close does it.
+pub type OnTask = Arc<dyn Fn(tokio::task::AbortHandle) -> edge::Registration + Send + Sync>;
+
+/// Shared, cheap-to-clone context for serving connections.
 #[derive(Clone)]
 struct Ctx {
     ca: Arc<CaClient>,
     secrets: Arc<iso_secrets::Client>,
+    /// Upstream client that negotiates h2 or http/1.1.
     client: UpstreamClient,
-    resolver: Arc<dyn PolicyResolver>,
+    /// Upstream client pinned to http/1.1, for upgrades.
+    client_h1: UpstreamClient,
+    handshake_timeout: Duration,
 }
 
-/// Run the proxy, binding every address in `cfg.listen`.
+/// Everything a running proxy holds, for whichever role.
+struct Runtime {
+    cfg: Arc<ProxyConfig>,
+    ctx: Option<Ctx>,
+    registry: Arc<Registry>,
+    tier: Option<Arc<edge::Tier>>,
+}
+
+/// Run the proxy, binding every address in `cfg.listen`. Never returns
+/// unless a listener fails.
 pub async fn run(cfg: ProxyConfig) -> std::io::Result<()> {
-    let ctx = build_ctx(&cfg.ca_sock, &cfg.secrets_sock, cfg.resolver.clone())?;
+    let mut listeners = Vec::new();
+    for addr in &cfg.listen {
+        let l = TcpListener::bind(addr).await?;
+        tracing::info!("iso-proxy ({:?}) listening on {addr}", cfg.role);
+        listeners.push(l);
+    }
+    run_with_listeners(listeners, cfg).await
+}
+
+/// Run on already-bound listeners (tests bind `:0`).
+pub async fn run_with_listeners(
+    listeners: Vec<TcpListener>,
+    cfg: ProxyConfig,
+) -> std::io::Result<()> {
+    let rt = Arc::new(build_runtime(cfg)?);
+    if let (Some(resolver), true) = (
+        &rt.cfg.resolver,
+        matches!(rt.cfg.role, Role::Single | Role::Edge),
+    ) {
+        tokio::spawn(edge::watch(
+            rt.registry.clone(),
+            resolver.clone(),
+            rt.cfg.watch_every,
+        ));
+    }
     let mut handles = Vec::new();
-    for addr in cfg.listen {
-        let listener = TcpListener::bind(addr).await?;
-        tracing::info!("iso-proxy listening on {addr}");
-        let ctx = ctx.clone();
-        handles.push(tokio::spawn(accept_loop(listener, ctx)));
+    for listener in listeners {
+        let rt = rt.clone();
+        handles.push(tokio::spawn(accept_loop(listener, rt)));
     }
     for h in handles {
         let _ = h.await;
@@ -66,54 +284,233 @@ pub async fn run(cfg: ProxyConfig) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Run the proxy on an already-bound listener (used by tests that need `:0`).
-pub async fn run_with_listener(listener: TcpListener, cfg: ProxyConfig) -> std::io::Result<()> {
-    let ctx = build_ctx(&cfg.ca_sock, &cfg.secrets_sock, cfg.resolver)?;
-    accept_loop(listener, ctx).await
-}
-
-fn build_ctx(
-    ca_sock: &std::path::Path,
-    secrets_sock: &std::path::Path,
-    resolver: Arc<dyn PolicyResolver>,
-) -> std::io::Result<Ctx> {
-    let ca = Arc::new(
-        CaClient::new(ca_sock.to_path_buf()).map_err(|e| std::io::Error::other(e.to_string()))?,
-    );
-    let secrets = Arc::new(iso_secrets::Client::new(secrets_sock));
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-    let client: UpstreamClient = Client::builder(TokioExecutor::new()).build(https);
-    Ok(Ctx {
-        ca,
-        secrets,
-        client,
-        resolver,
+fn build_runtime(cfg: ProxyConfig) -> std::io::Result<Runtime> {
+    let invalid = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, m.to_string());
+    let ctx = match cfg.role {
+        Role::Single | Role::Proxy => {
+            let ca = cfg
+                .ca
+                .clone()
+                .ok_or_else(|| invalid("this role needs a CA endpoint"))?;
+            let secrets = cfg
+                .secrets
+                .clone()
+                .ok_or_else(|| invalid("this role needs a secrets endpoint"))?;
+            let (client, client_h1) =
+                upstream_clients(&cfg.extra_upstream_roots, &cfg.upstream_pins);
+            Some(Ctx {
+                ca: Arc::new(CaClient::new(ca).map_err(|e| std::io::Error::other(e.to_string()))?),
+                secrets: Arc::new(iso_secrets::Client::from_endpoint(secrets)),
+                client,
+                client_h1,
+                handshake_timeout: cfg.handshake_timeout,
+            })
+        }
+        Role::Edge => None,
+    };
+    if matches!(cfg.role, Role::Single | Role::Edge) && cfg.resolver.is_none() {
+        return Err(invalid("this role needs a policy resolver"));
+    }
+    let tier = match cfg.role {
+        Role::Edge => Some(Arc::new(edge::Tier::new(
+            cfg.tier.clone(),
+            cfg.tier_server_name.clone(),
+            cfg.tier_tls
+                .clone()
+                .ok_or_else(|| invalid("edge needs a TLS client config for the tier"))?,
+            cfg.host_id.clone(),
+        )?)),
+        _ => None,
+    };
+    if cfg.role == Role::Proxy && cfg.accept_tls.is_none() {
+        return Err(invalid("proxy needs a TLS server config to accept edges"));
+    }
+    Ok(Runtime {
+        cfg: Arc::new(cfg),
+        ctx,
+        registry: Registry::new(),
+        tier,
     })
 }
 
-async fn accept_loop(listener: TcpListener, ctx: Ctx) -> std::io::Result<()> {
+/// Two upstream clients over one root store: one that negotiates h2 or
+/// http/1.1, one pinned to http/1.1 for upgrades. Both are https-only, so no
+/// code path can ever originate plaintext.
+fn upstream_clients(
+    extra_roots: &[CertificateDer<'static>],
+    pins: &std::collections::HashMap<String, SocketAddr>,
+) -> (UpstreamClient, UpstreamClient) {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for r in extra_roots {
+        let _ = roots.add(r.clone());
+    }
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let resolver = PinResolver {
+        pins: Arc::new(pins.clone()),
+        gai: GaiResolver::new(),
+    };
+    let mut http = HttpConnector::new_with_resolver(resolver);
+    http.enforce_http(false);
+    let both = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls.clone())
+        .https_only()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http.clone());
+    let h1 = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_only()
+        .enable_http1()
+        .wrap_connector(http);
+    (
+        Client::builder(TokioExecutor::new()).build(both),
+        Client::builder(TokioExecutor::new()).build(h1),
+    )
+}
+
+async fn accept_loop(listener: TcpListener, rt: Arc<Runtime>) -> std::io::Result<()> {
     loop {
-        let (tcp, peer) = listener.accept().await?;
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = serve_conn(tcp, peer.ip(), ctx).await {
-                tracing::debug!("conn {peer} ended: {e}");
+        let (tcp, peer) = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("accept: {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
             }
-        });
+        };
+        let local = tcp.local_addr().unwrap_or(peer);
+        let rt = rt.clone();
+        match rt.cfg.role {
+            Role::Single => tokio::spawn(single_conn(tcp, peer, rt)),
+            Role::Edge => tokio::spawn(edge_conn(tcp, peer, local, rt)),
+            Role::Proxy => tokio::spawn(proxy_conn(tcp, peer, rt)),
+        };
     }
 }
 
-async fn serve_conn(tcp: TcpStream, peer: IpAddr, ctx: Ctx) -> Result<(), BoxError> {
+/// `single`: name the connection, register it, serve it here.
+async fn single_conn(tcp: TcpStream, peer: SocketAddr, rt: Arc<Runtime>) {
+    let resolver = rt.cfg.resolver.as_ref().expect("single has a resolver");
+    let policy = match edge::admit(&**resolver, peer.ip()).await {
+        Ok(p) => p,
+        Err(why) => {
+            tracing::info!("refuse {peer}: {why:?}");
+            return;
+        }
+    };
+    let ctx = rt.ctx.clone().expect("single has a ctx");
+    let registry = rt.registry.clone();
+    let policy_for_reg = policy.clone();
+    // Anything the connection spawns (a tunnel) is registered beside it.
+    let on_task: OnTask = {
+        let registry = registry.clone();
+        let policy = policy.clone();
+        let ip = peer.ip();
+        Arc::new(move |h| registry.register(ip, &policy, h))
+    };
+    let task = tokio::spawn(async move {
+        if let Err(e) = serve_conn(tcp, peer.ip(), policy, ctx, Some(on_task)).await {
+            tracing::debug!("conn {peer} ended: {e}");
+        }
+    });
+    // Registering after spawn is fine: the handle aborts a task at any point.
+    let _reg = registry.register(peer.ip(), &policy_for_reg, task.abort_handle());
+    let _ = task.await;
+}
+
+/// `edge`: name the connection, carry it to a replica, register it.
+async fn edge_conn(tcp: TcpStream, peer: SocketAddr, local: SocketAddr, rt: Arc<Runtime>) {
+    let resolver = rt.cfg.resolver.as_ref().expect("edge has a resolver");
+    let policy = match edge::admit(&**resolver, peer.ip()).await {
+        Ok(p) => p,
+        Err(why) => {
+            tracing::info!("refuse {peer}: {why:?}");
+            return;
+        }
+    };
+    let tier = rt.tier.clone().expect("edge has a tier");
+    let registry = rt.registry.clone();
+    let policy_for_reg = policy.clone();
+    let task = tokio::spawn(async move {
+        let mut upstream = match tier.open(peer, local, &policy).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("edge: tier unreachable for {peer}: {e}");
+                return;
+            }
+        };
+        let mut tcp = tcp;
+        match tokio::io::copy_bidirectional(&mut tcp, &mut upstream).await {
+            Ok((a, b)) => tracing::debug!("edge: {peer} done, {a} up {b} down"),
+            Err(e) => tracing::debug!("edge: {peer} ended: {e}"),
+        }
+    });
+    let _reg = registry.register(peer.ip(), &policy_for_reg, task.abort_handle());
+    let _ = task.await;
+}
+
+/// `proxy`: mTLS from an edge, then the header, then the guest's TLS.
+async fn proxy_conn(tcp: TcpStream, peer: SocketAddr, rt: Arc<Runtime>) {
+    let acceptor =
+        tokio_rustls::TlsAcceptor::from(rt.cfg.accept_tls.clone().expect("proxy has accept tls"));
+    let mut tls = match tokio::time::timeout(rt.cfg.handshake_timeout, acceptor.accept(tcp)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::info!("proxy: edge {peer} failed mTLS: {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::info!("proxy: edge {peer} handshake timed out");
+            return;
+        }
+    };
+    let decoded =
+        match tokio::time::timeout(rt.cfg.handshake_timeout, proxyproto::read(&mut tls)).await {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => {
+                tracing::info!("proxy: edge {peer} sent no usable header: {e}");
+                return;
+            }
+            Err(_) => return,
+        };
+    let src = decoded.src.map(|s| s.ip()).unwrap_or(peer.ip());
+    let policy = match decoded.policy.into_policy() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("proxy: edge {peer} sent an unparsable policy: {e}");
+            return;
+        }
+    };
+    if policy.is_deny_mode() {
+        tracing::info!("proxy: refusing deny-mode connection from {src} via {peer}");
+        return;
+    }
+    let ctx = rt.ctx.clone().expect("proxy has a ctx");
+    if let Err(e) = serve_conn(tls, src, policy, ctx, None).await {
+        tracing::debug!("conn {src} via {peer} ended: {e}");
+    }
+}
+
+/// Serve one guest connection: SNI gate, mint, terminate, then requests.
+async fn serve_conn<S>(
+    stream: S,
+    peer: IpAddr,
+    policy: Policy,
+    ctx: Ctx,
+    on_task: Option<OnTask>,
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // Peek the ClientHello: non-TLS never produces one → dropped here.
-    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp);
-    let handshake = match acceptor.await {
-        Ok(h) => h,
-        Err(_) => return Ok(()), // not TLS
+    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
+    let handshake = match tokio::time::timeout(ctx.handshake_timeout, acceptor).await {
+        Ok(Ok(h)) => h,
+        Ok(Err(_)) => return Ok(()), // not TLS
+        Err(_) => return Ok(()),     // never sent a ClientHello
     };
 
     let sni = match handshake.client_hello().server_name() {
@@ -121,19 +518,12 @@ async fn serve_conn(tcp: TcpStream, peer: IpAddr, ctx: Ctx) -> Result<(), BoxErr
         None => return Ok(()), // no SNI → unroutable
     };
 
-    // Resolve this VM's current policy by source IP; default-deny.
-    let policy = match ctx.resolver.resolve(peer).await {
-        Some(p) => p,
-        None => {
-            tracing::info!("deny {sni}: unknown source {peer}");
-            return Ok(());
-        }
-    };
-    if !policy.allow.contains(&sni) {
-        tracing::info!("deny {sni} for {peer} (not in allow-list)");
+    // Host phase: is there any allow rule this host could satisfy? A host
+    // with no allow rule is never terminated and never gets a certificate.
+    if !policy.rules.host_allowed(&sni) {
+        tracing::info!("deny {sni} for {peer} (no allow rule names it)");
         return Ok(());
     }
-    let principal = policy.principal.clone();
 
     // Mint (fail-closed) and terminate.
     let server_cfg = match ctx.ca.server_config(&sni).await {
@@ -143,36 +533,45 @@ async fn serve_conn(tcp: TcpStream, peer: IpAddr, ctx: Ctx) -> Result<(), BoxErr
             return Ok(());
         }
     };
-    let tls = handshake.into_stream(server_cfg).await?;
+    let tls = match tokio::time::timeout(ctx.handshake_timeout, handshake.into_stream(server_cfg))
+        .await
+    {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Ok(()),
+    };
 
-    let sni2 = sni.clone();
-    let ctx2 = ctx.clone();
+    let sni = Arc::new(sni);
+    let policy = Arc::new(policy);
     let service = service_fn(move |req| {
-        handle(req, sni2.clone(), principal.clone(), ctx2.clone())
+        handle(
+            req,
+            sni.clone(),
+            policy.clone(),
+            ctx.clone(),
+            on_task.clone(),
+        )
     });
 
     hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-        .serve_connection(TokioIo::new(tls), service)
+        .serve_connection_with_upgrades(TokioIo::new(tls), service)
         .await
 }
 
 async fn handle(
     req: Request<Incoming>,
-    sni: String,
-    principal: Option<String>,
+    sni: Arc<String>,
+    policy: Arc<Policy>,
     ctx: Ctx,
+    on_task: Option<OnTask>,
 ) -> Result<Resp, BoxError> {
     // Anti-fronting: the request authority must equal the SNI we terminated.
-    let authority = req
-        .uri()
-        .host()
-        .map(str::to_string)
-        .or_else(|| {
-            req.headers()
-                .get(HOST)
-                .and_then(|h| h.to_str().ok())
-                .map(|h| h.split(':').next().unwrap_or(h).to_string())
-        });
+    let authority = req.uri().host().map(str::to_string).or_else(|| {
+        req.headers()
+            .get(HOST)
+            .and_then(|h| h.to_str().ok())
+            .map(|h| h.split(':').next().unwrap_or(h).to_string())
+    });
     if authority.as_deref() != Some(sni.as_str()) {
         tracing::warn!("authority {authority:?} != sni {sni}");
         return Ok(simple(421, "authority does not match TLS SNI"));
@@ -189,6 +588,20 @@ async fn handle(
         Err(_) => return Ok(simple(400, "bad request target")),
     };
 
+    // URI phase, before anything is injected: a denied path never carries a
+    // credential. An upgrade request is judged under `wss`.
+    let upgrade = ws::is_websocket_upgrade(req.headers());
+    let scheme = if upgrade { Scheme::Wss } else { Scheme::Https };
+    let path = uri.path().to_string();
+    if let Decision::Deny(rule) = policy.rules.evaluate(scheme, &sni, None, &path) {
+        tracing::info!(
+            "deny {} {}://{sni}{path} (rule {rule:?})",
+            req.method(),
+            scheme.as_str()
+        );
+        return Ok(denied(&sni, scheme, &path, rule.as_deref()));
+    }
+
     let (mut parts, body) = req.into_parts();
     parts.uri = uri;
     parts.headers.remove(HOST); // re-derived from the authority by the client
@@ -196,10 +609,9 @@ async fn handle(
     // The provider sees the path (never the query string) so it can apply
     // path-scoped rules — a credential that must not reach a vendor's OAuth
     // routes, say — instead of deciding host-wide.
-    let path = parts.uri.path().to_string();
     for (k, v) in ctx
         .secrets
-        .headers(&sni, principal.as_deref(), Some(&path))
+        .headers(&sni, policy.principal.as_deref(), Some(&path))
         .await
     {
         if let (Ok(name), Ok(val)) = (
@@ -211,6 +623,12 @@ async fn handle(
     }
 
     let upstream = Request::from_parts(parts, body);
+    if upgrade {
+        return match ws::proxy_upgrade(upstream, &ctx.client_h1, on_task).await {
+            Ok(resp) => Ok(resp),
+            Err(e) => Ok(simple(502, &format!("upstream error: {e}"))),
+        };
+    }
     match ctx.client.request(upstream).await {
         Ok(resp) => Ok(resp.map(|b| b.map_err(|e| Box::new(e) as BoxError).boxed())),
         Err(e) => Ok(simple(502, &format!("upstream error: {e}"))),
@@ -222,6 +640,26 @@ fn simple(status: u16, msg: &str) -> Resp {
         .status(status)
         .body(
             Full::new(Bytes::from(msg.to_string()))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
+/// The URI phase's answer to the guest: a 403 that says which rule, so an
+/// agent can tell a policy decision from a broken network.
+fn denied(host: &str, scheme: Scheme, path: &str, rule: Option<&str>) -> Resp {
+    let body = serde_json::json!({
+        "error": "denied by policy",
+        "request": format!("{}://{host}{path}", scheme.as_str()),
+        "rule": rule,
+    });
+    Response::builder()
+        .status(403)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header("x-iso-denied", "policy")
+        .body(
+            Full::new(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
                 .map_err(|never| match never {})
                 .boxed(),
         )

@@ -59,6 +59,19 @@ enum AdminCmd {
         #[arg(long, default_value = ".")]
         out: PathBuf,
     },
+    /// Mint a service identity (server + client auth) signed by the admin CA,
+    /// for a proxy edge, a proxy replica, the CA service or the secrets
+    /// service. Writes `<name>.crt`, `<name>.key` and `ca.crt` into `--out`.
+    IssueServer {
+        /// Common name, e.g. `proxy-1` or `edge-hostA`.
+        #[arg(long)]
+        name: String,
+        /// DNS names or IPs the certificate is valid for as a server (repeatable).
+        #[arg(long = "san")]
+        sans: Vec<String>,
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
+    },
     /// Print the admin CA certificate (PEM).
     Ca,
 }
@@ -268,6 +281,34 @@ fn admin(a: Admin) -> R<()> {
     match a.cmd {
         AdminCmd::Ca => {
             print!("{}", pki.ca_cert_pem());
+            Ok(())
+        }
+        AdminCmd::IssueServer { name, sans, out } => {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let id = pki.issue_server(&name, &sans)?;
+            std::fs::create_dir_all(&out)?;
+            let crt = out.join(format!("{name}.crt"));
+            let key = out.join(format!("{name}.key"));
+            let ca = out.join("ca.crt");
+            std::fs::write(&crt, &id.cert_pem)?;
+            let _ = std::fs::remove_file(&key);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&key)?
+                .write_all(id.key_pem.as_bytes())?;
+            std::fs::write(&ca, pki.ca_cert_pem())?;
+            eprintln!(
+                "issued service identity {name}: {} {} (CA: {})\n  ISO_TLS_CA={} ISO_TLS_CERT={} ISO_TLS_KEY={}",
+                crt.display(),
+                key.display(),
+                ca.display(),
+                ca.display(),
+                crt.display(),
+                key.display()
+            );
             Ok(())
         }
         AdminCmd::IssueClient { name, out } => {

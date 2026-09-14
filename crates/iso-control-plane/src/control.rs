@@ -135,6 +135,9 @@ where
     /// Create and boot a VM. Allocates a slot, provisions storage, applies
     /// network, and starts the VMM — rolling everything back on failure.
     pub async fn create_vm(&self, req: CreateVm) -> Result<VmId> {
+        // Reject a policy that would never compile before anything is
+        // allocated for it.
+        validate_policy(&req.allow, &req.rules)?;
         let tpl = self
             .store
             .get_template(&req.template)?
@@ -202,6 +205,8 @@ where
             tap: None,
             principal: req.principal.clone(),
             allow: req.allow.clone(),
+            rules: req.rules.clone(),
+            policy_gen: 1,
             // A new VM has never suspended; it resumes from its template.
             snapshot: None,
         };
@@ -615,16 +620,19 @@ where
         self.store.list_vms()
     }
 
-    /// Update a VM's egress policy: the (opaque) `principal` it acts as and/or
-    /// the `allow` domain list routed through the proxy. `None` fields are left
-    /// unchanged. Mutable at runtime (e.g. set per agent turn).
+    /// Update a VM's egress policy: the (opaque) `principal` it acts as, the
+    /// `allow` domain list and/or the URI `rules`. `None` fields are left
+    /// unchanged. Mutable at runtime (e.g. set per agent turn). Every call
+    /// bumps the policy generation, which is what tells the proxy edge to
+    /// close connections it holds at the old one. Returns the new generation.
     pub async fn set_policy(
         &self,
         id: VmId,
         principal: Option<String>,
         allow: Option<Vec<String>>,
+        rules: Option<Vec<String>>,
         egress: Option<EgressMode>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let lock = self.vm_lock(id);
         let _guard = lock.lock().await;
         let rec = self.store.get_vm(id)?.ok_or(Error::UnknownVm(id))?;
@@ -634,17 +642,24 @@ where
         // a concurrent lifecycle transition's slot/state.
         let new_principal = principal.or_else(|| rec.principal.clone());
         let new_allow = allow.unwrap_or_else(|| rec.allow.clone());
+        let new_rules = rules.unwrap_or_else(|| rec.rules.clone());
+        validate_policy(&new_allow, &new_rules)?;
         let new_egress = egress.unwrap_or(rec.egress);
         let egress_changed = new_egress != rec.egress;
-        self.store
-            .update_policy(id, new_principal.as_deref(), &new_allow, new_egress)?;
+        let new_gen = self.store.update_policy(
+            id,
+            new_principal.as_deref(),
+            &new_allow,
+            &new_rules,
+            new_egress,
+        )?;
 
-        // The allow-list is read live by the proxy/DNS via `identify`; only an
+        // The policy is read live by the proxy/DNS via `identify`; only an
         // egress *mode* change needs a network re-steer.
         if egress_changed {
             self.apply_network(id).await?;
         }
-        Ok(())
+        Ok(new_gen)
     }
 
     /// Apply a VM's declared desired state to the live network: an nft-only
@@ -770,6 +785,15 @@ where
             vms: records.len(),
         })
     }
+}
+
+
+/// The effective policy must compile: bad input is rejected with the offending
+/// rule, never stored to fail later inside the proxy.
+fn validate_policy(allow: &[String], rules: &[String]) -> Result<()> {
+    iso_policy::RuleSet::from_record(allow, rules)
+        .map(|_| ())
+        .map_err(|e| Error::InvalidRule(e.to_string()))
 }
 
 #[cfg(test)]
@@ -1345,7 +1369,7 @@ mod tests {
 
         let (fwd, pol) = tokio::join!(
             cp.add_forward(id, 90, Protocol::Tcp),
-            cp.set_policy(id, None, None, Some(EgressMode::Allow)),
+            cp.set_policy(id, None, None, None, Some(EgressMode::Allow)),
         );
         fwd.unwrap();
         pol.unwrap();

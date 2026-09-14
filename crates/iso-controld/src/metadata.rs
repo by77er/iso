@@ -78,8 +78,13 @@ where
                 // `Deny` has no egress at all, so nothing is injected into it.
                 (_, EgressMode::Deny) | (None, _) => None,
                 (Some(client), _) => {
+                    // Only literal hosts can be described; a wildcard rule has
+                    // no host to ask about.
+                    let hosts = iso_policy::RuleSet::from_record(&rec.allow, &rec.rules)
+                        .map(|rs| rs.literal_allow_hosts())
+                        .unwrap_or_default();
                     let mut out = Vec::new();
-                    for domain in &rec.allow {
+                    for domain in &hosts {
                         let names = client
                             .names(domain, rec.principal.as_deref(), None)
                             .await;
@@ -111,6 +116,9 @@ where
                 // Selects which per-principal credentials the proxy injects.
                 "principal": rec.principal,
                 "allow": rec.allow,
+                // URI-level rules on top of `allow`; deny wins, default deny.
+                "rules": rec.rules,
+                "policy_gen": rec.policy_gen,
                 // Header names the proxy overrides in flight, per allowed host.
                 // An entry with an empty `headers` is reachable but carries no
                 // credential: expect 401/403 from anything that needs one.

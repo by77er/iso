@@ -38,7 +38,8 @@ Not TLS, or no SNI: dropped. SNI not on the allow-list: reset. Request host that
 | `iso-network-manager` | netlink + nftables. Every fixture (netns, veth pair, /31 addresses, NAT, egress verdict) is a pure function of a 15-bit slot ID, so provision and teardown are idempotent. |
 | `iso-storage-manager` | LVM thin pool over a loop file. Templates are volumes; VM disks are thin snapshots. |
 | `iso-firecracker` | Drives Firecracker over its API socket from inside the VM's netns. Snapshot and resume for warm starts. |
-| `iso-proxy` / `iso-ca` / `iso-secrets` | The `proxy` egress mode: `iso-proxyd` (data plane), `iso-cad` (sign-only CA), `iso-secretsd` (TOML-backed header store, hot-reloaded). |
+| `iso-proxy` / `iso-ca` / `iso-secrets` | The `proxy` egress mode: `iso-proxyd` (data plane; one binary in `single`, `edge` or `proxy` role), `iso-cad` (sign-only CA, 24 h leaves), `iso-secretsd` (header store behind a provider trait: TOML, `exec`, chain). Each side service speaks a Unix socket and, given a service identity, HTTPS with mutual TLS. |
+| `iso-policy` / `iso-rpc` | The URI-level rule language and matcher (pure), and the two RPC transports the side services share. |
 | `iso-dns-server` | Dual-horizon resolver on the services address: `metadata.iso.internal` locally, everything else forwarded. |
 | `iso-guest-agent` / `iso-guest-proto` | The service inside the guest that runs programs and moves files for the host, and its wire protocol. |
 | `iso-admin-pki` | The admin API's own CA: server certificate and client certificates for mutual TLS. |
@@ -56,7 +57,9 @@ Design notes with the full reasoning: [`crates/iso-network-manager/DESIGN.md`](c
 | `allow` | direct out the uplink; allow-listed domains are DNS-steered through the proxy for credential injection | reachable |
 | `proxy` | everything intercepted; only allow-listed TLS destinations pass, with credentials injected | reachable |
 
-Mode and allow-list are per VM, changeable live with `PATCH /vms/{id}/policy`, and apply to new connections.
+Mode, allow-list and rules are per VM, changeable live with `PATCH /vms/{id}/policy`. Every change bumps the VM's policy generation; new connections carry it, and the proxy closes connections it holds at an older one within a second, WebSockets included.
+
+Rules go below the host: `allow https://api.github.com/**` with `deny https://api.github.com/user/keys`, `allow https://*.anthropic.com/v1/messages`, `allow wss://api.openai.com/v1/realtime`. Deny wins, nothing matching is denied, and a plain `allow` host is sugar for `allow https://host/**` plus `allow wss://host/**`. A denied request gets a `403` naming the rule; a host no allow rule names is dropped before TLS is even terminated.
 
 ## Quick start
 
@@ -128,9 +131,12 @@ Then create a VM as that principal:
 
 ```bash
 sudo curl -s --unix-socket state/control.sock -H 'content-type: application/json' \
-  -d '{"template":"base","egress":"proxy","principal":"alice","allow":["api.anthropic.com","api.github.com","github.com"]}' \
+  -d '{"template":"base","egress":"proxy","principal":"alice","allow":["api.anthropic.com","github.com"],
+       "rules":["allow https://api.github.com/repos/**","deny https://api.github.com/user/keys","allow wss://api.github.com/**"]}' \
   http://x/vms
 ```
+
+To run the proxy as a tier on other machines, keep an `edge` on each host and point it at replicas; see [`crates/iso-proxy/DESIGN.md`](crates/iso-proxy/DESIGN.md) for the roles and the config file. Service identities come from `isoctl admin issue-server --name proxy-1 --san 10.0.0.9`, and `iso-cad` / `iso-secretsd` serve HTTPS with `ISO_CA_LISTEN` / `ISO_SECRETS_LISTEN` beside their sockets. `cargo test -p iso-proxy` exercises both the single-host and the split configuration in-process.
 
 Inside the guest, `curl https://api.github.com/user` just works. No token in the environment, no `gh auth login`.
 
@@ -165,11 +171,11 @@ Served on `$ISO_STATE_DIR/control.sock` (root only) and on TCP port 7070 of the 
 
 | Endpoint | Effect |
 | --- | --- |
-| `POST /vms` | Create and boot. Body: `template`, plus optional `egress`, `ingress`, `labels`, `lifecycle` (`ephemeral` or `durable`), `restart`, `vcpus`, `mem_mib`, `principal`, `allow`. |
+| `POST /vms` | Create and boot. Body: `template`, plus optional `egress`, `ingress`, `labels`, `lifecycle` (`ephemeral` or `durable`), `restart`, `vcpus`, `mem_mib`, `principal`, `allow`, `rules`. A rule that does not parse is a `400`. |
 | `GET /vms`, `GET /vms/{id}` | List, inspect. |
 | `POST /vms/{id}/start` · `stop` · `suspend` · `halt` | Lifecycle. |
 | `DELETE /vms/{id}` | Destroy. |
-| `PATCH /vms/{id}/policy` | Change `egress`, `principal`, `allow` on a running VM. |
+| `PATCH /vms/{id}/policy` | Change `egress`, `principal`, `allow`, `rules` on a running VM; bumps `policy_gen`. |
 | `POST /vms/{id}/forwards` | Open a host port to a VM port. The host port is allocated and returned. |
 | `POST /vms/{id}/exec` | Run a program inside the VM through the guest agent; output and exit status come back. |
 | `GET` / `PUT` / `DELETE /vms/{id}/files?path=`, `GET /vms/{id}/dir?path=` | Read, write, remove and list files inside the VM. |
@@ -191,4 +197,4 @@ This is a working prototype, not a hardened product.
 
 ## Tests
 
-`cargo test` covers the pure parts: slot math, network plans, storage naming, proxy policy. The integration tests in `iso-controld` and `iso-firecracker` need root and KVM and skip otherwise. `scripts/e2e_ssh.sh` and `scripts/e2e_dns.sh` bake a throwaway image into their own volume group and exercise all three egress modes over SSH.
+`cargo test` covers the pure parts (slot math, network plans, storage naming, the rule language) and the proxy end to end in both configurations, in-process without root. The integration tests in `iso-controld` and `iso-firecracker` need root and KVM and skip otherwise. `scripts/e2e_ssh.sh` and `scripts/e2e_dns.sh` bake a throwaway image into their own volume group and exercise all three egress modes over SSH.

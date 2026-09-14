@@ -1,0 +1,10 @@
+[package]
+name = "iso-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "URI-level allow/deny rules for the iso egress proxy: grammar, matcher, no I/O"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

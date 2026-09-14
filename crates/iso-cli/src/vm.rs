@@ -59,6 +59,10 @@ pub enum VmCmd {
         /// Replace the proxied-domain list (repeatable).
         #[arg(long = "allow")]
         allow: Vec<String>,
+        /// Replace the URI-level rules (repeatable), e.g.
+        /// `--rule 'allow https://api.github.com/**' --rule 'deny https://api.github.com/user/keys'`.
+        #[arg(long = "rule")]
+        rules: Vec<String>,
     },
     /// Ask the guest agent who it is.
     Agent { id: String },
@@ -123,6 +127,10 @@ pub struct Create {
     /// Domains routed through the egress proxy (repeatable).
     #[arg(long = "allow")]
     allow: Vec<String>,
+    /// URI-level rules on top of --allow (repeatable): `allow|deny https|wss://host/path`,
+    /// with `*.` host wildcards and `*` / `**` path wildcards. Deny wins.
+    #[arg(long = "rule")]
+    rules: Vec<String>,
     /// Forward a VM port: `PORT` or `PORT/udp` (repeatable). The host port is allocated.
     #[arg(long = "forward")]
     forwards: Vec<String>,
@@ -211,6 +219,7 @@ pub async fn run(v: Vm) -> R<()> {
                         .restart(a.restart.clone())
                         .principal(a.principal.clone())
                         .allow(a.allow.clone())
+                        .rules(a.rules.clone())
                         .ingress(ingress.clone())
                         .labels(labels.iter().cloned().collect::<std::collections::HashMap<_, _>>())
                         .vcpus(a.vcpus.map(|v| v as i32))
@@ -240,11 +249,17 @@ pub async fn run(v: Vm) -> R<()> {
         VmCmd::Suspend { id } => {
             c.suspend().id(id).send().await?;
         }
-        VmCmd::Policy { id, egress, principal, allow } => {
+        VmCmd::Policy { id, egress, principal, allow, rules } => {
             let allow = if allow.is_empty() { None } else { Some(allow) };
+            let rules = if rules.is_empty() { None } else { Some(rules) };
             c.set_policy()
                 .id(id)
-                .body_map(|b| b.egress(egress.clone()).principal(principal.clone()).allow(allow.clone()))
+                .body_map(|b| {
+                    b.egress(egress.clone())
+                        .principal(principal.clone())
+                        .allow(allow.clone())
+                        .rules(rules.clone())
+                })
                 .send()
                 .await?;
         }

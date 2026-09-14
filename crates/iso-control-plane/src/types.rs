@@ -119,6 +119,12 @@ pub struct VmRecord {
     /// credential injection). In `Allow` mode the rest go direct; in `Proxy`
     /// mode the rest are denied.
     pub allow: Vec<String>,
+    /// URI-level rules in `iso-policy` syntax, on top of `allow`. Validated
+    /// on the way in; the effective policy is `allow` expanded plus these.
+    pub rules: Vec<String>,
+    /// Bumped on every policy change. Consumers that cache policy or hold
+    /// long-lived connections compare generations, never contents.
+    pub policy_gen: u64,
     /// This VM's own snapshot, from the last successful suspend. Preferred over
     /// the template's on resume — the template's is where every clone *starts*,
     /// this is where this one left off. Cleared when the VM is destroyed (the
@@ -139,6 +145,7 @@ pub struct CreateVm {
     pub mem_mib: Option<u32>,
     pub principal: Option<String>,
     pub allow: Vec<String>,
+    pub rules: Vec<String>,
 }
 
 impl CreateVm {
@@ -156,6 +163,7 @@ impl CreateVm {
             mem_mib: None,
             principal: None,
             allow: Vec::new(),
+            rules: Vec::new(),
         }
     }
 }

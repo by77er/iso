@@ -1,9 +1,11 @@
 # iso-proxy — Credential-injecting, policy-enforcing egress proxy
 
-The backend for the `Proxy` egress mode. A **transparent MITM HTTPS proxy** on
-the host that (a) lets through *only* TLS, (b) enforces a per-VM domain
-allow-list (default-deny), and (c) injects/overrides credential headers based on
-the VM's **principal** and **global** secrets.
+The backend for the `Proxy` egress mode (and the injection path of `Allow`
+mode). A **transparent MITM HTTPS proxy** that (a) lets through *only* TLS,
+(b) enforces per-VM **URI-level rules** (default-deny, deny wins), (c) injects
+credential headers based on the VM's **principal**, and (d) tunnels WebSocket
+upgrades. One binary, three roles, so the same code runs on one host or as a
+stateless tier serving many.
 
 ## Guiding principles
 
@@ -11,141 +13,186 @@ the VM's **principal** and **global** secrets.
   the guest cannot reach or reconfigure either. The VM only ever sees a CA it
   trusts and a transparent redirect.
 - **TLS or nothing.** A connection that isn't a TLS `ClientHello` has no SNI,
-  hence no routable destination, hence is dropped. "Only TLS" and "transparent
-  routing needs a destination" are the same requirement.
-- **MITM everything (for now).** Every allowed TLS connection is terminated and
-  re-originated. Splicing un-injected domains is a later perf optimization that
-  slots in behind the same boundaries — nothing here precludes it.
+  hence no routable destination, hence is dropped.
+- **MITM everything.** Every allowed TLS connection is terminated and
+  re-originated. The upstream leg is HTTPS only and webpki-validated (plus any
+  operator-added roots); no code path can originate plaintext.
 - **Secrets never touch the guest, the CA key never touches the proxy.** Both
   live behind RPC boundaries in their own processes.
+- **Policy travels with the connection.** Nothing in the data plane looks
+  policy up mid-flight; the thing that admits a connection also owns its
+  lifetime and ends it when policy changes.
 
-## Topology & data flow
+## Roles
 
-`Proxy`-mode VMs have their egress steered (nftables, host root netns) to the
-proxy on the services address `172.22.0.1`. The VM's `vp` source IP is preserved,
-so the proxy identifies the VM the same way the metadata server does
-(`address_to_slot`).
+```text
+single   nft DNAT ─▶ iso-proxyd ─┬─ identify.sock (controld)      today's deployment:
+                                 ├─ ca.sock (iso-cad)             everything on the host
+                                 └─ secrets.sock (iso-secretsd)
 
-```
-VM (172.20.0.1) ──tap──vp(172.21.x)──▶ nft redirect ──▶ iso-proxyd @172.22.0.1:PORT
-                                                          │
-   1. accept; src_ip ──▶ control-plane identify ──▶ {vm, principal, allow}
-   2. peek TLS ClientHello  ── not TLS? ──▶ DROP
-   3. SNI = client_hello.server_name   ── no SNI? ──▶ DROP
-   4. SNI ∈ allow?           ── no ──▶ RESET
-   5. CertAuthority.sign(SNI, csr) ──▶ leaf cert (cached); complete TLS to VM
-   6. dial upstream TLS to resolve(SNI) (webpki-validated); ALPN h2/h1.1
-   7. per request/stream:
-        require :authority/Host == SNI            ── else 421/RESET
-        hdrs = SecretProvider.headers(SNI, principal); set/override; forward
-   8. stream bodies both ways (SSE/chunked safe)
+edge     nft DNAT ─▶ iso-proxyd --role edge ─▶ mTLS + PROXY v2 {vm, principal, rules, gen} ─▶ tier
+                       └─ identify.sock (controld)
+
+proxy    edges ─mTLS─▶ iso-proxyd --role proxy ─┬─ https://…/sign     (iso-cad, mTLS)
+                                                 └─ https://…/headers  (iso-secretsd, mTLS)
 ```
 
-nftables (Proxy mode), root netns, per slot:
-- redirect VM egress **TCP** (any port) → `172.22.0.1:PROXY_PORT` (DNAT, src kept);
-- VM **DNS** (udp/tcp 53) → the iso resolver (`172.22.0.1:53`);
-- **drop everything else** out of the netns (other UDP incl. QUIC/:443-udp, so
-  clients fall back to TCP TLS).
+- **single**: accept the connections nftables steers to the services address,
+  name each one through the host's identify RPC, serve it here. This is what
+  `iso-up.sh` runs; nothing about it changed.
+- **edge**: the half that stays on a host. Name the connection, refuse what
+  should never be proxied (unknown source, deny-mode VM), and carry the raw
+  bytes to a replica over mutual TLS (admin PKI) with the connection's
+  identity **and whole policy** in one custom PROXY protocol v2 TLV
+  (`0xE5`, JSON `WirePolicy`). Round-robins over the tier's addresses. Nothing
+  is terminated at the edge.
+- **proxy**: a stateless replica. Require a client certificate from the admin
+  CA, read the header, serve the connection with the policy it carries. It
+  has no state directory, no policy lookup, no cache and no watch; the only
+  services it calls are the CA and the secrets store, over HTTPS with mutual
+  TLS. Its one cache is leaf certificates, until their `not_after`.
+
+The **registry** (edge and single roles) records every live connection under
+its source address and policy generation, tunnels included. A watcher
+re-reads each VM's policy every `watch_every` (1 s) and closes everything held
+at an older generation, or by a VM that became unknown or deny-mode. That is
+how an h2 session or a WebSocket outlives a `PATCH /policy` by at most one
+tick, and the tier never learns it happened.
+
+## Data flow (serving a connection, `single` and `proxy`)
+
+```text
+   1. accept; policy ← identify(src ip) [single] or the PROXY header [proxy]
+   2. egress == deny? ──▶ DROP (a deny VM has no egress; reaching the services
+      address is not a licence to proxy for it)
+   3. peek TLS ClientHello  ── not TLS / no SNI? ──▶ DROP
+   4. host phase: some allow rule names the SNI? ── no ──▶ DROP (never terminated,
+      no certificate minted)
+   5. CertAuthority.sign(SNI, csr) ──▶ leaf (cached until not_after − 10 min);
+      complete TLS to VM (ALPN h2, http/1.1)
+   6. per request/stream:
+        :authority/Host == SNI                       ── else 421
+        URI phase: rules.evaluate(https|wss, host, path)  ── deny ──▶ 403 JSON
+        hdrs = SecretProvider.headers(SNI, principal, path); set/override
+        Upgrade: websocket?  ── yes ──▶ forward over http/1.1; on 101 bridge both
+                                        upgraded streams, bytes only, no timer
+                             ── no  ──▶ forward (h2 or http/1.1), stream body
+```
+
+## Rules
+
+Grammar and semantics live in `iso-policy` (pure, tested). In short:
+
+```text
+rule    := ("allow" | "deny") pattern
+pattern := scheme "://" host [":" port] path
+scheme  := "https" | "wss"        wss matches only Upgrade requests
+host    := exact | "*." suffix    one or more leading labels, never the apex
+path    := "/" segments           "*" = one segment, "**" = the rest (last only)
+```
+
+- Default deny. Explicit deny wins regardless of order. Query strings are
+  never matched.
+- Host phase at SNI time uses only allow rules' hosts; a host with deny rules
+  only is never terminated.
+- URI phase runs after the authority check and before injection, so a denied
+  path never carries a credential. The guest gets `403` with
+  `{"error":"denied by policy","request":…,"rule":…|null}` and
+  `x-iso-denied: policy`, because at that point a reset would look like a
+  network fault.
+- The legacy `allow: [host]` list is sugar for `allow https://host/**` plus
+  `allow wss://host/**`. Records and clients that only know `allow` keep
+  working; the effective policy is `allow` expanded plus `rules`.
+- Consumers: both proxy phases, the DNS steer for Allow mode (host phase, so
+  `*.example.com` steers), control-plane validation (`400` on a bad rule),
+  and the metadata description (literal allow hosts only).
 
 ## Identity, policy & principal
 
-| Thing | Owner | How set (now) | How set (later) |
-| --- | --- | --- | --- |
-| src_ip → vm | control plane (`identify`) | — | — |
-| `principal` (current user) | control-plane VM record | `isoctl policy set` | orchestrator push |
-| `allow` (domain list) | control-plane VM record | `isoctl policy set` | orchestrator push |
-| secrets (headers) | secret provider TOML | edit `state/secrets.toml` | secret store |
+| Thing | Owner | How set |
+| --- | --- | --- |
+| src ip → vm | control plane (`identify`) | — |
+| `principal`, `allow`, `rules` | VM record | `POST /vms`, `PATCH /vms/{id}/policy`, `isoctl vm create/policy --rule` |
+| `policy_gen` | VM record | bumped by every policy change |
+| secrets (headers) | secret provider | adapter: TOML, exec, … |
 
-The VM record gains `principal: Option<String>` and `allow: Vec<String>`
-(exact-match domains). `principal` is **deliberately mutable** at runtime; the
-proxy re-resolves it per request through a short-TTL (~1s) `identify` cache, so
-a change takes effect within the TTL without a lookup storm.
+`IdentifyResponse` now carries `vm`, `rules` (effective, expanded) and
+`policy_gen` beside `allow`, `principal` and `egress`. A proxy that predates
+`rules` still works from `allow`.
 
-## RPC boundaries
+## RPC boundaries (`iso-rpc`)
 
-Both are unix-domain-socket servers under `state/`, framed as length-prefixed
-(u32 BE) JSON request→response. Realized in Rust as traits with (a) in-process
-impls for tests and (b) RPC client/server impls for deployment.
+Every side service speaks two transports from one handler: **Unix** (one
+half-close framed JSON request per connection, root-only socket under
+`state/`) and **HTTPS** (`POST /<method>`, JSON body, mutual TLS on the admin
+PKI). A service identity comes from `isoctl admin issue-server`, and is read
+from `ISO_TLS_CA`, `ISO_TLS_CERT`, `ISO_TLS_KEY`.
 
-### SecretProvider — `state/secrets.sock`
+### SecretProvider — `secrets.sock` · `POST /headers`
 ```
-headers(domain: String, principal: Option<String>) -> Map<String,String>
+headers(domain, principal, path, names_only) -> { headers } | { names }
 ```
-Returns the **effective** headers to set/override: the provider merges **global
-OVER per-principal** internally. Empty ⇒ inject nothing (fail-open: an allowed
-domain with no secrets is forwarded verbatim). "override" = set the value (add if
-absent, replace if present).
+Fail-open: down or empty ⇒ inject nothing. Backends are adapters behind
+`iso_secrets::SecretProvider` (`headers` may mint; `names` must not): TOML,
+`exec` (an operator program: `prog headers|names <domain> <principal|-> <path|->`),
+`chain`.
 
-Backing TOML (`state/secrets.toml`):
-```toml
-# Injected for every principal (override per-principal). Keyed by domain.
-[global."api.anthropic.com"]
-"x-api-key"         = "sk-ant-..."
-"anthropic-version" = "2023-06-01"
-
-# Per-principal. One test principal "default".
-[principals.default."api.github.com"]
-"authorization" = "Bearer ghp_..."
+### CertAuthority — `ca.sock` · `POST /sign`
 ```
-
-### CertAuthority — `state/ca.sock`
+sign(domain, csr_pem) -> { chain_der_b64: [leaf, ca], not_after }
 ```
-sign(domain: String, csr_der: Bytes) -> { chain_der: [Bytes], not_after }
-```
-**Sign-only**: the proxy generates a disposable leaf keypair and CSR; the CA only
-signs. The CA private key never leaves the minter. Proxy caches leaf certs per
-domain (short lifetime, e.g. 24h; SAN = domain).
+Sign-only; leaves live 24 h; empty chain ⇒ refusal, proxy fails closed.
 
 ## CA trust bootstrap
 
-A single CA is generated once into `state/ca/` (`ca.crt`, `ca.key`). The minter
-loads its key; the proxy trusts nothing extra (it validates upstream with webpki
-roots). The **VM must trust `ca.crt`**, baked into the template trust store
-(`security.pki.certificateFiles`, or via `isoctl bake --inject`) **before the
-snapshot** — warm-resume freezes the trust store, so post-snapshot trust changes
-are invisible. For e2e we can shortcut with `curl --cacert` to validate the data
-path without rebaking.
+One CA per **tier** (a single host is a tier of one), generated into
+`state/ca/`, private key only ever in `iso-cad`. Guests must trust `ca.crt`,
+baked into the template before the snapshot. Serving it from metadata at boot
+(so one template serves many hosts) is the next step, not this one.
 
-## HTTP — hyper end-to-end
+## Configuration (`iso-proxyd`)
 
-We do **not** hand-roll `h2`. rustls terminates TLS (server side, ALPN
-`["h2","http/1.1"]`, cert resolved per-SNI via the minter using
-`LazyConfigAcceptor` to read the ClientHello first); hyper serves whatever ALPN
-negotiated. A hyper client re-originates upstream (prefer h2, webpki-validated),
-one upstream connection per client connection (same SNI; h2 multiplexes). We
-operate at the `http::Request`/`Response` header level and stream bodies. SNI is
-per-connection but `:authority` is per-stream, so `:authority == SNI` is checked
-per request — both a correctness (one upstream per SNI) and anti-fronting
-guarantee. This is *especially* important on injected flows: it prevents a
-crafted `:authority` from redirecting the injected credential to another host.
+No config file ⇒ today's behaviour: `single` on `ISO_PROXY_LISTEN` with the
+three sockets under `ISO_STATE_DIR`. Otherwise `ISO_PROXY_CONFIG=file.toml`:
+
+```toml
+role = "edge"                          # single | edge | proxy
+listen = ["172.22.0.1:3128", "172.22.0.1:443"]
+[identify]  socket = "/var/lib/iso/identify.sock"   ttl_ms = 1000
+[tier]      addrs = ["10.0.0.9:3129"]  server_name = "proxy-1"
+[tls]       ca = "creds/ca.crt"  cert = "creds/edge.crt"  key = "creds/edge.key"
+```
+
+```toml
+role = "proxy"
+listen = ["0.0.0.0:3129"]
+[ca]        url = "https://10.0.0.7:7443"
+[secrets]   url = "https://10.0.0.7:7444"
+[tls]       ca = "creds/ca.crt"  cert = "creds/proxy-1.crt"  key = "creds/proxy-1.key"
+[upstream]  extra_roots = ["/etc/ssl/corp-ca.pem"]  pins = { "api.internal" = "10.0.0.5:8443" }
+```
+
+`iso-cad` and `iso-secretsd` add the HTTPS listener with `ISO_CA_LISTEN` /
+`ISO_SECRETS_LISTEN` plus the `ISO_TLS_*` identity.
 
 ## Failure modes
 
-- Not TLS / no SNI ⇒ drop. SNI ∉ allow ⇒ reset.
-- `:authority != SNI` ⇒ reject (421).
-- SecretProvider down or empty ⇒ **forward without injection** (fail-open;
-  the domain is already allow-listed).
-- CertAuthority down ⇒ **block** (fail-closed; we can't terminate).
-- Upstream TLS/DNS failure ⇒ 502 to the VM.
+- Not TLS / no SNI ⇒ drop. No allow rule for the host ⇒ drop before minting.
+- `:authority != SNI` ⇒ 421. URI rule deny ⇒ 403.
+- Unknown source / deny-mode VM ⇒ refused at the edge.
+- SecretProvider down or empty ⇒ forward without injection (fail-open).
+- CertAuthority down ⇒ block (fail-closed). Tier unreachable ⇒ the edge
+  closes the guest connection.
+- Policy changed ⇒ the edge closes that VM's connections within one watch
+  tick; new ones carry the new generation.
 
-## Crate layout
+## Tests
 
-- `iso-proxy` — data plane (`iso-proxyd`); `SecretProvider`/`CertAuthority`
-  traits + their RPC client impls; `identify` client.
-- `iso-secrets` — `TomlSecretProvider` + `iso-secretsd` (RPC server).
-- `iso-ca` — CA (generate/load, sign CSR) + `iso-cad` (RPC server).
-- control plane / `iso-controld` — `principal`+`allow` on the VM record; an
-  `identify` endpoint (for the proxy) and a policy-set endpoint (for the CLI).
-- `iso-cli` — `isoctl policy set <vm> --principal <p> --allow <domain>...`.
-
-## e2e test plan
-
-1. Generate CA into `state/ca`; start `iso-cad`, `iso-secretsd` (with a test
-   `secrets.toml` injecting a recognizable header for an echo domain), `iso-proxyd`.
-2. Create a `Proxy`-mode VM; `isoctl policy set` it to `principal=default`,
-   `allow=[<echo-domain>]`.
-3. From the VM (trusting the CA via `--cacert`):
-   - `curl https://<echo>/headers` ⇒ response reflects the injected header ✓
-     (proves MITM + injection + CA trust + h2).
-   - `curl https://example.com` ⇒ blocked (not in allow-list) ✓.
-   - `curl http://<echo>` ⇒ blocked (non-TLS) ✓.
+`cargo test -p iso-proxy` runs both configurations in-process on loopback,
+no root and no network: `tests/single_host.rs` (one process, Unix sockets)
+and `tests/multi_host.rs` (two edges, one replica, HTTPS mTLS to the CA and
+secrets services). They cover injection, the host and URI phases, deny-mode
+refusal, WebSocket tunnels with injection on the handshake, close-on-policy-
+change in both roles, the tier refusing non-admin-CA edges, and a replica
+with a stranger identity failing closed at the CA. `tests/e2e.rs` is the
+`#[ignore]`d real-network check against an external echo service.

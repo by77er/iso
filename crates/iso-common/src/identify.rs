@@ -17,6 +17,18 @@ pub struct IdentifyResponse {
     pub egress: String,
     /// Opaque principal the VM acts as (selects per-principal injected creds).
     pub principal: Option<String>,
-    /// Domains routed through the proxy.
+    /// Domains routed through the proxy (the legacy host allow-list, kept for
+    /// callers that predate `rules`).
     pub allow: Vec<String>,
+    /// The VM's id, so a caller can key state by VM rather than by address.
+    #[serde(default)]
+    pub vm: Option<String>,
+    /// The effective rule set, expanded: `allow` sugar plus explicit rules,
+    /// in `iso-policy` syntax. A caller with rules ignores `allow`.
+    #[serde(default)]
+    pub rules: Vec<String>,
+    /// Policy generation: bumped on every policy change. Equal generations
+    /// mean equal policy; a caller closes what it holds at an older one.
+    #[serde(default)]
+    pub policy_gen: u64,
 }

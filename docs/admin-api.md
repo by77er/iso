@@ -86,7 +86,7 @@ code, so it composes with shell tooling the way `ssh host cmd` does.
 | `GET /vms`, `GET /vms/{id}` | List, inspect. |
 | `POST /vms/{id}/start` · `stop` · `suspend` · `halt` | Lifecycle transitions; `409` when not valid in the current state. |
 | `DELETE /vms/{id}` | Destroy, whatever the lifecycle. |
-| `PATCH /vms/{id}/policy` | Change `egress`, `principal`, `allow` on a running VM; applies to new connections. |
+| `PATCH /vms/{id}/policy` | Change `egress`, `principal`, `allow`, `rules` on a running VM. Bumps `policy_gen`; new connections carry it and the proxy closes older ones within a second. A rule that does not parse is a `400`. |
 | `POST /vms/{id}/forwards`, `DELETE /vms/{id}/forwards/{host_port}` | Open or close an ingress forward; the host port is allocated. |
 | `GET /vms/{id}/agent` | Ping the guest agent. |
 | `POST /vms/{id}/exec` | Run a program inside the VM. |

@@ -890,7 +890,17 @@
         },
         "responses": {
           "204": {
-            "description": "Applied to new connections"
+            "description": "Applied to new connections; connections at the old policy generation are closed by the proxy edge"
+          },
+          "400": {
+            "description": "A rule does not parse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           },
           "404": {
             "description": "Unknown VM",
@@ -1227,6 +1237,13 @@
             "type": "string",
             "description": "`never` (default), `on_failure` or `always`."
           },
+          "rules": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "URI-level rules, e.g. `allow https://api.github.com/**` or\n`deny https://api.github.com/user/keys`. Deny wins; nothing matching\nis denied. `allow` hosts are sugar for `allow https://host/**` plus\n`allow wss://host/**`. A rule that does not parse is a 400."
+          },
           "template": {
             "type": "string",
             "description": "A registered template name."
@@ -1457,6 +1474,14 @@
           "principal": {
             "type": "string",
             "nullable": true
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Replace the URI-level rules. A rule that does not parse is a 400.",
+            "nullable": true
           }
         }
       },
@@ -1617,7 +1642,9 @@
           "restart",
           "labels",
           "ingress",
-          "allow"
+          "allow",
+          "rules",
+          "policy_gen"
         ],
         "properties": {
           "allow": {
@@ -1649,6 +1676,12 @@
             "type": "string",
             "description": "`ephemeral` or `durable`."
           },
+          "policy_gen": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bumped on every policy change.",
+            "minimum": 0
+          },
           "principal": {
             "type": "string",
             "nullable": true
@@ -1660,6 +1693,13 @@
           "rootfs_device": {
             "type": "string",
             "nullable": true
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "URI-level rules on top of `allow`, in `iso-policy` syntax."
           },
           "slot": {
             "type": "integer",

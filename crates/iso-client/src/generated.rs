@@ -70,6 +70,12 @@ pub mod types {
         ///`never` (default), `on_failure` or `always`.
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub restart: ::std::option::Option<::std::string::String>,
+        ///URI-level rules, e.g. `allow https://api.github.com/**` or
+        ///`deny https://api.github.com/user/keys`. Deny wins; nothing matching
+        ///is denied. `allow` hosts are sugar for `allow https://host/**` plus
+        ///`allow wss://host/**`. A rule that does not parse is a 400.
+        #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
+        pub rules: ::std::vec::Vec<::std::string::String>,
         ///A registered template name.
         pub template: ::std::string::String,
         ///Override the template's vCPU count (forces a cold boot).
@@ -285,6 +291,9 @@ pub mod types {
         pub egress: ::std::option::Option<::std::string::String>,
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub principal: ::std::option::Option<::std::string::String>,
+        ///Replace the URI-level rules. A rule that does not parse is a 400.
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub rules: ::std::option::Option<::std::vec::Vec<::std::string::String>>,
     }
 
     impl PolicyRequest {
@@ -382,12 +391,16 @@ pub mod types {
         pub labels: ::std::collections::HashMap<::std::string::String, ::std::string::String>,
         ///`ephemeral` or `durable`.
         pub lifecycle: ::std::string::String,
+        ///Bumped on every policy change.
+        pub policy_gen: i64,
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub principal: ::std::option::Option<::std::string::String>,
         ///`never`, `on_failure` or `always`.
         pub restart: ::std::string::String,
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub rootfs_device: ::std::option::Option<::std::string::String>,
+        ///URI-level rules on top of `allow`, in `iso-policy` syntax.
+        pub rules: ::std::vec::Vec<::std::string::String>,
         ///Placement slot; absent while a durable VM is stopped.
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub slot: ::std::option::Option<i32>,
@@ -632,6 +645,10 @@ pub mod types {
                 ::std::option::Option<::std::string::String>,
                 ::std::string::String,
             >,
+            rules: ::std::result::Result<
+                ::std::vec::Vec<::std::string::String>,
+                ::std::string::String,
+            >,
             template: ::std::result::Result<::std::string::String, ::std::string::String>,
             vcpus: ::std::result::Result<::std::option::Option<i32>, ::std::string::String>,
         }
@@ -647,6 +664,7 @@ pub mod types {
                     mem_mib: Ok(Default::default()),
                     principal: Ok(Default::default()),
                     restart: Ok(Default::default()),
+                    rules: Ok(Default::default()),
                     template: Err("no value supplied for template".to_string()),
                     vcpus: Ok(Default::default()),
                 }
@@ -736,6 +754,16 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for restart: {e}"));
                 self
             }
+            pub fn rules<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::vec::Vec<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.rules = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for rules: {e}"));
+                self
+            }
             pub fn template<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<::std::string::String>,
@@ -772,6 +800,7 @@ pub mod types {
                     mem_mib: value.mem_mib?,
                     principal: value.principal?,
                     restart: value.restart?,
+                    rules: value.rules?,
                     template: value.template?,
                     vcpus: value.vcpus?,
                 })
@@ -789,6 +818,7 @@ pub mod types {
                     mem_mib: Ok(value.mem_mib),
                     principal: Ok(value.principal),
                     restart: Ok(value.restart),
+                    rules: Ok(value.rules),
                     template: Ok(value.template),
                     vcpus: Ok(value.vcpus),
                 }
@@ -1387,6 +1417,10 @@ pub mod types {
                 ::std::option::Option<::std::string::String>,
                 ::std::string::String,
             >,
+            rules: ::std::result::Result<
+                ::std::option::Option<::std::vec::Vec<::std::string::String>>,
+                ::std::string::String,
+            >,
         }
 
         impl ::std::default::Default for PolicyRequest {
@@ -1395,6 +1429,7 @@ pub mod types {
                     allow: Ok(Default::default()),
                     egress: Ok(Default::default()),
                     principal: Ok(Default::default()),
+                    rules: Ok(Default::default()),
                 }
             }
         }
@@ -1432,6 +1467,18 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for principal: {e}"));
                 self
             }
+            pub fn rules<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<
+                    ::std::option::Option<::std::vec::Vec<::std::string::String>>,
+                >,
+                T::Error: ::std::fmt::Display,
+            {
+                self.rules = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for rules: {e}"));
+                self
+            }
         }
 
         impl ::std::convert::TryFrom<PolicyRequest> for super::PolicyRequest {
@@ -1443,6 +1490,7 @@ pub mod types {
                     allow: value.allow?,
                     egress: value.egress?,
                     principal: value.principal?,
+                    rules: value.rules?,
                 })
             }
         }
@@ -1453,6 +1501,7 @@ pub mod types {
                     allow: Ok(value.allow),
                     egress: Ok(value.egress),
                     principal: Ok(value.principal),
+                    rules: Ok(value.rules),
                 }
             }
         }
@@ -1890,6 +1939,7 @@ pub mod types {
                 ::std::string::String,
             >,
             lifecycle: ::std::result::Result<::std::string::String, ::std::string::String>,
+            policy_gen: ::std::result::Result<i64, ::std::string::String>,
             principal: ::std::result::Result<
                 ::std::option::Option<::std::string::String>,
                 ::std::string::String,
@@ -1897,6 +1947,10 @@ pub mod types {
             restart: ::std::result::Result<::std::string::String, ::std::string::String>,
             rootfs_device: ::std::result::Result<
                 ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
+            rules: ::std::result::Result<
+                ::std::vec::Vec<::std::string::String>,
                 ::std::string::String,
             >,
             slot: ::std::result::Result<::std::option::Option<i32>, ::std::string::String>,
@@ -1917,9 +1971,11 @@ pub mod types {
                     ingress: Err("no value supplied for ingress".to_string()),
                     labels: Err("no value supplied for labels".to_string()),
                     lifecycle: Err("no value supplied for lifecycle".to_string()),
+                    policy_gen: Err("no value supplied for policy_gen".to_string()),
                     principal: Ok(Default::default()),
                     restart: Err("no value supplied for restart".to_string()),
                     rootfs_device: Ok(Default::default()),
+                    rules: Err("no value supplied for rules".to_string()),
                     slot: Ok(Default::default()),
                     state: Err("no value supplied for state".to_string()),
                     tap: Ok(Default::default()),
@@ -1991,6 +2047,16 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for lifecycle: {e}"));
                 self
             }
+            pub fn policy_gen<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<i64>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.policy_gen = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for policy_gen: {e}"));
+                self
+            }
             pub fn principal<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
@@ -2019,6 +2085,16 @@ pub mod types {
                 self.rootfs_device = value
                     .try_into()
                     .map_err(|e| format!("error converting supplied value for rootfs_device: {e}"));
+                self
+            }
+            pub fn rules<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::vec::Vec<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.rules = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for rules: {e}"));
                 self
             }
             pub fn slot<T>(mut self, value: T) -> Self
@@ -2073,9 +2149,11 @@ pub mod types {
                     ingress: value.ingress?,
                     labels: value.labels?,
                     lifecycle: value.lifecycle?,
+                    policy_gen: value.policy_gen?,
                     principal: value.principal?,
                     restart: value.restart?,
                     rootfs_device: value.rootfs_device?,
+                    rules: value.rules?,
                     slot: value.slot?,
                     state: value.state?,
                     tap: value.tap?,
@@ -2093,9 +2171,11 @@ pub mod types {
                     ingress: Ok(value.ingress),
                     labels: Ok(value.labels),
                     lifecycle: Ok(value.lifecycle),
+                    policy_gen: Ok(value.policy_gen),
                     principal: Ok(value.principal),
                     restart: Ok(value.restart),
                     rootfs_device: Ok(value.rootfs_device),
+                    rules: Ok(value.rules),
                     slot: Ok(value.slot),
                     state: Ok(value.state),
                     tap: Ok(value.tap),
@@ -4112,6 +4192,9 @@ pub mod builder {
             let response = result?;
             match response.status().as_u16() {
                 204u16 => Ok(ResponseValue::empty(response)),
+                400u16 => Err(Error::ErrorResponse(
+                    ResponseValue::from_response(response).await?,
+                )),
                 404u16 => Err(Error::ErrorResponse(
                     ResponseValue::from_response(response).await?,
                 )),

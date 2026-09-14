@@ -1144,6 +1144,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "rcgen",
+ "rustls",
  "rustls-pki-types",
  "thiserror 2.0.18",
  "time",
@@ -1154,12 +1155,17 @@ name = "iso-ca"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "iso-admin-pki",
+ "iso-rpc",
  "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "x509-parser",
 ]
 
@@ -1206,6 +1212,7 @@ name = "iso-control-plane"
 version = "0.1.0"
 dependencies = [
  "iso-common",
+ "iso-policy",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1228,6 +1235,7 @@ dependencies = [
  "iso-guest-agent",
  "iso-guest-proto",
  "iso-network-manager",
+ "iso-policy",
  "iso-secrets",
  "iso-storage-manager",
  "libc",
@@ -1322,6 +1330,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "iso-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "iso-proxy"
 version = "0.1.0"
 dependencies = [
@@ -1333,9 +1349,13 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "iso-admin-pki",
  "iso-ca",
  "iso-common",
+ "iso-policy",
+ "iso-rpc",
  "iso-secrets",
+ "ppp",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
@@ -1344,15 +1364,40 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "toml",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots",
+]
+
+[[package]]
+name = "iso-rpc"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]
 name = "iso-secrets"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
+ "iso-admin-pki",
+ "iso-rpc",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1861,6 +1906,15 @@ name = "powerfmt"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
+
+[[package]]
+name = "ppp"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a7a2049cd2570bd67bf0228e86bf850f8ceb5190a345c471d03a909da6049e0"
+dependencies = [
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "ppv-lite86"
