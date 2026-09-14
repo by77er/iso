@@ -1,0 +1,5 @@
+.deploy/
+.inframe/
+lean/.generated/
+lean/.lake/
+secrets.toml

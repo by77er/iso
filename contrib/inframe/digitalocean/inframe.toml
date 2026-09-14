@@ -1,0 +1,25 @@
+# iso on DigitalOcean: two VM hosts and one control host, for testing the
+# distributed deployment. See README.md. Applying creates billable resources.
+
+[lean]
+directory = "lean"
+main = "infra"
+test = "policies"
+# The inframe core library. Pin a revision for a reproducible build, or point
+# `path` at a checkout: core = { path = "/path/to/inframe/lean" }.
+core = { git = "https://github.com/by77er/inframe", rev = "main", subdir = "lean" }
+
+[providers.digitalocean]
+source = "digitalocean/digitalocean"
+version = "2.100.0"
+module_root = "DigitalOcean"
+
+[workspace]
+directory = ".inframe"
+graph_directory = ".inframe/graphs"
+
+[stacks.do]
+frontend = "lean"
+
+[stacks.do.backend]
+type = "local"

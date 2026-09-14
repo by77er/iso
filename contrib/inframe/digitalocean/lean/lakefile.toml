@@ -1,0 +1,28 @@
+name = "iso-fleet-digitalocean"
+version = "0.1.0"
+defaultTargets = ["IsoFleet"]
+
+# The core library; `inframe provider generate` writes a generated package
+# that points at the same core, so keep this in step with [lean.core] in
+# ../inframe.toml (a path for a local checkout, or git + rev + subDir).
+[[require]]
+name = "inframe"
+git = "https://github.com/by77er/inframe"
+rev = "main"
+subDir = "lean"
+
+[[require]]
+name = "generated-digitalocean"
+path = ".generated/digitalocean"
+
+[[lean_lib]]
+name = "IsoFleet"
+globs = ["IsoFleet.+"]
+
+[[lean_exe]]
+name = "infra"
+root = "IsoFleet.Main"
+
+[[lean_exe]]
+name = "policies"
+root = "IsoFleet.Policies"

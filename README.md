@@ -159,7 +159,7 @@ Without `ISO_SERVER` or credentials the extension leaves pi's tools local. `/iso
 
 ## More than one host
 
-`iso-fleetd` fronts any number of hosts with the same API each host serves, so `isoctl vm`, the pi extension and `iso-client` need only a different `ISO_SERVER`. Point it at hosts that share one admin CA, and it places, routes by id and keeps its record honest; see [docs/fleet.md](docs/fleet.md) and [`contrib/fleet/fleet.example.toml`](contrib/fleet/fleet.example.toml). Hosts stay exactly as above.
+`iso-fleetd` fronts any number of hosts with the same API each host serves, so `isoctl vm`, the pi extension and `iso-client` need only a different `ISO_SERVER`. Point it at hosts that share one admin CA, and it places, routes by id and keeps its record honest; see [docs/fleet.md](docs/fleet.md) and [`contrib/fleet/fleet.example.toml`](contrib/fleet/fleet.example.toml). Hosts stay exactly as above. [`contrib/inframe/digitalocean`](contrib/inframe/digitalocean/README.md) provisions a three-droplet test rig, one control host running the fleet, the proxy tier, the CA and the secrets service, and two VM hosts, and installs iso on it.
 
 ## Master web console
 
