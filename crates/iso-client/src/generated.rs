@@ -45,8 +45,9 @@ pub mod types {
         ///Domains routed through the egress proxy.
         #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
         pub allow: ::std::vec::Vec<::std::string::String>,
-        ///`allow`, `proxy` or `deny` (default). Unrecognized values mean
-        /// `deny`.
+        ///`proxy` or `deny` (default). Unrecognized values mean `deny`. There
+        /// is no direct mode: how much a VM may reach is its rules'
+        /// business (`allow https://*/**` opens everything, through the proxy).
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub egress: ::std::option::Option<::std::string::String>,
         ///Create under this id (hyphenated UUID or 32 hex digits) instead of a
@@ -293,7 +294,7 @@ pub mod types {
     pub struct PolicyRequest {
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub allow: ::std::option::Option<::std::vec::Vec<::std::string::String>>,
-        ///`allow`, `proxy` or `deny`; anything else leaves the mode unchanged.
+        ///`proxy` or `deny`; anything else leaves the mode unchanged.
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub egress: ::std::option::Option<::std::string::String>,
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
@@ -423,7 +424,7 @@ pub mod types {
     #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug)]
     pub struct Vm {
         pub allow: ::std::vec::Vec<::std::string::String>,
-        ///`allow`, `proxy` or `deny`.
+        ///`proxy` or `deny`.
         pub egress: ::std::string::String,
         pub id: ::std::string::String,
         pub ingress: ::std::vec::Vec<PortForward>,

@@ -82,7 +82,7 @@ code, so it composes with shell tooling the way `ssh host cmd` does.
 
 | Method and path | What it does |
 | --- | --- |
-| `POST /vms` | Create and boot. Body: `template`, plus optional `egress`, `ingress`, `labels`, `lifecycle`, `restart`, `vcpus`, `mem_mib`, `principal`, `allow`. |
+| `POST /vms` | Create and boot. Body: `template`, plus optional `egress` (`proxy` or `deny`), `ingress`, `labels`, `lifecycle`, `restart`, `vcpus`, `mem_mib`, `principal`, `allow`, `rules`. |
 | `GET /vms`, `GET /vms/{id}` | List, inspect. |
 | `POST /vms/{id}/start` · `stop` · `suspend` · `halt` | Lifecycle transitions; `409` when not valid in the current state. |
 | `DELETE /vms/{id}` | Destroy, whatever the lifecycle. |

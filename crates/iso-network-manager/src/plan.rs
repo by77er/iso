@@ -28,7 +28,7 @@ pub enum NftRule {
     AcceptEstablished,
     /// `ct state new iifname <iif> oifname <oif> accept` (inbound port-forwards)
     AcceptInbound { iif: String, oif: String },
-    /// `iifname <iif> oifname <oif> accept` (Allow egress)
+    /// `iifname <iif> oifname <oif> accept` (direct egress, the bake's builder only)
     AcceptEgress { iif: String, oif: String },
     /// `iifname <iif> ip daddr <daddr> accept` (services baseline, input)
     AcceptServices { iif: String, daddr: Ipv4Addr },
@@ -140,7 +140,7 @@ fn host_ruleset(fx: &NetworkFixture, policy: &NetworkPolicy, cfg: &Config) -> Ru
             to_port: f.vm_port,
         });
     }
-    if policy.egress == EgressMode::Proxy {
+    if policy.egress == EgressMode::Proxy && !policy.direct {
         // intercept after the in-netns SNAT (source is vp_ip). tcp+udp.
         for proto in [Protocol::Tcp, Protocol::Udp] {
             prerouting.push(NftRule::RedirectProxy {
@@ -165,7 +165,7 @@ fn host_ruleset(fx: &NetworkFixture, policy: &NetworkPolicy, cfg: &Config) -> Ru
             prefix: 16,
         },
     ];
-    if policy.egress == EgressMode::Allow {
+    if policy.direct && policy.egress != EgressMode::Deny {
         forward.push(NftRule::AcceptEgress {
             iif: vh.clone(),
             oif: up.clone(),
@@ -283,7 +283,7 @@ mod tests {
         fixture::derive(SlotId::new(slot).unwrap(), &ctx())
     }
     fn policy(egress: EgressMode, ingress: Vec<PortForward>) -> NetworkPolicy {
-        NetworkPolicy { egress, ingress }
+        NetworkPolicy { egress, ingress, direct: false }
     }
     fn forward_chain(rs: &Ruleset) -> &Vec<NftRule> {
         &rs.chains
@@ -324,11 +324,12 @@ mod tests {
     }
 
     #[test]
-    fn allow_permits_egress_and_routes_default() {
+    fn direct_permits_egress_and_routes_default_without_intercept() {
         let f = fx(1);
         let cfg = ctx();
-        let p = policy(EgressMode::Allow, vec![]);
+        let p = NetworkPolicy { direct: true, ..policy(EgressMode::Proxy, vec![]) };
         let host = host_ruleset(&f, &p, &cfg);
+        assert!(prerouting(&host).is_empty(), "nothing intercepted");
 
         assert!(forward_chain(&host).iter().any(|r| matches!(
             r,
@@ -403,7 +404,7 @@ mod tests {
     fn netns_always_snats_to_unique_vp() {
         let f = fx(5);
         let cfg = ctx();
-        for mode in [EgressMode::Allow, EgressMode::Proxy, EgressMode::Deny] {
+        for mode in [EgressMode::Proxy, EgressMode::Deny] {
             let rs = netns_ruleset(&f, &policy(mode, vec![]), &cfg);
             let post = &rs
                 .chains
@@ -425,7 +426,7 @@ mod tests {
     fn services_baseline_is_always_present() {
         let f = fx(1);
         let cfg = ctx();
-        for mode in [EgressMode::Allow, EgressMode::Proxy, EgressMode::Deny] {
+        for mode in [EgressMode::Proxy, EgressMode::Deny] {
             let host = host_ruleset(&f, &policy(mode, vec![]), &cfg);
             let input = &host
                 .chains

@@ -130,17 +130,32 @@ echo "iso-guest" > "$R/etc/hostname"
 printf '127.0.0.1 localhost\n127.0.1.1 iso-guest\n' > "$R/etc/hosts"
 printf '/dev/vda / ext4 defaults 0 1\n' > "$R/etc/fstab"
 
-# --- trust the egress proxy's CA, if the host has one yet ---
+# --- trust the egress proxy's CA, if the host has one yet. Every byte the
+#     guest sends outward is terminated by that proxy, so the CA goes into
+#     the system store and into every runtime that keeps its own. ---
 if [ -n "${CA_CERT:-}" ] && [ -f "$CA_CERT" ]; then
   install -m 0644 "$CA_CERT" "$R/usr/local/share/ca-certificates/iso-egress-proxy.crt"
   in_chroot update-ca-certificates >/dev/null 2>&1 || true
+  # Java keeps its own keystore; import there too when a JDK is installed.
+  if in_chroot sh -c 'command -v keytool >/dev/null'; then
+    in_chroot keytool -importcert -noprompt -trustcacerts -alias iso-egress-proxy \
+      -file /usr/local/share/ca-certificates/iso-egress-proxy.crt \
+      -cacerts -storepass changeit >/dev/null 2>&1 || true
+  fi
 fi
 
 # --- environment agents expect: a placeholder key the proxy overrides in
-#     flight, a UTF-8 locale, UTC ---
+#     flight, the proxy's CA for every runtime that does not read the system
+#     store (Python's certifi, Node, curl builds without a default), a UTF-8
+#     locale, UTC ---
 cat > "$R/etc/environment" <<'ENV'
 ANTHROPIC_API_KEY=iso-proxy-injects-the-real-key
+SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+SSL_CERT_DIR=/etc/ssl/certs
+REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
 LANG=C.UTF-8
 ENV
 echo 'LANG=C.UTF-8' > "$R/etc/default/locale"

@@ -19,6 +19,11 @@ pub struct SignedPolicy {
 pub struct IdentifyRequest {
     /// The connection's source IP (the VM's `vp` address).
     pub ip: String,
+    /// The address the VM dialled, when the caller needs to know what name
+    /// the VM resolved to it: a TCP connection to a port that carries no
+    /// SNI. The answer is in `dst_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -47,4 +52,9 @@ pub struct IdentifyResponse {
     /// An edge relays it to the tier, which trusts nothing else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed: Option<SignedPolicy>,
+    /// The name this VM resolved `dst` from through the host's DNS, if it
+    /// did and recently. What a `tunnel tcp://name:port` rule is matched
+    /// against for a connection that carries no SNI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst_name: Option<String>,
 }

@@ -77,6 +77,17 @@ What it does, in order:
    and a proxied request to `api.github.com` comes back with the token
    injected on the control host.
 
+## What a VM may reach
+
+Two egress modes, `proxy` and `deny`; nothing goes out except through the
+tier. Breadth is the rules' business: `allow https://api.github.com/**`
+terminates and injects for one host, `allow https://*/**` opens everything
+(still terminated, still logged), and `tunnel tcp://host:port` carries a
+plain TCP connection through as bytes: `tunnel tcp://github.com:22` for
+ssh, `tunnel tcp://postman-echo.com:80` for plain HTTP, `tunnel
+tcp://api.example:443` to let a pinned client see the real certificate. A
+tunnel is never injected into and is logged at connection level.
+
 ## Reading the access log
 
 The tier writes one JSON line per request and per tunnel (`ISO_LOG_FORMAT=json`

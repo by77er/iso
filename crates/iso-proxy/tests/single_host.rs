@@ -23,6 +23,16 @@ struct Single {
 }
 
 async fn start(rules: &[&str], principal: Option<&str>, egress: &str) -> Single {
+    start_custom(rules, principal, egress, |_| {}).await
+}
+
+/// `start`, with a last word on the configuration before it runs.
+async fn start_custom(
+    rules: &[&str],
+    principal: Option<&str>,
+    egress: &str,
+    tweak: impl FnOnce(&mut ProxyConfig),
+) -> Single {
     init();
     let dir = tempdir("single");
     let ca = TestCa::start(&dir, None).await;
@@ -43,6 +53,7 @@ async fn start(rules: &[&str], principal: Option<&str>, egress: &str) -> Single 
         .insert(UPSTREAM_HOST.into(), upstream.addr);
     cfg.watch_every = Duration::from_millis(50);
     cfg.host_id = "hostT".into();
+    tweak(&mut cfg);
     tokio::spawn(run_with_listeners(vec![listener], cfg));
     Single {
         proxy,
@@ -348,4 +359,102 @@ async fn every_request_and_tunnel_leaves_an_access_event() {
     // Its handshake was a request too, judged under wss.
     let hs = access_events().into_iter().filter(|e| e["path"] == "/ws" && e["upgrade"] == true).last().unwrap();
     assert_eq!((hs["scheme"].as_str(), hs["status"].as_u64()), (Some("wss"), Some(101)));
+}
+
+/// A connection to a port with no SNI is carried through as bytes when a
+/// `tunnel tcp://name:port` rule names the host the VM resolved the
+/// address from; with no name, or no rule, nothing is carried. Either way
+/// there is one access event.
+#[tokio::test]
+async fn tcp_passthrough_follows_tunnel_rules() {
+    let echo = TestTcpEcho::start().await;
+    let guest: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let dialled: std::net::Ipv4Addr = "10.9.9.9".parse().unwrap();
+
+    let s = start_custom(&["tunnel tcp://db.internal:5432"], Some("alice"), "proxy", |cfg| {
+        cfg.dst_lookup = fixed_dst("10.9.9.9:5432");
+        cfg.upstream_pins.insert("db.internal".into(), echo.addr);
+    })
+    .await;
+    s.resolver.name_dst(guest, dialled, "db.internal");
+    let mut c = tokio::net::TcpStream::connect(s.proxy).await.unwrap();
+    let payload = format!("hello {}", unique_path(""));
+    c.write_all(payload.as_bytes()).await.unwrap();
+    let mut back = vec![0u8; payload.len()];
+    c.read_exact(&mut back).await.unwrap();
+    assert_eq!(back, payload.as_bytes(), "carried through, byte for byte");
+    drop(c);
+    let n = payload.len() as u64;
+    eventually(
+        || access_events().iter().any(|e| e["kind"] == "tcp" && e["bytes_up"] == n),
+        Duration::from_secs(5),
+        "the tunnel's close is logged",
+    )
+    .await;
+    let t = access_events().into_iter().find(|e| e["kind"] == "tcp" && e["bytes_up"] == n).unwrap();
+    assert_eq!((t["host"].as_str(), t["port"].as_u64(), t["bytes_down"].as_u64()), (Some("db.internal"), Some(5432), Some(n)));
+    assert_eq!(t["principal"], "alice");
+
+    // The same address, never resolved by this VM: no name, nothing carried.
+    let s = start_custom(&["tunnel tcp://db.internal:5432"], None, "proxy", |cfg| {
+        cfg.dst_lookup = fixed_dst("10.9.9.9:5432");
+        cfg.upstream_pins.insert("db.internal".into(), echo.addr);
+    })
+    .await;
+    // The proxy closes without reading, so the guest sees EOF or a reset.
+    async fn nothing_back(proxy: SocketAddr) {
+        let mut c = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let _ = c.write_all(b"hello").await;
+        let mut buf = [0u8; 8];
+        match c.read(&mut buf).await {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!("{n} bytes came back through a refused connection"),
+        }
+    }
+    nothing_back(s.proxy).await;
+    eventually(
+        || access_events().iter().any(|e| e["phase"] == "tcp" && e["host"] == "10.9.9.9" && e["rule"].as_str().unwrap().starts_with("no name")),
+        Duration::from_secs(5),
+        "the refusal is logged with its reason",
+    )
+    .await;
+
+    // Resolved, but no tunnel rule for that host and port.
+    let s = start_custom(&["tunnel tcp://db.internal:5432"], None, "proxy", |cfg| {
+        cfg.dst_lookup = fixed_dst("10.9.9.9:5433");
+        cfg.upstream_pins.insert("db.internal".into(), echo.addr);
+    })
+    .await;
+    s.resolver.name_dst(guest, dialled, "db.internal");
+    nothing_back(s.proxy).await;
+    eventually(
+        || access_events().iter().any(|e| e["phase"] == "tcp" && e["host"] == "db.internal" && e["port"] == 5433 && e["rule"] == "no tunnel rule"),
+        Duration::from_secs(5),
+        "the missing rule is logged",
+    )
+    .await;
+}
+
+/// `tunnel tcp://host:443` carries the TLS session through untouched: the
+/// guest sees the upstream's own certificate and nothing is injected.
+#[tokio::test]
+async fn a_443_tunnel_rule_passes_tls_through_without_terminating() {
+    let s = start(&["tunnel tcp://api.example.test:443"], Some("alice"), "proxy").await;
+    // The guest trusts the upstream's CA, not the tier's: no MITM happened.
+    let client = guest_client(s.proxy, &s.upstream.ca_pem, true);
+    let path = unique_path("/passthrough");
+    let body: serde_json::Value = client.get(url(&path)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["path"], path);
+    assert!(body["headers"]["x-iso-injected"].is_null(), "nothing injected on a passthrough: {body}");
+    assert!(body["headers"]["authorization"].is_null());
+    // Through the tier's CA it does not verify: the proxy never minted a leaf.
+    let mitm = guest_client(s.proxy, &s.tier_ca, true);
+    assert!(mitm.get(url(&path)).send().await.is_err());
+    drop(client);
+    eventually(
+        || access_events().iter().any(|e| e["kind"] == "tcp" && e["host"] == UPSTREAM_HOST && e["port"] == 443),
+        Duration::from_secs(5),
+        "the passthrough's close is logged",
+    )
+    .await;
 }

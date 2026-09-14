@@ -130,6 +130,14 @@ impl WirePolicy {
 pub trait PolicyResolver: Send + Sync {
     /// Resolve the policy for a connection's source IP, or `None` if unknown.
     async fn resolve(&self, ip: IpAddr) -> Option<Policy>;
+
+    /// The name the VM at `ip` resolved `dst` from, for a connection that
+    /// carries no SNI. `None` when the VM never resolved it, which refuses
+    /// the connection: a `tunnel tcp://` rule names hosts, not addresses.
+    async fn resolve_dst(&self, ip: IpAddr, dst: std::net::Ipv4Addr) -> Option<String> {
+        let _ = (ip, dst);
+        None
+    }
 }
 
 /// A fixed policy for every source (tests / static single-tenant deployments).
@@ -173,7 +181,7 @@ impl PolicyResolver for RpcResolver {
 
         let pol = match iso_rpc::call_unix::<_, IdentifyResponse>(
             &self.sock,
-            &IdentifyRequest { ip: ip.to_string() },
+            &IdentifyRequest { ip: ip.to_string(), dst: None },
         )
         .await
         {
@@ -189,5 +197,23 @@ impl PolicyResolver for RpcResolver {
             .unwrap()
             .insert(ip, (Instant::now(), pol.clone()));
         pol
+    }
+
+    /// Not cached: the answer is per destination and the call is made once
+    /// per plain TCP connection, which is rare next to requests.
+    async fn resolve_dst(&self, ip: IpAddr, dst: std::net::Ipv4Addr) -> Option<String> {
+        match iso_rpc::call_unix::<_, IdentifyResponse>(
+            &self.sock,
+            &IdentifyRequest { ip: ip.to_string(), dst: Some(dst.to_string()) },
+        )
+        .await
+        {
+            Ok(resp) if resp.found => resp.dst_name,
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("identify rpc (dst) failed for {ip}: {e}");
+                None
+            }
+        }
     }
 }

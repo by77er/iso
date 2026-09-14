@@ -3,7 +3,9 @@
 //! - An authoritative local zone `iso.internal` answers `metadata.iso.internal`
 //!   with the services dummy IP, so guests can reach the metadata server by name.
 //!   (`.internal` avoids the `.local` mDNS reservation entirely.)
-//! - Everything else is forwarded to upstream resolvers.
+//! - Everything else is forwarded to upstream resolvers; A answers are
+//!   reported to an [`Observer`], the control plane's memory of what each VM
+//!   resolved, which is how a plain TCP connection gets a name.
 //!
 //! The control plane binds it on the dummy address (e.g. `172.22.0.1:53`), which
 //! the guest image uses as its nameserver.
@@ -24,22 +26,26 @@ use hickory_server::zone_handler::{AxfrPolicy, Catalog, MessageResponseBuilder, 
 use hickory_server::Server;
 use tokio::net::{TcpListener, UdpSocket};
 
-/// Decides whether a query should be steered to the egress proxy. Lets `Allow`
-/// VMs route their proxied domains (per-VM `allow`-list) to the proxy for
-/// credential injection while everything else resolves normally.
-pub trait RedirectResolver: Send + Sync + Unpin + 'static {
-    /// `Some(proxy_ip)` if `name` (queried by `src`) should resolve to the proxy.
-    fn redirect(&self, src: IpAddr, name: &str) -> Option<Ipv4Addr>;
+/// Told what a VM resolved: the A answers handed to `src` for `name`, and
+/// how long they are good for. The control plane keeps that memory so the
+/// proxy can put a name to an address a VM dials on a port that carries no
+/// SNI, and match it against `tunnel tcp://name:port` rules.
+pub trait Observer: Send + Sync + Unpin + 'static {
+    fn answered(&self, src: IpAddr, name: &str, addrs: &[Ipv4Addr], ttl_secs: u32);
 }
 
-/// Wraps the dual-horizon [`Catalog`] with per-source redirect-to-proxy.
-struct RedirectHandler {
+/// Answers A queries itself, through the upstream resolvers, so every
+/// answer can be observed; AAAA is NODATA (guests have no IPv6 route, and a
+/// passthrough needs the A answer we saw); everything else goes to the
+/// dual-horizon [`Catalog`].
+struct ObservedHandler {
     catalog: Catalog,
-    resolver: Arc<dyn RedirectResolver>,
+    resolver: hickory_resolver::TokioResolver,
+    observer: Arc<dyn Observer>,
 }
 
 #[async_trait::async_trait]
-impl RequestHandler for RedirectHandler {
+impl RequestHandler for ObservedHandler {
     async fn handle_request<R: ResponseHandler, T: Time>(
         &self,
         request: &Request,
@@ -47,39 +53,60 @@ impl RequestHandler for RedirectHandler {
     ) -> ResponseInfo {
         if let Ok(info) = request.request_info() {
             let qtype = info.query.query_type();
-            if matches!(qtype, RecordType::A | RecordType::AAAA) {
-                let name = info.query.name().to_string();
-                let domain = name.trim_end_matches('.');
-                if let Some(ip) = self.resolver.redirect(info.src.ip(), domain) {
-                    // A -> proxy; AAAA -> NODATA so the client falls back to A.
-                    let mut answers = Vec::new();
-                    if qtype == RecordType::A {
-                        let rec_name = Name::from(info.query.name().clone());
-                        answers.push(Record::from_rdata(rec_name, 5, RData::A(A(ip))));
-                    }
-                    let mut meta = Metadata::response_from_request(&request.metadata);
-                    meta.authoritative = true;
-                    meta.recursion_available = true;
-                    let err_meta = meta; // Metadata: Copy
-                    let builder = MessageResponseBuilder::from_message_request(request);
-                    let response = builder.build(
-                        meta,
-                        &answers,
-                        std::iter::empty::<&Record>(),
-                        std::iter::empty::<&Record>(),
-                        std::iter::empty::<&Record>(),
-                    );
-                    return match response_handle.send_response(response).await {
-                        Ok(info) => info,
-                        Err(error) => {
-                            tracing::error!(%error, "dns: send redirect response failed");
-                            ResponseInfo::from(Header {
-                                metadata: err_meta,
-                                counts: HeaderCounts::default(),
-                            })
+            let name = info.query.name().to_string();
+            let internal = name.to_ascii_lowercase().ends_with(LOCAL_ZONE);
+            if matches!(qtype, RecordType::A | RecordType::AAAA) && !internal {
+                let domain = name.trim_end_matches('.').to_ascii_lowercase();
+                let rec_name = Name::from(info.query.name().clone());
+                let mut answers = Vec::new();
+                if qtype == RecordType::A {
+                    match self.resolver.lookup(domain.as_str(), RecordType::A).await {
+                        Ok(lookup) => {
+                            let a_records: Vec<(Ipv4Addr, u32)> = lookup
+                                .answers()
+                                .iter()
+                                .filter_map(|r| match &r.data {
+                                    RData::A(A(ip)) => Some((*ip, r.ttl)),
+                                    _ => None,
+                                })
+                                .collect();
+                            let ttl = a_records.iter().map(|(_, t)| *t).min().unwrap_or(60);
+                            let addrs: Vec<Ipv4Addr> = a_records.iter().map(|(ip, _)| *ip).collect();
+                            self.observer.answered(info.src.ip(), &domain, &addrs, ttl);
+                            for ip in addrs {
+                                answers.push(Record::from_rdata(rec_name.clone(), ttl, RData::A(A(ip))));
+                            }
                         }
-                    };
+                        Err(e) => {
+                            tracing::debug!("dns: {domain}: {e}");
+                            // NXDOMAIN and the like: let the catalog answer
+                            // as it would have, so the client sees the same
+                            // error it always did.
+                            return self.catalog.handle_request::<R, T>(request, response_handle).await;
+                        }
+                    }
                 }
+                let mut meta = Metadata::response_from_request(&request.metadata);
+                meta.recursion_available = true;
+                let err_meta = meta;
+                let builder = MessageResponseBuilder::from_message_request(request);
+                let response = builder.build(
+                    meta,
+                    &answers,
+                    std::iter::empty::<&Record>(),
+                    std::iter::empty::<&Record>(),
+                    std::iter::empty::<&Record>(),
+                );
+                return match response_handle.send_response(response).await {
+                    Ok(info) => info,
+                    Err(error) => {
+                        tracing::error!(%error, "dns: send response failed");
+                        ResponseInfo::from(Header {
+                            metadata: err_meta,
+                            counts: HeaderCounts::default(),
+                        })
+                    }
+                };
             }
         }
         self.catalog
@@ -162,13 +189,29 @@ fn build_catalog(cfg: &Config) -> Result<Catalog, String> {
     Ok(catalog)
 }
 
-/// Run the dual-horizon DNS server with per-source redirect-to-proxy, until shutdown.
+/// The resolver A queries go through, so their answers can be observed.
+fn build_resolver(cfg: &Config) -> Result<hickory_resolver::TokioResolver, String> {
+    use hickory_resolver::config::ResolverConfig;
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
+    let rc = ResolverConfig::from_parts(
+        None,
+        Vec::new(),
+        cfg.upstreams.iter().map(|ip| NameServerConfig::udp_and_tcp(*ip)).collect(),
+    );
+    hickory_resolver::TokioResolver::builder_with_config(rc, TokioRuntimeProvider::default())
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Run the dual-horizon DNS server, telling `observer` what every VM
+/// resolved, until shutdown.
 pub async fn run(
     cfg: Config,
-    resolver: Arc<dyn RedirectResolver>,
+    observer: Arc<dyn Observer>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let catalog = build_catalog(&cfg)?;
-    let handler = RedirectHandler { catalog, resolver };
+    let resolver = build_resolver(&cfg)?;
+    let handler = ObservedHandler { catalog, resolver, observer };
     let mut server = Server::new(handler);
     server.register_socket(UdpSocket::bind(cfg.bind).await?);
     server.register_listener(TcpListener::bind(cfg.bind).await?, Duration::from_secs(5), 4096);

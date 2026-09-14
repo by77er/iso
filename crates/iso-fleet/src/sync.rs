@@ -106,6 +106,7 @@ async fn sync_host(fleet: &Fleet, client: crate::hosts::HostClient) {
                     match client.delete_vm(&r.id).await {
                         Ok(s) if s.is_success() || s == http::StatusCode::NOT_FOUND => {
                             let _ = fleet.store.delete_vm(&r.id);
+                            let _ = fleet.store.host_freed_slot(&name);
                             tracing::info!("vm {} deleted from {name} on retry", r.id);
                         }
                         Ok(s) => tracing::warn!("vm {}: {name} refused delete: {s}", r.id),

@@ -1,19 +1,25 @@
 # iso-proxy — Credential-injecting, policy-enforcing egress proxy
 
-The backend for the `Proxy` egress mode (and the injection path of `Allow`
-mode). A **transparent MITM HTTPS proxy** that (a) lets through *only* TLS,
-(b) enforces per-VM **URI-level rules** (default-deny, deny wins), (c) injects
-credential headers based on the VM's **principal**, and (d) tunnels WebSocket
-upgrades. One binary, three roles, so the same code runs on one host or as a
-stateless tier serving many.
+The one path out of a VM: every TCP connection a VM makes is intercepted
+and lands here (the other egress mode is `deny`). A **transparent MITM
+HTTPS proxy** that (a) terminates TLS only for hosts an allow rule names,
+(b) enforces per-VM **URI-level rules** (default-deny, deny wins), (c)
+injects credential headers based on the VM's **principal**, (d) tunnels
+WebSocket upgrades, and (e) carries a connection through as bytes, never
+terminated, where a `tunnel tcp://host:port` rule says so. One binary, three
+roles, so the same code runs on one host or as a stateless tier serving many.
 
 ## Guiding principles
 
 - **Guest-tamper-proof.** Enforcement lives in the host root netns + this proxy;
   the guest cannot reach or reconfigure either. The VM only ever sees a CA it
   trusts and a transparent redirect.
-- **TLS or nothing.** A connection that isn't a TLS `ClientHello` has no SNI,
-  hence no routable destination, hence is dropped.
+- **A name or nothing.** On port 443 the ClientHello's SNI names the host; a
+  connection that isn't TLS has no SNI, hence no routable destination, hence
+  is dropped. On any other port the name is what the VM resolved the
+  address from through the host's DNS (the only resolver it can reach); an
+  address it never resolved has no name and is refused. Rules name hosts,
+  never addresses.
 - **MITM everything.** Every allowed TLS connection is terminated and
   re-originated. The upstream leg is HTTPS only and webpki-validated (plus any
   operator-added roots); no code path can originate plaintext.
@@ -218,6 +224,24 @@ log is meant to be shipped. `iso-proxyd --log-format json` (or
 `RUST_LOG=iso_proxy::access=info` keeps the access log alone. On the tier
 `edge` is the name on the edge's certificate, so a line names the host a
 request came through even when the host lies.
+
+## Passthrough (`tunnel tcp://host:port`)
+
+The nftables intercept redirects every TCP port a VM dials to the proxy's
+listener; the kernel's conntrack keeps the original destination
+(`SO_ORIGINAL_DST`), which the edge or single-role proxy reads on accept.
+Port 443 goes through the ClientHello peek (`sni.rs`, which keeps the bytes
+so they can be replayed to whichever side reads next): a `tunnel
+tcp://host:443` rule for the SNI carries the TLS session through untouched,
+the guest sees the upstream's own certificate and nothing is injected;
+otherwise an allow rule terminates as before. Any other port asks the
+host's DNS memory (`identify` with `dst`) for the name the VM resolved the
+address from, and a `tunnel tcp://name:port` rule carries the connection
+to `name:port`, dialled by name on the proxy's side (pins apply). In the
+split, the edge puts the destination and its name in the CONNECT headers
+(`x-iso-dst`, `x-iso-dst-name`) and the tier does the rest, so the tier
+still needs no lookup. Every tunnel leaves one access event with the bytes
+each way; a refused connection leaves a `phase = tcp` event saying why.
 
 ## Failure modes
 

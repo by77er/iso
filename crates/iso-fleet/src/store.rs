@@ -198,6 +198,16 @@ impl Store {
         Ok(())
     }
 
+    /// The inverse, on a confirmed delete, so a create that follows places
+    /// on what is free now rather than what the last sync saw.
+    pub fn host_freed_slot(&self, name: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE hosts SET slots_free = MIN(slots_free + 1, slots_total) WHERE name=?1",
+            params![name],
+        )?;
+        Ok(())
+    }
+
     // ---- vms ----
 
     pub fn insert_vm(

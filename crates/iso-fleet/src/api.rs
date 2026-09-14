@@ -252,6 +252,7 @@ async fn delete_one(
     match client.delete_vm(&id).await {
         Ok(s) if s == StatusCode::NO_CONTENT || s == StatusCode::NOT_FOUND => {
             fleet.store.delete_vm(&id)?;
+            let _ = fleet.store.host_freed_slot(&row.host);
             Ok(StatusCode::NO_CONTENT.into_response())
         }
         Ok(s) => Err(ApiError(s, format!("{}: refused the delete", row.host))),
@@ -287,7 +288,7 @@ impl PolicyFields {
     /// From a create body: the host's defaults for what is absent.
     fn from_create(body: &Value) -> Self {
         let egress = match body["egress"].as_str() {
-            Some(e) if e == "allow" || e == "proxy" || e == "deny" => e.to_string(),
+            Some(e) if e == "proxy" || e == "deny" => e.to_string(),
             _ => "deny".to_string(),
         };
         Self {
@@ -323,7 +324,7 @@ impl PolicyFields {
             out.rules = strings(&change["rules"]);
         }
         if let Some(e) = change["egress"].as_str()
-            && (e == "allow" || e == "proxy" || e == "deny")
+            && (e == "proxy" || e == "deny")
         {
             out.egress = e.to_string();
         }

@@ -9,10 +9,12 @@
 //!
 //! ```text
 //! rule    := ("allow" | "deny") ws pattern
+//!          | ("tunnel" | "deny") ws "tcp://" host ":" port
 //! pattern := scheme "://" host [":" port] path
 //! scheme  := "https" | "wss"          both TLS; wss matches only Upgrade requests
 //! host    := label ("." label)*       exact
 //!          | "*." label ("." label)*  one or more leading labels, never the apex
+//!          | "*"                      any host
 //! path    := "/" segment*             "*" matches within one segment
 //!                                     "**" matches across segments (last only)
 //! ```
@@ -29,6 +31,12 @@
 //! - Query strings are never matched; callers strip them.
 //! - The legacy allow-list is sugar: `allow: ["h"]` means
 //!   `allow https://h/**` plus `allow wss://h/**`.
+//! - `tunnel tcp://host:port` is a passthrough: a TCP connection to that
+//!   host and port is carried as bytes, never terminated, never injected
+//!   into, and logged at connection level. On port 443 the host is the SNI
+//!   and a tunnel rule takes precedence over terminating; on any other port
+//!   the host is the name the guest resolved for the address it dialled.
+//!   `deny tcp://host:port` wins over a tunnel rule, as deny always does.
 
 pub mod signed;
 
@@ -38,10 +46,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
-    #[error("rule must start with `allow` or `deny`: {0:?}")]
+    #[error("rule must start with `allow`, `deny` or `tunnel`: {0:?}")]
     Action(String),
-    #[error("pattern must be `https://host/path` or `wss://host/path`: {0:?}")]
+    #[error("pattern must be `https://host/path`, `wss://host/path` or `tcp://host:port`: {0:?}")]
     Scheme(String),
+    #[error("{0}")]
+    Tunnel(String),
     #[error("invalid host {0:?}: {1}")]
     Host(String, &'static str),
     #[error("invalid port in {0:?}")]
@@ -55,6 +65,8 @@ pub enum ParseError {
 pub enum Action {
     Allow,
     Deny,
+    /// Carry a TCP connection through as bytes (`tcp://` rules only).
+    Tunnel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -64,6 +76,8 @@ pub enum Scheme {
     Https,
     /// A WebSocket upgrade request over TLS.
     Wss,
+    /// A raw TCP connection, passed through (`tunnel` and `deny` only).
+    Tcp,
 }
 
 impl Scheme {
@@ -71,6 +85,7 @@ impl Scheme {
         match self {
             Scheme::Https => "https",
             Scheme::Wss => "wss",
+            Scheme::Tcp => "tcp",
         }
     }
 }
@@ -82,6 +97,8 @@ pub enum HostPattern {
     Exact(String),
     /// `*.suffix`: matches `a.suffix`, `a.b.suffix`, never `suffix`.
     Subdomains(String),
+    /// `*`: any host at all. `allow https://*/**` is the open policy.
+    Any,
 }
 
 impl HostPattern {
@@ -91,12 +108,15 @@ impl HostPattern {
         if s.is_empty() {
             return Err(ParseError::Host(raw, "empty"));
         }
+        if s == "*" {
+            return Ok(HostPattern::Any);
+        }
         let (wild, name) = match s.strip_prefix("*.") {
             Some(rest) => (true, rest),
             None => (false, s.as_str()),
         };
         if name.is_empty() || name.contains('*') {
-            return Err(ParseError::Host(raw, "`*` is only valid as a leading `*.`"));
+            return Err(ParseError::Host(raw, "`*` is only valid alone or as a leading `*.`"));
         }
         if name.starts_with('.') || name.ends_with('.') || name.contains("..") {
             return Err(ParseError::Host(raw, "malformed labels"));
@@ -123,6 +143,7 @@ impl HostPattern {
                     && host.ends_with(suffix.as_str())
                     && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
             }
+            HostPattern::Any => !host.is_empty(),
         }
     }
 
@@ -131,7 +152,7 @@ impl HostPattern {
     pub fn literal(&self) -> Option<&str> {
         match self {
             HostPattern::Exact(h) => Some(h),
-            HostPattern::Subdomains(_) => None,
+            HostPattern::Subdomains(_) | HostPattern::Any => None,
         }
     }
 }
@@ -141,6 +162,7 @@ impl fmt::Display for HostPattern {
         match self {
             HostPattern::Exact(h) => f.write_str(h),
             HostPattern::Subdomains(s) => write!(f, "*.{s}"),
+            HostPattern::Any => f.write_str("*"),
         }
     }
 }
@@ -237,7 +259,8 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// Parse `allow https://host/path` or `deny wss://host:port/path`.
+    /// Parse `allow https://host/path`, `deny wss://host:port/path` or
+    /// `tunnel tcp://host:port`.
     pub fn parse(s: &str) -> Result<Self, ParseError> {
         let s = s.trim();
         let (action, rest) = match s.split_once(char::is_whitespace) {
@@ -247,13 +270,25 @@ impl Rule {
         let action = match action {
             "allow" => Action::Allow,
             "deny" => Action::Deny,
+            "tunnel" => Action::Tunnel,
             _ => return Err(ParseError::Action(s.to_string())),
         };
         let (scheme, rest) = match rest.split_once("://") {
             Some(("https", r)) => (Scheme::Https, r),
             Some(("wss", r)) => (Scheme::Wss, r),
+            Some(("tcp", r)) => (Scheme::Tcp, r),
             _ => return Err(ParseError::Scheme(rest.to_string())),
         };
+        match (action, scheme) {
+            (Action::Tunnel, Scheme::Tcp) | (Action::Deny, Scheme::Tcp) => {}
+            (Action::Tunnel, _) => {
+                return Err(ParseError::Tunnel(format!("`tunnel` takes a `tcp://host:port` pattern: {s:?}")));
+            }
+            (Action::Allow, Scheme::Tcp) => {
+                return Err(ParseError::Tunnel(format!("a tcp:// pattern is `tunnel`led, not allowed: {s:?}")));
+            }
+            _ => {}
+        }
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
@@ -268,6 +303,14 @@ impl Rule {
             ),
             None => (authority, None),
         };
+        if scheme == Scheme::Tcp {
+            if port.is_none() {
+                return Err(ParseError::Tunnel(format!("a tcp:// rule names a port: {s:?}")));
+            }
+            if path != "/" {
+                return Err(ParseError::Tunnel(format!("a tcp:// rule has no path: {s:?}")));
+            }
+        }
         Ok(Rule {
             action,
             scheme,
@@ -290,10 +333,14 @@ impl fmt::Display for Rule {
         let action = match self.action {
             Action::Allow => "allow",
             Action::Deny => "deny",
+            Action::Tunnel => "tunnel",
         };
         write!(f, "{action} {}://{}", self.scheme.as_str(), self.host)?;
         if let Some(p) = self.port {
             write!(f, ":{p}")?;
+        }
+        if self.scheme == Scheme::Tcp {
+            return Ok(());
         }
         write!(f, "{}", self.path)
     }
@@ -407,7 +454,7 @@ impl RuleSet {
             }
             match r.action {
                 Action::Deny => return Decision::Deny(Some(r.to_string())),
-                Action::Allow => allowed = true,
+                Action::Allow | Action::Tunnel => allowed = true,
             }
         }
         if allowed {
@@ -415,6 +462,12 @@ impl RuleSet {
         } else {
             Decision::Deny(None)
         }
+    }
+
+    /// Whether a TCP connection to `host:port` is to be carried through as
+    /// bytes: a `tunnel tcp://` rule matches and no `deny tcp://` does.
+    pub fn tunnel_allowed(&self, host: &str, port: u16) -> bool {
+        self.evaluate(Scheme::Tcp, host, Some(port), "/").is_allow()
     }
 
     /// The literal (non-wildcard) hosts named by allow rules, for callers
@@ -451,6 +504,34 @@ mod tests {
             "deny https://example.com/",
         ] {
             assert_eq!(Rule::parse(s).unwrap().to_string(), s, "{s}");
+        }
+    }
+
+    #[test]
+    fn any_host_and_tunnel_rules() {
+        let open = rs(&["allow https://*/**"]);
+        assert!(open.host_allowed("anything.example"));
+        assert!(open.evaluate(Scheme::Https, "x.y.z", None, "/a/b").is_allow());
+        assert!(!open.evaluate(Scheme::Wss, "x.y.z", None, "/").is_allow(), "wss is its own scheme");
+        assert_eq!(open.to_strings(), vec!["allow https://*/**"]);
+        assert!(open.literal_allow_hosts().is_empty());
+
+        let t = rs(&["tunnel tcp://db.internal:5432", "tunnel tcp://*.git.example:22", "deny tcp://bad.git.example:22"]);
+        assert!(t.tunnel_allowed("db.internal", 5432));
+        assert!(!t.tunnel_allowed("db.internal", 5433), "the port is part of the rule");
+        assert!(t.tunnel_allowed("a.git.example", 22));
+        assert!(!t.tunnel_allowed("bad.git.example", 22), "deny wins");
+        assert!(!t.tunnel_allowed("git.example", 22), "never the apex");
+        assert!(!t.host_allowed("db.internal"), "a tunnel is not a licence to terminate");
+        assert!(!t.evaluate(Scheme::Https, "db.internal", Some(5432), "/").is_allow());
+        assert_eq!(
+            t.to_strings(),
+            vec!["deny tcp://bad.git.example:22", "tunnel tcp://*.git.example:22", "tunnel tcp://db.internal:5432"]
+        );
+        assert_eq!(Rule::parse(" tunnel  tcp://h.example:443/ ").unwrap().to_string(), "tunnel tcp://h.example:443");
+
+        for bad in ["tunnel https://h/**", "allow tcp://h:22", "tunnel tcp://h", "tunnel tcp://h:22/path", "tunnel tcp://h:99999"] {
+            assert!(Rule::parse(bad).is_err(), "{bad}");
         }
     }
 

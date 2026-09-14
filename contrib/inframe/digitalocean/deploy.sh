@@ -192,7 +192,7 @@ host() { # name public private
   "${SSH[@]}" "root@$ip" "ssh-keygen -q -t ed25519 -N '' -f /opt/iso/guest_ed25519 </dev/null 2>/dev/null || true; cat /opt/iso/guest_ed25519.pub > /opt/iso/authorized_keys"
   "${SSH[@]}" "root@$ip" "cat > /etc/iso/edge.toml" <<EOT
 role = "edge"
-listen = ["172.22.0.1:3128", "172.22.0.1:443"]
+listen = ["172.22.0.1:3128"]
 host_id = "$name"
 [identify]
 socket = "/var/lib/iso/identify.sock"

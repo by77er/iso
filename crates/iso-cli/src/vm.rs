@@ -119,7 +119,8 @@ pub struct Create {
     /// Stored as the `name` label and shown to the guest's metadata.
     #[arg(long)]
     name: Option<String>,
-    /// `allow`, `proxy` or `deny` (default).
+    /// `proxy` or `deny` (default). Breadth is the rules' business:
+    /// `--rule 'allow https://*/**'` opens everything, through the proxy.
     #[arg(long, default_value = "deny")]
     egress: String,
     #[arg(long)]

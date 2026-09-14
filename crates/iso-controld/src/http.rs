@@ -107,7 +107,9 @@ struct CreateVmRequest {
     id: Option<String>,
     /// A registered template name.
     template: String,
-    /// `allow`, `proxy` or `deny` (default). Unrecognized values mean `deny`.
+    /// `proxy` or `deny` (default). Unrecognized values mean `deny`. There is
+    /// no direct mode: how much a VM may reach is its rules' business
+    /// (`allow https://*/**` opens everything, through the proxy).
     #[serde(default)]
     egress: String,
     /// Ports to forward into the VM; host ports are allocated.
@@ -200,7 +202,7 @@ struct Vm {
     template: String,
     /// `creating`, `running`, `suspended`, `stopped` or `failed`.
     state: String,
-    /// `allow`, `proxy` or `deny`.
+    /// `proxy` or `deny`.
     egress: String,
     /// `ephemeral` or `durable`.
     lifecycle: String,
@@ -231,7 +233,7 @@ struct PolicyRequest {
     /// Replace the URI-level rules. A rule that does not parse is a 400.
     #[serde(default)]
     rules: Option<Vec<String>>,
-    /// `allow`, `proxy` or `deny`; anything else leaves the mode unchanged.
+    /// `proxy` or `deny`; anything else leaves the mode unchanged.
     #[serde(default)]
     egress: Option<String>,
     /// A fleet's signature over the resulting policy at the next generation,
@@ -342,7 +344,6 @@ fn proto_from(s: &str) -> Protocol {
 }
 fn egress_from(s: &str) -> EgressMode {
     match s {
-        "allow" => EgressMode::Allow,
         "proxy" => EgressMode::Proxy,
         _ => EgressMode::Deny,
     }
@@ -903,7 +904,7 @@ pub(crate) mod tests {
         // create
         let resp = app
             .clone()
-            .oneshot(post("/vms", serde_json::json!({"template":"base","egress":"allow"})))
+            .oneshot(post("/vms", serde_json::json!({"template":"base","egress":"proxy"})))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -918,7 +919,7 @@ pub(crate) mod tests {
             .unwrap();
         let list = body_json(resp).await;
         assert_eq!(list.as_array().unwrap().len(), 1);
-        assert_eq!(list[0]["egress"], "allow");
+        assert_eq!(list[0]["egress"], "proxy");
         assert_eq!(list[0]["state"], "running");
 
         // stats

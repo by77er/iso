@@ -66,13 +66,24 @@ impl Conn {
     }
 
     /// A tunnel (a WebSocket after its 101, a TCP passthrough) that ended.
-    pub fn tunnel_closed(&self, kind: &str, host: &str, path: &str, up: u64, down: u64, duration: Duration) {
+    pub fn tunnel_closed(&self, kind: &str, host: &str, port: u16, path: &str, up: u64, down: u64, duration: Duration) {
         tracing::info!(
             target: TARGET,
             src = %self.src, edge = %self.edge, vm = %self.vm, principal = %self.principal,
-            kind, host, path, bytes_up = up, bytes_down = down,
+            kind, host, port, path, bytes_up = up, bytes_down = down,
             duration_ms = duration.as_millis() as u64,
             "tunnel"
+        );
+    }
+
+    /// A TCP connection refused before any byte was carried: no tunnel rule
+    /// for the host and port, or no name for the address at all.
+    pub fn tcp_denied(&self, host: &str, port: u16, why: &str) {
+        tracing::info!(
+            target: TARGET,
+            src = %self.src, edge = %self.edge, vm = %self.vm, principal = %self.principal,
+            host, port, decision = "deny", phase = "tcp", rule = why,
+            "tcp"
         );
     }
 }

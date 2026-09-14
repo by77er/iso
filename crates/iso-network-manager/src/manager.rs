@@ -127,8 +127,9 @@ mod tests {
             proto: Protocol::Tcp,
         };
         let policy = NetworkPolicy {
-            egress: EgressMode::Allow,
+            egress: EgressMode::Proxy,
             ingress: vec![f, f],
+            direct: false,
         };
         assert!(matches!(
             m.plan(slot(1), &policy),
@@ -140,7 +141,8 @@ mod tests {
     fn distinct_forwards_are_accepted() {
         let m = Manager::default();
         let policy = NetworkPolicy {
-            egress: EgressMode::Allow,
+            egress: EgressMode::Proxy,
+            direct: false,
             ingress: vec![
                 PortForward {
                     host_port: 8080,
@@ -246,7 +248,8 @@ mod tests {
 
         let s = slot(4242); // -> vm1092 / iso_vm1092
         let policy = NetworkPolicy {
-            egress: EgressMode::Allow,
+            egress: EgressMode::Proxy,
+            direct: true,
             ingress: vec![PortForward {
                 host_port: 18080,
                 vm_port: 80,

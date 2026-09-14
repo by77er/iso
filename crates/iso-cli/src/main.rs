@@ -427,13 +427,17 @@ async fn bake(b: Bake) -> R<()> {
     let net = iso_network_manager::Manager::new(ncfg.clone());
     net.init().await?;
     let slot = SlotId::new(b.slot)?;
-    // Provisioning needs network; otherwise the builder needs no egress.
+    // Provisioning needs network; otherwise the builder needs no egress. The
+    // builder is host tooling on a slot no VM occupies: it has no policy and
+    // no proxy identity, so it goes out directly. Every VM goes through the
+    // proxy.
     let policy = if b.provision.is_empty() {
         NetworkPolicy::default()
     } else {
         NetworkPolicy {
-            egress: EgressMode::Allow,
+            egress: EgressMode::Proxy,
             ingress: Vec::new(),
+            direct: true,
         }
     };
     let fixture = net.apply(slot, &policy).await?;

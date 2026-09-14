@@ -1232,7 +1232,7 @@
           },
           "egress": {
             "type": "string",
-            "description": "`allow`, `proxy` or `deny` (default). Unrecognized values mean `deny`."
+            "description": "`proxy` or `deny` (default). Unrecognized values mean `deny`. There is\nno direct mode: how much a VM may reach is its rules' business\n(`allow https://*/**` opens everything, through the proxy)."
           },
           "id": {
             "type": "string",
@@ -1512,7 +1512,7 @@
           },
           "egress": {
             "type": "string",
-            "description": "`allow`, `proxy` or `deny`; anything else leaves the mode unchanged.",
+            "description": "`proxy` or `deny`; anything else leaves the mode unchanged.",
             "nullable": true
           },
           "principal": {
@@ -1752,7 +1752,7 @@
           },
           "egress": {
             "type": "string",
-            "description": "`allow`, `proxy` or `deny`."
+            "description": "`proxy` or `deny`."
           },
           "id": {
             "type": "string"

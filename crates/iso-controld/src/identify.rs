@@ -14,7 +14,11 @@ use iso_control_plane::types::egress_str;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 
-pub async fn serve<N, S, R>(cp: Arc<ControlPlane<N, S, R>>, sock: &Path) -> std::io::Result<()>
+pub async fn serve<N, S, R>(
+    cp: Arc<ControlPlane<N, S, R>>,
+    dns: Arc<crate::dns_memory::DnsMemory>,
+    sock: &Path,
+) -> std::io::Result<()>
 where
     N: NetworkManager + Send + Sync + 'static,
     S: StorageManager + Send + Sync + 'static,
@@ -26,19 +30,20 @@ where
     loop {
         let (mut conn, _) = listener.accept().await?;
         let cp = cp.clone();
+        let dns = dns.clone();
         tokio::spawn(async move {
             let mut buf = Vec::new();
             if conn.read_to_end(&mut buf).await.is_err() {
                 return;
             }
-            let resp = handle(&cp, &buf);
+            let resp = handle(&cp, &dns, &buf);
             let _ = conn.write_all(&resp).await;
             let _ = conn.shutdown().await;
         });
     }
 }
 
-fn handle<N, S, R>(cp: &ControlPlane<N, S, R>, req: &[u8]) -> Vec<u8>
+fn handle<N, S, R>(cp: &ControlPlane<N, S, R>, dns: &crate::dns_memory::DnsMemory, req: &[u8]) -> Vec<u8>
 where
     N: NetworkManager + Send + Sync + 'static,
     S: StorageManager + Send + Sync + 'static,
@@ -48,6 +53,11 @@ where
         let req: IdentifyRequest = serde_json::from_slice(req).ok()?;
         let ip: Ipv4Addr = req.ip.parse().ok()?;
         let rec = cp.identify(ip).ok()??;
+        let dst_name = req
+            .dst
+            .as_deref()
+            .and_then(|d| d.parse::<Ipv4Addr>().ok())
+            .and_then(|d| dns.name_for(ip, d));
         // The stored policy was validated on the way in; a record that still
         // fails to compile is served as "no rules" rather than as "no VM", so
         // the failure is a denied connection and a log line, not a mystery.
@@ -67,6 +77,7 @@ where
             rules,
             policy_gen: rec.policy_gen,
             signed: rec.signed,
+            dst_name,
         })
     })()
     .unwrap_or_default();

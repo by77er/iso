@@ -21,6 +21,8 @@
 //! URI rules, inject credentials, and forward or tunnel.
 
 pub mod access;
+pub mod dst;
+pub mod sni;
 pub mod ca;
 pub mod edge;
 pub mod policy;
@@ -118,9 +120,9 @@ impl std::str::FromStr for Role {
 /// constructors below fill in the right ones.
 pub struct ProxyConfig {
     pub role: Role,
-    /// Addresses to accept on: the nft Proxy-mode DNAT target and the
-    /// DNS-steer target for Allow mode (`single`, `edge`), or the address
-    /// edges dial (`proxy`).
+    /// Addresses to accept on: the nft intercept target, every TCP port a
+    /// VM dials lands there (`single`, `edge`), or the address edges dial
+    /// (`proxy`).
     pub listen: Vec<SocketAddr>,
     /// This host's name in the tunnel headers (`edge`) and in logs.
     pub host_id: String,
@@ -157,6 +159,9 @@ pub struct ProxyConfig {
     /// check are still the host's.
     pub upstream_pins: std::collections::HashMap<String, SocketAddr>,
     pub handshake_timeout: Duration,
+    /// How a guest connection's original destination is learned (`single`,
+    /// `edge`): the kernel's conntrack record by default.
+    pub dst_lookup: dst::DstLookup,
 }
 
 impl ProxyConfig {
@@ -179,6 +184,7 @@ impl ProxyConfig {
             extra_upstream_roots: Vec::new(),
             upstream_pins: std::collections::HashMap::new(),
             handshake_timeout: Duration::from_secs(10),
+            dst_lookup: dst::kernel_lookup(),
         }
     }
 
@@ -255,6 +261,8 @@ struct Ctx {
     /// Upstream client pinned to http/1.1, for upgrades.
     client_h1: UpstreamClient,
     handshake_timeout: Duration,
+    /// Hosts dialled at a fixed address, for passthroughs as for requests.
+    pins: Arc<std::collections::HashMap<String, SocketAddr>>,
 }
 
 /// Everything a running proxy holds, for whichever role.
@@ -330,6 +338,7 @@ fn build_runtime(cfg: ProxyConfig) -> std::io::Result<Runtime> {
                 client,
                 client_h1,
                 handshake_timeout: cfg.handshake_timeout,
+                pins: Arc::new(cfg.upstream_pins.clone()),
             })
         }
         Role::Edge => None,
@@ -439,8 +448,9 @@ async fn single_conn(tcp: TcpStream, peer: SocketAddr, rt: Arc<Runtime>) {
         Arc::new(move |h| registry.register(ip, &policy, h))
     };
     let conn = access::Conn::new(peer.ip(), &rt.cfg.host_id, &policy);
+    let dst = lookup_dst(&rt, &tcp, peer.ip()).await;
     let task = tokio::spawn(async move {
-        if let Err(e) = serve_conn(tcp, conn, policy, ctx, Some(on_task)).await {
+        if let Err(e) = serve_conn(tcp, conn, policy, ctx, Some(on_task), dst).await {
             tracing::debug!("conn {peer} ended: {e}");
         }
     });
@@ -462,8 +472,9 @@ async fn edge_conn(tcp: TcpStream, peer: SocketAddr, rt: Arc<Runtime>) {
     let tier = rt.tier.clone().expect("edge has a tier");
     let registry = rt.registry.clone();
     let policy_for_reg = policy.clone();
+    let dst = lookup_dst(&rt, &tcp, peer.ip()).await;
     let task = tokio::spawn(async move {
-        let mut upstream = match tier.open(peer, &policy).await {
+        let mut upstream = match tier.open(peer, &policy, &dst).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("edge: tier unreachable for {peer}: {e}");
@@ -549,6 +560,7 @@ fn accept_stream(
         }
     };
     let src = decoded.src.map(|s| s.ip()).unwrap_or(edge.ip());
+    let dst = decoded.dst.clone();
     let policy = match verifier {
         Some(v) => {
             let Some(signed) = decoded.policy.signed else {
@@ -600,7 +612,7 @@ fn accept_stream(
                 return;
             }
         };
-        if let Err(e) = serve_conn(stream, conn, policy, ctx, None).await {
+        if let Err(e) = serve_conn(stream, conn, policy, ctx, None, dst).await {
             tracing::debug!("conn {src} via {edge} ended: {e}");
         }
     });
@@ -610,29 +622,104 @@ fn accept_stream(
         .unwrap()
 }
 
-/// Serve one guest connection: SNI gate, mint, terminate, then requests.
-async fn serve_conn<S>(
+/// The destination a guest connection was dialling and, for a port that
+/// carries no SNI, the name the VM resolved it from.
+async fn lookup_dst(rt: &Runtime, tcp: &TcpStream, src: std::net::IpAddr) -> dst::Dst {
+    let addr = (rt.cfg.dst_lookup)(tcp);
+    let mut d = dst::Dst { addr, name: None };
+    if let Some(a) = addr
+        && a.port() != 443
+        && let Some(resolver) = &rt.cfg.resolver
+    {
+        d.name = resolver.resolve_dst(src, *a.ip()).await;
+    }
+    d
+}
+
+/// Carry a connection through as bytes: dial `host:port` (a pin first, then
+/// DNS), replay what was peeked, copy both ways until either side is done,
+/// and log the tunnel. Nothing is terminated and nothing is injected.
+async fn passthrough<S>(
     stream: S,
+    prefix: Vec<u8>,
+    conn: &access::Conn,
+    ctx: &Ctx,
+    host: &str,
+    port: u16,
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
+    let addr = match ctx.pins.get(host) {
+        Some(a) => *a,
+        None => match tokio::net::lookup_host((host, port)).await.ok().and_then(|mut it| it.next()) {
+            Some(a) => a,
+            None => {
+                conn.tcp_denied(host, port, "does not resolve");
+                return Ok(());
+            }
+        },
+    };
+    let mut upstream = match tokio::time::timeout(ctx.handshake_timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => ws::Metered::new(s),
+        _ => {
+            conn.tcp_denied(host, port, "unreachable");
+            return Ok(());
+        }
+    };
+    let mut guest = ws::Metered::new(sni::Prefixed::new(prefix, stream));
+    let (to_guest, to_upstream) = (guest.written(), upstream.written());
+    if let Err(e) = tokio::io::copy_bidirectional(&mut guest, &mut upstream).await {
+        tracing::debug!("tcp tunnel to {host}:{port} ended: {e}");
+    }
+    conn.tunnel_closed("tcp", host, port, "", to_upstream.load(Relaxed), to_guest.load(Relaxed), started.elapsed());
+    Ok(())
+}
+
+/// Serve one guest connection. A port with no SNI is a passthrough or
+/// nothing; on 443 the ClientHello's SNI decides between a passthrough
+/// (`tunnel tcp://host:443`), terminating (an allow rule names the host)
+/// and dropping.
+async fn serve_conn<S>(
+    mut stream: S,
     conn: access::Conn,
     policy: Policy,
     ctx: Ctx,
     on_task: Option<OnTask>,
+    dst: dst::Dst,
 ) -> Result<(), BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let port = dst.port();
+    if port != 443 {
+        let Some(host) = dst.name.clone() else {
+            conn.tcp_denied(&dst.label(), port, "no name: the address was not resolved through the host");
+            return Ok(());
+        };
+        if !policy.rules.tunnel_allowed(&host, port) {
+            conn.tcp_denied(&host, port, "no tunnel rule");
+            return Ok(());
+        }
+        return passthrough(stream, Vec::new(), &conn, &ctx, &host, port).await;
+    }
+
     // Peek the ClientHello: non-TLS never produces one → dropped here.
-    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
-    let handshake = match tokio::time::timeout(ctx.handshake_timeout, acceptor).await {
-        Ok(Ok(h)) => h,
-        Ok(Err(_)) => return Ok(()), // not TLS
-        Err(_) => return Ok(()),     // never sent a ClientHello
+    let peeked = match sni::peek(&mut stream, ctx.handshake_timeout).await {
+        Ok(p) => p,
+        Err(_) => return Ok(()), // never sent a ClientHello
+    };
+    let sni = match (peeked.is_tls, peeked.sni.clone()) {
+        (true, Some(s)) => s,
+        _ => return Ok(()), // not TLS, or no SNI → unroutable
     };
 
-    let sni = match handshake.client_hello().server_name() {
-        Some(s) => s.to_string(),
-        None => return Ok(()), // no SNI → unroutable
-    };
+    // A tunnel rule for the host carries the TLS session through untouched.
+    if policy.rules.tunnel_allowed(&sni, 443) {
+        return passthrough(stream, peeked.bytes, &conn, &ctx, &sni, 443).await;
+    }
 
     // Host phase: is there any allow rule this host could satisfy? A host
     // with no allow rule is never terminated and never gets a certificate.
@@ -640,6 +727,14 @@ where
         conn.sni_denied(&sni);
         return Ok(());
     }
+
+    let stream = sni::Prefixed::new(peeked.bytes, stream);
+    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
+    let handshake = match tokio::time::timeout(ctx.handshake_timeout, acceptor).await {
+        Ok(Ok(h)) => h,
+        Ok(Err(_)) => return Ok(()),
+        Err(_) => return Ok(()),
+    };
 
     // Mint (fail-closed) and terminate.
     let server_cfg = match ctx.ca.server_config(&sni).await {

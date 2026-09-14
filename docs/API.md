@@ -70,7 +70,9 @@ Returned by `GET /vms` and `GET /vms/{id}`.
 `slot`, `tap`, and `rootfs_device` are `null` while the VM holds no placement (state `stopped`).
 `state` is one of `creating`, `running`, `suspended`, `stopped`, `failed` — note that `failed` is
 defined but never currently produced, so clients should treat it as reserved. `egress` is
-`allow`, `proxy`, or `deny`.
+`proxy` or `deny`: every byte a VM sends outward goes through the proxy, where its rules decide
+(`allow https://*/**` is the open policy; `tunnel tcp://host:port` carries a plain TCP connection
+through as bytes). There is no direct mode.
 
 ### `POST /vms` — create and boot a VM
 
@@ -139,8 +141,9 @@ All three fields are optional; omitted fields are left unchanged. An `egress` va
 parse is *ignored* rather than rejected. Takes effect on a live VM without a restart.
 
 `principal` selects which credential set `iso-secretsd` injects for this VM's proxied requests, and
-`allow` is the exact-match domain allow-list the proxy enforces (default deny). **There is no
-ownership check**: any caller may set any VM's principal to any string.
+`allow` is the exact-match domain allow-list the proxy enforces (default deny), sugar for
+`allow https://host/**` plus `allow wss://host/**` in `rules`. **There is no ownership check**:
+any caller may set any VM's principal to any string.
 
 **`204 No Content`**.
 
@@ -250,15 +253,13 @@ The metadata service exposes no secrets, no credentials, and no write operations
 - Authoritative for the `iso.internal.` zone, which contains a single A record,
   `metadata.iso.internal` → `172.22.0.1`. Zone transfers (AXFR) are refused.
 - Everything else is forwarded upstream (default `1.1.1.1`, `8.8.8.8`). No DNSSEC validation.
-- **Selective redirect:** for a VM in `allow` egress mode, an A query for a name that appears
-  exactly in that VM's `allow` list is answered with the proxy's address instead of the real one,
-  with a 5-second TTL, so that traffic is routed through credential injection. The matching AAAA
-  query returns NODATA so clients fall back to A. Matching is case-sensitive exact string equality,
-  so a mixed-case query silently misses the redirect and resolves normally.
-- VMs in `proxy` mode are **not** affected by this redirect: their traffic is intercepted at the
-  network layer by nftables regardless of what DNS returns, so DNS is not a security boundary for
-  them. For `allow`-mode VMs the redirect is a credential-injection convenience, not a restriction —
-  those VMs have unrestricted direct egress either way.
+- **Every A answer is remembered**, per VM, for at least ten minutes: `(VM, address) → name`.
+  A VM's traffic is intercepted at the network layer whatever DNS says, so DNS is not a security
+  boundary; the memory is what puts a name to a plain TCP connection (one to a port other than 443,
+  which carries no SNI) so it can be matched against `tunnel tcp://name:port` rules. An address a VM
+  never resolved through this server has no name and is refused.
+- AAAA queries answer NODATA: guests have no IPv6 route, and a passthrough needs the A answer the
+  server saw.
 
 ---
 

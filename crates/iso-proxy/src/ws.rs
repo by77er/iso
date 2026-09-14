@@ -86,7 +86,7 @@ pub async fn proxy_upgrade(
         }
         let up = to_upstream.load(std::sync::atomic::Ordering::Relaxed);
         let down = to_guest.load(std::sync::atomic::Ordering::Relaxed);
-        conn.tunnel_closed("websocket", &host, &path, up, down, started.elapsed());
+        conn.tunnel_closed("websocket", &host, 443, &path, up, down, started.elapsed());
     });
     // Register the tunnel where the connection is registered, and hold that
     // registration exactly as long as the tunnel runs.

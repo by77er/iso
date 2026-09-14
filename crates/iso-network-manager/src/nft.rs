@@ -374,9 +374,10 @@ mod tests {
     fn every_mode_renders_to_nonempty_netlink() {
         let cfg = Config::default();
         let fx = fixture::derive(SlotId::new(1).unwrap(), &cfg);
-        for mode in [EgressMode::Allow, EgressMode::Proxy, EgressMode::Deny] {
+        for (mode, direct) in [(EgressMode::Proxy, true), (EgressMode::Proxy, false), (EgressMode::Deny, false)] {
             let policy = NetworkPolicy {
                 egress: mode,
+                direct,
                 ingress: vec![PortForward {
                     host_port: 8080,
                     vm_port: 80,

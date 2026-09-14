@@ -85,7 +85,13 @@ in
   # inside the guest. NODE_EXTRA_CA_CERTS points node/pi at the system bundle.
   security.pki.certificateFiles =
     lib.optionals (builtins.pathExists ../ca.crt) [ ../ca.crt ];
+  # Every runtime that keeps its own trust store reads the system bundle,
+  # which carries the proxy's CA: the proxy terminates every outbound byte.
   environment.variables.NODE_EXTRA_CA_CERTS = "/etc/ssl/certs/ca-bundle.crt";
+  environment.variables.SSL_CERT_FILE = "/etc/ssl/certs/ca-bundle.crt";
+  environment.variables.REQUESTS_CA_BUNDLE = "/etc/ssl/certs/ca-bundle.crt";
+  environment.variables.CURL_CA_BUNDLE = "/etc/ssl/certs/ca-bundle.crt";
+  environment.variables.GIT_SSL_CAINFO = "/etc/ssl/certs/ca-bundle.crt";
 
   # SDKs refuse to start without an API key in the environment and send it as
   # the `x-api-key` header. The egress proxy OVERRIDES that header with the real

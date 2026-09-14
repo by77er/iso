@@ -274,6 +274,7 @@ where
         let policy = NetworkPolicy {
             egress: rec.egress,
             ingress: rec.ingress.clone(),
+            direct: false,
         };
         let fixture = self.net.apply(slot, &policy).await?;
 
@@ -718,6 +719,7 @@ where
         let policy = NetworkPolicy {
             egress: rec.egress,
             ingress: rec.ingress,
+            direct: false,
         };
         self.net.reapply_policy(slot, &policy).await?;
         Ok(())
@@ -1555,14 +1557,14 @@ mod tests {
 
         let (fwd, pol) = tokio::join!(
             cp.add_forward(id, 90, Protocol::Tcp),
-            cp.set_policy(id, None, None, None, Some(EgressMode::Allow), None),
+            cp.set_policy(id, None, None, None, Some(EgressMode::Proxy), None),
         );
         fwd.unwrap();
         pol.unwrap();
 
         let rec = cp.get_vm(id).unwrap().unwrap();
         assert_eq!(rec.ingress.len(), 1, "the forward must survive the egress change");
-        assert_eq!(rec.egress, EgressMode::Allow);
+        assert_eq!(rec.egress, EgressMode::Proxy);
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ struct Split {
     tier: SocketAddr,
     tier_ca: String,
     upstream: TestUpstream,
+    echo: TestTcpEcho,
     pki: TestPki,
     ca_url: String,
     secrets_url: String,
@@ -38,6 +39,7 @@ async fn start_tier_with(verifier: Option<iso_policy::signed::Verifier>) -> Spli
     let ca = TestCa::start(&dir, Some(pki.ca_svc.server_config().unwrap())).await;
     let secrets = TestSecrets::start(&dir, Some(pki.secrets_svc.server_config().unwrap())).await;
     let upstream = TestUpstream::start(&dir).await;
+    let echo = TestTcpEcho::start().await;
     let ca_url = format!("https://{}", ca.https.unwrap());
     let secrets_url = format!("https://{}", secrets.https.unwrap());
 
@@ -52,12 +54,14 @@ async fn start_tier_with(verifier: Option<iso_policy::signed::Verifier>) -> Spli
     cfg.extra_upstream_roots = vec![upstream.ca_der.clone()];
     cfg.upstream_pins
         .insert(UPSTREAM_HOST.into(), upstream.addr);
+    cfg.upstream_pins.insert("db.internal".into(), echo.addr);
     cfg.policy_verifier = verifier;
     tokio::spawn(run_with_listeners(vec![listener], cfg));
     Split {
         tier,
         tier_ca: ca.cert_pem.clone(),
         upstream,
+        echo,
         pki,
         ca_url,
         secrets_url,
@@ -79,6 +83,18 @@ async fn start_edge(
     principal: Option<&str>,
     egress: &str,
 ) -> Edge {
+    start_edge_custom(split, host_id, creds, rules, principal, egress, |_| {}).await
+}
+
+async fn start_edge_custom(
+    split: &Split,
+    host_id: &str,
+    creds: &Creds,
+    rules: &[&str],
+    principal: Option<&str>,
+    egress: &str,
+    tweak: impl FnOnce(&mut ProxyConfig),
+) -> Edge {
     let resolver = TestResolver::new(policy(egress, principal, rules));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -91,6 +107,7 @@ async fn start_edge(
     cfg.host_id = host_id.into();
     cfg.watch_every = Duration::from_millis(50);
     let metrics = cfg.metrics.clone();
+    tweak(&mut cfg);
     tokio::spawn(run_with_listeners(vec![listener], cfg));
     Edge { addr, resolver, metrics }
 }
@@ -465,4 +482,35 @@ async fn the_tier_logs_requests_under_the_edge_name() {
     assert_eq!(ev["vm"], "vm-test");
     assert_eq!(ev["injected"], "authorization,x-iso-injected");
     assert_eq!(ev["decision"], "allow");
+}
+
+/// A plain TCP connection is carried edge to tier as a CONNECT stream with
+/// the destination and its resolved name in the headers; the tier matches
+/// the tunnel rule, dials by name and copies bytes, and logs it under the
+/// edge's certificate name.
+#[tokio::test]
+async fn tcp_passthrough_runs_through_the_tier() {
+    let s = start_tier().await;
+    let e = start_edge_custom(&s, "hostA", &s.pki.edge, &["tunnel tcp://db.internal:5432"], Some("alice"), "proxy", |cfg| {
+        cfg.dst_lookup = fixed_dst("10.9.9.9:5432");
+    })
+    .await;
+    e.resolver.name_dst("127.0.0.1".parse().unwrap(), "10.9.9.9".parse().unwrap(), "db.internal");
+    let mut c = tokio::net::TcpStream::connect(e.addr).await.unwrap();
+    let payload = format!("split {}", unique_path(""));
+    c.write_all(payload.as_bytes()).await.unwrap();
+    let mut back = vec![0u8; payload.len()];
+    c.read_exact(&mut back).await.unwrap();
+    assert_eq!(back, payload.as_bytes());
+    drop(c);
+    let n = payload.len() as u64;
+    eventually(
+        || access_events().iter().any(|e| e["kind"] == "tcp" && e["bytes_up"] == n),
+        Duration::from_secs(5),
+        "logged on the tier",
+    )
+    .await;
+    let t = access_events().into_iter().find(|e| e["kind"] == "tcp" && e["bytes_up"] == n).unwrap();
+    assert_eq!((t["edge"].as_str(), t["host"].as_str(), t["port"].as_u64()), (Some("edge-hostA"), Some("db.internal"), Some(5432)));
+    let _ = &s.echo;
 }

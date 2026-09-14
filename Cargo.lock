@@ -1390,6 +1390,7 @@ dependencies = [
  "iso-policy",
  "iso-rpc",
  "iso-secrets",
+ "libc",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",

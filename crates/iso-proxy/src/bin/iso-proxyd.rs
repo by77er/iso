@@ -147,11 +147,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .split(',')
             .map(|s| s.trim().parse())
             .collect::<Result<_, _>>()?,
-        // The nft Proxy-mode DNAT target (:3128) and the Allow-mode DNS-redirect
-        // target (:443), both on the services IP; a replica listens on :3129.
+        // The nft intercept target on the services IP, where every TCP port a
+        // VM dials lands; a replica listens on :3129.
         (None, None) => match role {
             Role::Proxy => vec!["0.0.0.0:3129".parse()?],
-            _ => vec!["172.22.0.1:3128".parse()?, "172.22.0.1:443".parse()?],
+            _ => vec!["172.22.0.1:3128".parse()?],
         },
     };
 

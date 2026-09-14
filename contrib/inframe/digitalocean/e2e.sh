@@ -23,7 +23,8 @@ healthy=$(echo "$hosts" | py "print(sum(1 for h in d if h['healthy'] and '$TEMPL
 echo "== create, placed by the fleet"
 id=$("$ISOCTL" vm create --template "$TEMPLATE" --egress proxy --principal alice \
   --allow postman-echo.com --allow echo.websocket.org \
-  --rule 'deny https://postman-echo.com/status/**' --quiet)
+  --rule 'deny https://postman-echo.com/status/**' \
+  --rule 'tunnel tcp://postman-echo.com:80' --rule 'tunnel tcp://github.com:22' --quiet)
 vm=$(api "$ISO_SERVER/vms/$id")
 host=$(echo "$vm" | py "print(d['host'])")
 echo "$vm" | py "print('  vm', d['id'][:8], 'on', d['host'], '·', d['fleet_state'], '·', d['state'], '· gen', d['policy_gen'])"
@@ -56,6 +57,15 @@ echo "== WebSocket upgrade through the tunnel"
 # A WebSocket client speaks HTTP/1.1 (h2 has no Upgrade); curl must be told.
 ws=$(vmexec "$id" 'curl -si --http1.1 --max-time 15 -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==" https://echo.websocket.org/ | head -1' || true)
 echo "$ws" | grep -q ' 101 ' && ok "101 Switching Protocols" || bad "no 101: $ws"
+
+echo "== tcp passthrough: a tunnel rule carries plain TCP through, nothing else does"
+out=$(vmexec "$id" 'curl -sS --max-time 20 http://postman-echo.com/get' || true)
+# (the echo service sits behind a TLS terminator and reports its own scheme, so the host is what proves it)
+echo "$out" | grep -q '"host":"postman-echo.com"' && ok "plain HTTP on :80 carried through (tunnel tcp://postman-echo.com:80)" || bad "no plain HTTP through the tunnel: $(echo "$out" | head -c 200)"
+echo "$out" | grep -q 'x-iso-injected' && bad "a tunnel must not inject" || ok "nothing injected on a tunnel"
+out=$(vmexec "$id" 'ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15 -T git@github.com 2>&1' || true)
+echo "$out" | grep -qi 'permission denied\|successfully authenticated' && ok "ssh reached github.com:22 through the tunnel" || bad "ssh did not reach github: $(echo "$out" | head -c 200)"
+if vmexec "$id" 'curl -s --max-time 10 http://example.com/ >/dev/null'; then bad "plain HTTP to a host with no tunnel rule got through"; else ok "plain HTTP to example.com:80 refused (no tunnel rule)"; fi
 
 echo "== policy change: new connections see it"
 api -X PATCH -H 'content-type: application/json' -d '{"allow":["echo.websocket.org"]}' "$ISO_SERVER/vms/$id/policy" -o /dev/null
@@ -101,6 +111,15 @@ if [ -n "${ISO_E2E_HOST_A:-}" ] && [ -n "${ISO_E2E_CONTROL_PRIV:-}" ]; then
 else
   echo "  skip (set ISO_E2E_HOST_A and ISO_E2E_CONTROL_PRIV, as deploy.sh prints)"
 fi
+
+echo "== a 443 tunnel: the guest sees the real certificate, no injection"
+id3=$("$ISOCTL" vm create --template "$TEMPLATE" --egress proxy --principal alice --rule 'tunnel tcp://postman-echo.com:443' --quiet)
+for _ in $(seq 1 60); do "$ISOCTL" vm agent "$id3" >/dev/null 2>&1 && break; sleep 2; done
+for _ in $(seq 1 30); do vmexec "$id3" 'getent hosts postman-echo.com >/dev/null' && break; sleep 2; done
+out=$(vmexec "$id3" 'curl -sS --max-time 20 https://postman-echo.com/get' || true)
+echo "$out" | grep -q '"url":"https://postman-echo.com/get"' && ok "TLS passed through on a tunnel tcp://host:443 rule" || bad "no response through the 443 tunnel: $(echo "$out" | head -c 200)"
+echo "$out" | grep -q 'x-iso-injected' && bad "a 443 tunnel must not inject" || ok "nothing injected on the 443 tunnel"
+"$ISOCTL" vm rm "$id3"
 
 echo "== a second VM lands on the other host"
 id2=$("$ISOCTL" vm create --template "$TEMPLATE" --egress deny --quiet)

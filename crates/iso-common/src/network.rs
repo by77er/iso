@@ -101,16 +101,16 @@ mod tests {
     }
 }
 
-/// The three egress levels governing a VM's **external** traffic.
+/// The two egress levels governing a VM's **external** traffic.
 ///
 /// Access to the host's internal services (DNS, …) on the services dummy address
 /// is a baseline available in every mode; these levels only govern egress
-/// *beyond* it.
+/// *beyond* it. There is no direct mode: every byte a VM sends outward goes
+/// through the proxy, where policy decides and the log records it. How wide
+/// the policy is (`allow https://*/**`, `tunnel tcp://host:port`) is the
+/// rules' business, not the mode's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EgressMode {
-    /// Direct internet egress, **bypassing the proxy** (masqueraded out the
-    /// uplink).
-    Allow,
     /// Internet egress is **transparently intercepted by the proxy**. The proxy
     /// listen endpoint is manager configuration, not per-VM policy.
     Proxy,
@@ -147,6 +147,12 @@ pub struct NetworkPolicy {
     /// The full set of host port forwards that should exist. Anything not listed
     /// is removed; `(host_port, proto)` must be unique within the set.
     pub ingress: Vec<PortForward>,
+    /// Masqueraded egress straight out the uplink, with nothing in the way.
+    /// Never for a VM the control plane places: every VM's egress goes
+    /// through the proxy. This is for the bake's builder alone, which runs
+    /// provisioning commands before any policy or proxy identity exists
+    /// for it, on a slot no VM occupies.
+    pub direct: bool,
 }
 
 impl Default for NetworkPolicy {
@@ -154,6 +160,7 @@ impl Default for NetworkPolicy {
         Self {
             egress: EgressMode::Deny,
             ingress: Vec::new(),
+            direct: false,
         }
     }
 }

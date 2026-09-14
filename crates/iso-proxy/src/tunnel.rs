@@ -14,22 +14,34 @@ use std::net::SocketAddr;
 use base64::Engine as _;
 use http::{HeaderMap, HeaderValue};
 
+use crate::dst::Dst;
 use crate::policy::WirePolicy;
 
 /// The connection's identity and policy, base64 of the `WirePolicy` JSON.
 pub const H_POLICY: &str = "x-iso-policy";
 /// The guest's source address as the edge saw it, `ip:port`.
 pub const H_SRC: &str = "x-iso-src";
+/// The destination the guest dialled before the redirect, `ip:port`.
+pub const H_DST: &str = "x-iso-dst";
+/// The name the guest resolved that address from, for a port with no SNI.
+pub const H_DST_NAME: &str = "x-iso-dst-name";
 /// The authority a CONNECT names; nothing dials it, HTTP/2 just needs one.
 pub const AUTHORITY: &str = "guest.iso.internal:443";
 
-/// Headers for a CONNECT that carries `policy` for a guest connection from `src`.
-pub fn encode(src: SocketAddr, policy: &WirePolicy) -> std::io::Result<HeaderMap> {
+/// Headers for a CONNECT that carries `policy` for a guest connection from
+/// `src` to `dst`.
+pub fn encode(src: SocketAddr, policy: &WirePolicy, dst: &Dst) -> std::io::Result<HeaderMap> {
     let json = serde_json::to_vec(policy)?;
     let mut h = HeaderMap::new();
     let v = base64::engine::general_purpose::STANDARD.encode(json);
     h.insert(H_POLICY, HeaderValue::from_str(&v).map_err(bad)?);
     h.insert(H_SRC, HeaderValue::from_str(&src.to_string()).map_err(bad)?);
+    if let Some(a) = dst.addr {
+        h.insert(H_DST, HeaderValue::from_str(&a.to_string()).map_err(bad)?);
+    }
+    if let Some(n) = &dst.name {
+        h.insert(H_DST_NAME, HeaderValue::from_str(n).map_err(bad)?);
+    }
     Ok(h)
 }
 
@@ -37,6 +49,7 @@ pub fn encode(src: SocketAddr, policy: &WirePolicy) -> std::io::Result<HeaderMap
 pub struct Decoded {
     pub src: Option<SocketAddr>,
     pub policy: WirePolicy,
+    pub dst: Dst,
 }
 
 /// Read the identity out of a CONNECT's headers. A request without the
@@ -53,7 +66,17 @@ pub fn decode(headers: &HeaderMap) -> std::io::Result<Decoded> {
         .get(H_SRC)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok());
-    Ok(Decoded { src, policy })
+    let dst = Dst {
+        addr: headers
+            .get(H_DST)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok()),
+        name: headers
+            .get(H_DST_NAME)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_ascii_lowercase()),
+    };
+    Ok(Decoded { src, policy, dst })
 }
 
 fn bad(e: impl ToString) -> std::io::Error {
@@ -76,13 +99,20 @@ mod tests {
             signed: None,
         };
         let src: SocketAddr = "172.21.0.3:41000".parse().unwrap();
-        let h = encode(src, &p).unwrap();
+        let dst = Dst { addr: Some("10.0.0.5:5432".parse().unwrap()), name: Some("db.internal".into()) };
+        let h = encode(src, &p, &dst).unwrap();
         let d = decode(&h).unwrap();
         assert_eq!(d.src, Some(src));
         assert_eq!(d.policy.vm.as_deref(), Some("vm-1"));
         assert_eq!(d.policy.policy_gen, 7);
         assert_eq!(d.policy.rules, p.rules);
         assert_eq!(d.policy.principal.as_deref(), Some("alice"));
+        assert_eq!(d.dst.addr, dst.addr);
+        assert_eq!(d.dst.name.as_deref(), Some("db.internal"));
+        assert_eq!(d.dst.port(), 5432);
+        let bare = decode(&encode(src, &p, &Dst::default()).unwrap()).unwrap();
+        assert_eq!(bare.dst.port(), 443);
+        assert_eq!((bare.dst.addr, bare.dst.name), (None, None));
     }
 
     #[test]

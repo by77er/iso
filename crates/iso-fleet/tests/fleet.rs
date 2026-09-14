@@ -567,3 +567,18 @@ async fn policies_are_signed_for_the_host_and_re_signed_before_they_expire() {
     let c = verifier.verify(&signed_of(&r.host_of(&id).await)).unwrap();
     assert_eq!((c.policy_gen, c.principal.as_deref()), (5, Some("alice")));
 }
+
+/// A delete gives the slot back in the fleet's own accounting at once, so
+/// the very next create lands where the room is, not where the last sync
+/// thought it was.
+#[tokio::test]
+async fn a_delete_frees_the_slot_for_the_next_placement_without_a_sync() {
+    let r = Rig::start().await;
+    let (_, first) = r.create("base").await;
+    let (id2, second) = r.create("base").await;
+    assert_ne!(first, second, "spread over both hosts");
+    let (s, _) = r.delete(&format!("/vms/{id2}")).await;
+    assert_eq!(s, 204);
+    let (_, third) = r.create("base").await;
+    assert_eq!(third, second, "the freed host takes the next one, with no sync in between");
+}

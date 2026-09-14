@@ -101,19 +101,26 @@ fn nanos() -> u128 {
         .as_nanos()
 }
 
-/// A policy the tests can change while connections are open.
+/// A policy the tests can change while connections are open, and the
+/// names it remembers VMs resolving (what the host's DNS memory answers).
 pub struct TestResolver {
     inner: Mutex<Option<Policy>>,
+    dst: Mutex<std::collections::HashMap<(IpAddr, std::net::Ipv4Addr), String>>,
 }
 
 impl TestResolver {
     pub fn new(policy: Policy) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Some(policy)),
+            dst: Mutex::new(Default::default()),
         })
     }
     pub fn set(&self, policy: Option<Policy>) {
         *self.inner.lock().unwrap() = policy;
+    }
+    /// Remember that the VM at `src` resolved `dst` from `name`.
+    pub fn name_dst(&self, src: IpAddr, dst: std::net::Ipv4Addr, name: &str) {
+        self.dst.lock().unwrap().insert((src, dst), name.to_string());
     }
     /// A new generation with the same rules: what a `PATCH /policy` does.
     pub fn bump(&self) {
@@ -128,6 +135,39 @@ impl TestResolver {
 impl PolicyResolver for TestResolver {
     async fn resolve(&self, _ip: IpAddr) -> Option<Policy> {
         self.inner.lock().unwrap().clone()
+    }
+    async fn resolve_dst(&self, ip: IpAddr, dst: std::net::Ipv4Addr) -> Option<String> {
+        self.dst.lock().unwrap().get(&(ip, dst)).cloned()
+    }
+}
+
+/// A destination lookup that answers the same address for every connection:
+/// what the kernel's conntrack would say had the connection been redirected.
+pub fn fixed_dst(addr: &str) -> iso_proxy::dst::DstLookup {
+    let a: std::net::SocketAddrV4 = addr.parse().unwrap();
+    Arc::new(move |_| Some(a))
+}
+
+/// A raw TCP echo server on an ephemeral port: what a `tunnel tcp://`
+/// rule reaches, standing in for a database or an ssh server.
+pub struct TestTcpEcho {
+    pub addr: SocketAddr,
+}
+
+impl TestTcpEcho {
+    pub async fn start() -> Self {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { break };
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        Self { addr }
     }
 }
 
@@ -230,6 +270,9 @@ async fn wait_for(sock: &Path) {
 pub struct TestUpstream {
     pub addr: SocketAddr,
     pub ca_der: rustls_pki_types::CertificateDer<'static>,
+    /// The same CA as PEM, for a guest that must trust the upstream itself
+    /// (a passthrough shows the guest the upstream's certificate).
+    pub ca_pem: String,
     pub hits: Arc<Mutex<Vec<String>>>,
 }
 
@@ -285,6 +328,12 @@ impl TestUpstream {
         Self {
             addr,
             ca_der: rustls_pki_types::CertificateDer::from(up_ca.ca_cert_der().to_vec()),
+            ca_pem: {
+                use base64::Engine as _;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(up_ca.ca_cert_der());
+                let lines: Vec<&str> = b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect();
+                format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", lines.join("\n"))
+            },
             hits,
         }
     }

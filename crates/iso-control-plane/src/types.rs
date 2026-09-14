@@ -65,14 +65,12 @@ str_enum!(VmState {
 /// Map an [`EgressMode`] to/from its stored string.
 pub fn egress_str(e: EgressMode) -> &'static str {
     match e {
-        EgressMode::Allow => "allow",
         EgressMode::Proxy => "proxy",
         EgressMode::Deny => "deny",
     }
 }
 pub fn egress_parse(s: &str) -> Option<EgressMode> {
     match s {
-        "allow" => Some(EgressMode::Allow),
         "proxy" => Some(EgressMode::Proxy),
         "deny" => Some(EgressMode::Deny),
         _ => None,
@@ -115,9 +113,9 @@ pub struct VmRecord {
     /// Security principal the VM acts as (selects per-principal injected creds).
     /// Deliberately mutable at runtime.
     pub principal: Option<String>,
-    /// Domains routed through the egress proxy (intercept for policy +
-    /// credential injection). In `Allow` mode the rest go direct; in `Proxy`
-    /// mode the rest are denied.
+    /// Domains allowed through the egress proxy with credential injection
+    /// (sugar for `allow https://host/**` plus `allow wss://host/**`); the
+    /// rest are denied unless `rules` say otherwise.
     pub allow: Vec<String>,
     /// URI-level rules in `iso-policy` syntax, on top of `allow`. Validated
     /// on the way in; the effective policy is `allow` expanded plus these.

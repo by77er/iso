@@ -12,6 +12,7 @@
 //! what retires an h2 session or a WebSocket tunnel after a policy change,
 //! without the replica knowing anything happened.
 
+use crate::dst::Dst;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -295,12 +296,12 @@ impl Tier {
     /// Open a stream for the guest connection from `peer` carrying `policy`:
     /// a CONNECT on the next replica's pool. What comes back is ready for the
     /// guest's bytes. One replica that fails is skipped for the next.
-    pub async fn open(&self, peer: SocketAddr, policy: &Policy) -> std::io::Result<TokioIo<hyper::upgrade::Upgraded>> {
+    pub async fn open(&self, peer: SocketAddr, policy: &Policy, dst: &Dst) -> std::io::Result<TokioIo<hyper::upgrade::Upgraded>> {
         let start = self.next_replica.fetch_add(1, Ordering::Relaxed);
         let mut last = None;
         for n in 0..self.addrs.len() {
             let i = (start + n) % self.addrs.len();
-            match self.open_on(i, peer, policy).await {
+            match self.open_on(i, peer, policy, dst).await {
                 Ok(s) => return Ok(s),
                 Err(e) => {
                     tracing::warn!("edge: replica {} unusable: {e}", self.addrs[i]);
@@ -311,14 +312,14 @@ impl Tier {
         Err(last.unwrap_or_else(|| std::io::Error::other("no replica")))
     }
 
-    async fn open_on(&self, i: usize, peer: SocketAddr, policy: &Policy) -> std::io::Result<TokioIo<hyper::upgrade::Upgraded>> {
+    async fn open_on(&self, i: usize, peer: SocketAddr, policy: &Policy, dst: &Dst) -> std::io::Result<TokioIo<hyper::upgrade::Upgraded>> {
         let mut send = self.conn_for(i).await?;
         let mut req = http::Request::builder()
             .method(http::Method::CONNECT)
             .uri(crate::tunnel::AUTHORITY)
             .body(Empty::<Bytes>::new())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        *req.headers_mut() = crate::tunnel::encode(peer, &WirePolicy::from_policy(&self.host_id, policy))?;
+        *req.headers_mut() = crate::tunnel::encode(peer, &WirePolicy::from_policy(&self.host_id, policy), dst)?;
         // Waits for stream capacity on a busy connection rather than failing.
         send.ready().await.map_err(|e| std::io::Error::other(format!("tunnel not ready: {e}")))?;
         let resp = tokio::time::timeout(Duration::from_secs(10), send.send_request(req))
