@@ -315,6 +315,9 @@ where
         };
         self.runtime.create(&spec).await?;
         self.runtime.start(rec.id).await?;
+        if spec.resume_from.is_some() {
+            self.sync_guest_clock(rec.id).await;
+        }
 
         rec.rootfs_device = Some(storage.device_path);
         rec.tap = Some(fixture.tap);
@@ -512,6 +515,7 @@ where
         match rec.state {
             VmState::Suspended => {
                 self.runtime.start(id).await?;
+                self.sync_guest_clock(id).await;
                 rec.state = VmState::Running;
                 self.store.update_placement(&rec)?;
                 Ok(())
@@ -763,6 +767,61 @@ where
         Ok(self.runtime.guest_channel(id, port).await?)
     }
 
+    /// After a resume the guest's wall clock is where the snapshot left it:
+    /// kvm-clock carries the host's time into a fresh boot, not into a
+    /// restored one, and nothing in the guest notices. Tell the agent the
+    /// time. Best effort and bounded: a template with nothing on the agent's
+    /// vsock port costs a short wait and a warning, never the VM. An agent
+    /// that answers but cannot do it (too old, or without `CAP_SYS_TIME`) is
+    /// not retried.
+    async fn sync_guest_clock(&self, id: VmId) {
+        const BUDGET: Duration = Duration::from_secs(3);
+        const RETRY: Duration = Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let mut last = String::new();
+        while started.elapsed() < BUDGET {
+            match self.tell_guest_time(id).await {
+                Ok(c) if c.stepped => {
+                    tracing::info!(vm = %id, "guest clock stepped by {} ms after resume", c.offset_ms);
+                    return;
+                }
+                Ok(_) => return,
+                Err(ClockAttempt::GiveUp(e)) => {
+                    last = e;
+                    break;
+                }
+                Err(ClockAttempt::Retry(e)) => last = e,
+            }
+            tokio::time::sleep(RETRY).await;
+        }
+        tracing::warn!(vm = %id, "guest clock not set after resume: {last}");
+    }
+
+    /// One `set_clock` round trip with the host's time.
+    async fn tell_guest_time(&self, id: VmId) -> std::result::Result<iso_guest_proto::ClockResult, ClockAttempt> {
+        use iso_guest_proto::ClientError;
+        let retry = |e: &dyn std::fmt::Display| ClockAttempt::Retry(e.to_string());
+        let fd = self
+            .runtime
+            .guest_channel(id, self.cfg.guest_agent_port)
+            .await
+            .map_err(|e| retry(&e))?;
+        let std = std::os::unix::net::UnixStream::from(fd);
+        std.set_nonblocking(true).map_err(|e| retry(&e))?;
+        let stream = tokio::net::UnixStream::from_std(std).map_err(|e| retry(&e))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let mut agent = iso_guest_proto::GuestClient::new(stream);
+        match tokio::time::timeout(Duration::from_secs(2), agent.set_clock(now)).await {
+            Ok(Ok(c)) => Ok(c),
+            Ok(Err(ClientError::Agent(m))) => Err(ClockAttempt::GiveUp(format!("guest agent: {m}"))),
+            Ok(Err(e)) => Err(retry(&e)),
+            Err(_) => Err(ClockAttempt::Retry("guest agent did not answer in time".into())),
+        }
+    }
+
     /// Aggregate host stats (admin-only; never exposed to guests).
     pub async fn stats(&self) -> Result<Stats> {
         let pool = self.storage.pool_stats().await?;
@@ -801,6 +860,13 @@ fn validate_policy(allow: &[String], rules: &[String]) -> Result<()> {
     iso_policy::RuleSet::from_record(allow, rules)
         .map(|_| ())
         .map_err(|e| Error::InvalidRule(e.to_string()))
+}
+
+/// Why one `set_clock` attempt did not succeed: the channel was not there yet
+/// (try again shortly) or the agent said no (it will keep saying no).
+enum ClockAttempt {
+    Retry(String),
+    GiveUp(String),
 }
 
 #[cfg(test)]
@@ -965,6 +1031,25 @@ mod tests {
                 .copied()
                 .unwrap_or(VmStatus::Absent))
         }
+        /// A stand-in agent on a socketpair: answers one `set_clock`, logging
+        /// whether the time it was handed is a real one.
+        async fn guest_channel(&self, _vm: VmId, port: u32) -> IRes<std::os::fd::OwnedFd> {
+            use iso_guest_proto::{ClockResult, Request, Response, ResponseBody};
+            self.log.push(format!("rt.guest_channel:{port}"));
+            let (host, guest) = std::os::unix::net::UnixStream::pair().map_err(|e| IErr::Backend(e.to_string()))?;
+            guest.set_nonblocking(true).unwrap();
+            let log = self.log.clone();
+            tokio::spawn(async move {
+                let mut s = tokio::net::UnixStream::from_std(guest).unwrap();
+                if let Ok(Some(Request::SetClock { unix_nanos })) = iso_guest_proto::recv::<_, Request>(&mut s).await {
+                    let year_2020 = 1_577_836_800_000_000_000u64;
+                    log.push(if unix_nanos > year_2020 { "agent.set_clock:plausible" } else { "agent.set_clock:bogus" });
+                    let r = Response::ok(ResponseBody::Clock(ClockResult { offset_ms: 180_000, stepped: true }));
+                    let _ = iso_guest_proto::send(&mut s, &r).await;
+                }
+            });
+            Ok(std::os::fd::OwnedFd::from(host))
+        }
     }
 
     type Cp = ControlPlane<MockNet, MockStorage, MockRuntime>;
@@ -1058,6 +1143,34 @@ mod tests {
         let rec = cp.get_vm(id).unwrap().unwrap();
         assert_eq!(rec.state, VmState::Running);
         assert_eq!(rec.slot.unwrap().get(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_resume_tells_the_guest_the_time_and_a_fresh_boot_does_not() {
+        let (cp, log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp
+            .create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never))
+            .await
+            .unwrap();
+        let e = log.events();
+        let pos = |s: &str| e.iter().position(|x| x == s).unwrap();
+        assert!(pos("rt.start") < pos("rt.guest_channel:5000"), "told after the VMM resumed");
+        assert!(log.has("agent.set_clock:plausible"));
+
+        // Suspend and start resumes in place: told again.
+        cp.suspend_vm(id).await.unwrap();
+        cp.start_vm(id).await.unwrap();
+        let told = log.events().iter().filter(|x| *x == "agent.set_clock:plausible").count();
+        assert_eq!(told, 2);
+
+        // A fresh boot reads the host's clock on its own.
+        let (cp, log) = build(8, 10.0, false);
+        cp.register_template(&template(false)).unwrap();
+        cp.create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never))
+            .await
+            .unwrap();
+        assert!(!log.has("rt.guest_channel:5000"));
     }
 
     #[tokio::test]

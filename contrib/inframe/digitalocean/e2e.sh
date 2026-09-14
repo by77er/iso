@@ -34,6 +34,11 @@ for _ in $(seq 1 60); do "$ISOCTL" vm agent "$id" >/dev/null 2>&1 && break; slee
 "$ISOCTL" vm agent "$id" >/dev/null 2>&1 && ok "agent answers through the fleet" || bad "agent never answered"
 for _ in $(seq 1 30); do vmexec "$id" 'getent hosts postman-echo.com >/dev/null' && break; sleep 2; done
 
+echo "== guest clock: stepped to the host's after the snapshot resume"
+guest_now=$(vmexec "$id" 'date +%s' || echo 0); here_now=$(date +%s)
+skew=$(( here_now - guest_now )); [ "$skew" -lt 0 ] && skew=$(( -skew ))
+[ "$skew" -le 5 ] && ok "guest clock within ${skew}s of ours" || bad "guest clock is ${skew}s off (template bake time?)"
+
 echo "== allowed request: terminated on the control host, header injected there"
 out=$(vmexec "$id" 'curl -sS --max-time 20 https://postman-echo.com/get' || true)
 echo "$out" | grep -q '"x-iso-injected": *"hello-from-the-control-host"' && ok "global header injected" || bad "no injected header: $(echo "$out" | head -c 300)"

@@ -124,6 +124,12 @@ Semantics worth knowing:
   was cut. Listings never follow symlinks.
 - A template baked before the vsock device existed has no channel: the daemon
   reports `502` with a message saying so. Re-bake with the current image.
+- After a snapshot resume the daemon tells the agent the host's wall clock
+  (`set_clock`): a restored guest otherwise keeps the time it was baked at,
+  since kvm-clock only seeds a fresh boot. The agent steps the clock when it
+  is more than a second off; its unit grants `CAP_SYS_TIME` for that and
+  nothing else. A template baked with an older agent logs a warning on the
+  host at each resume and keeps its stale clock until it is re-baked.
 
 `iso-guest-agent --listen-tcp 127.0.0.1:5000` serves the same protocol over
 TCP for debugging outside a VM.

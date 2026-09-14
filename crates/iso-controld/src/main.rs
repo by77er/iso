@@ -46,6 +46,15 @@ where
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // The daemon's own lines are `eprintln!`s; the control plane library
+    // reports through `tracing` (a guest clock it could not set, say), and
+    // those need a subscriber to reach the journal. `RUST_LOG` narrows it.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     let mut s = settings::from_env()?;
 
     // The jailer is the default, so resolve it before anything boots. If it is

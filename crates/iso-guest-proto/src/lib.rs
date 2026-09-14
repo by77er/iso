@@ -83,6 +83,15 @@ pub enum Request {
         #[serde(default = "default_true")]
         parents: bool,
     },
+    /// Set the guest's wall clock. The host sends this after a snapshot
+    /// resume: kvm-clock carries the host's time into a fresh boot, but a
+    /// restored guest keeps the time the snapshot was taken at, and nothing
+    /// inside it notices. The agent steps the clock if the difference is more
+    /// than a second and reports what it found either way.
+    SetClock {
+        /// Nanoseconds since the Unix epoch on the host.
+        unix_nanos: u64,
+    },
 }
 
 /// `exec` parameters.
@@ -151,6 +160,7 @@ pub enum ResponseBody {
     Dir { entries: Vec<DirEntry> },
     Stat(FileStat),
     Done,
+    Clock(ClockResult),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -213,6 +223,17 @@ pub struct FileStat {
     pub gid: u32,
     /// Seconds since the Unix epoch.
     pub modified: Option<u64>,
+}
+
+/// What `set_clock` found and did.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ClockResult {
+    /// Host time minus guest time before any adjustment, in milliseconds;
+    /// positive when the guest was behind.
+    pub offset_ms: i64,
+    /// The clock was stepped to the host's time.
+    pub stepped: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -395,6 +416,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> GuestClient<S> {
             _ => Err(ClientError::UnexpectedResult("result kind for mkdir")),
         }
     }
+
+    /// Tell the guest the host's wall clock (nanoseconds since the epoch).
+    pub async fn set_clock(&mut self, unix_nanos: u64) -> Result<ClockResult, ClientError> {
+        match self.call(&Request::SetClock { unix_nanos }).await? {
+            ResponseBody::Clock(c) => Ok(c),
+            _ => Err(ClientError::UnexpectedResult("result kind for set_clock")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -437,5 +466,12 @@ mod tests {
         );
         let e: Response = serde_json::from_str(r#"{"ok":false,"error":"nope"}"#).unwrap();
         assert_eq!(e.into_result().unwrap_err(), "nope");
+        let v = serde_json::to_value(Request::SetClock { unix_nanos: 1_700_000_000_000_000_000 }).unwrap();
+        assert_eq!(v, serde_json::json!({ "op": "set_clock", "unix_nanos": 1_700_000_000_000_000_000u64 }));
+        let r = Response::ok(ResponseBody::Clock(ClockResult { offset_ms: 180_000, stepped: true }));
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            serde_json::json!({ "ok": true, "result": { "type": "clock", "offset_ms": 180000, "stepped": true } })
+        );
     }
 }

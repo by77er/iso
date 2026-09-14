@@ -1,5 +1,7 @@
 //! iso-guest-agent — runs inside the VM and answers [`iso_guest_proto`]
-//! requests: run a program, read or write a file, list a directory.
+//! requests: run a program, read or write a file, list a directory, and set
+//! the clock after a snapshot resume (the one privileged thing it does; its
+//! unit grants `CAP_SYS_TIME` for it).
 //!
 //! The library half is transport-agnostic ([`serve_connection`] takes any
 //! stream) so the host can exercise the real handlers in tests over a
@@ -17,12 +19,17 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use base64::Engine as _;
 use iso_guest_proto::{
-    AgentInfo, DirEntry, ExecRequest, ExecResult, FileContent, FileKind, FileStat, Request, Response,
-    ResponseBody, DEFAULT_EXEC_TIMEOUT_MS, DEFAULT_MAX_OUTPUT, DEFAULT_MAX_READ,
+    AgentInfo, ClockResult, DirEntry, ExecRequest, ExecResult, FileContent, FileKind, FileStat, Request,
+    Response, ResponseBody, DEFAULT_EXEC_TIMEOUT_MS, DEFAULT_MAX_OUTPUT, DEFAULT_MAX_READ,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// A clock within this much of the host's is left alone: stepping it would
+/// only jitter timers for no gain. A resumed snapshot is off by minutes to
+/// weeks.
+const CLOCK_STEP_MS: i64 = 1_000;
 
 /// Serve requests on one connection until the peer closes it.
 pub async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) {
@@ -64,7 +71,29 @@ async fn dispatch(req: Request) -> Result<ResponseBody, String> {
         Request::Stat { path } => stat(&path).await.map(ResponseBody::Stat),
         Request::Remove { path, recursive } => remove(&path, recursive).await.map(|_| ResponseBody::Done),
         Request::Mkdir { path, parents } => mkdir(&path, parents).await.map(|_| ResponseBody::Done),
+        Request::SetClock { unix_nanos } => set_clock(unix_nanos).map(ResponseBody::Clock),
     }
+}
+
+/// Step the wall clock to the host's when the two disagree by more than
+/// [`CLOCK_STEP_MS`]. Reports the offset it found either way. Without
+/// `CAP_SYS_TIME` the step fails, and the error says which capability.
+fn set_clock(unix_nanos: u64) -> Result<ClockResult, String> {
+    let host = Duration::from_nanos(unix_nanos);
+    let guest = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let offset_ms = host.as_millis() as i64 - guest.as_millis() as i64;
+    if offset_ms.abs() < CLOCK_STEP_MS {
+        return Ok(ClockResult { offset_ms, stepped: false });
+    }
+    // Built field by field: some libc targets pad `timespec`.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    ts.tv_sec = host.as_secs() as libc::time_t;
+    ts.tv_nsec = host.subsec_nanos() as libc::c_long;
+    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(format!("set clock: {e} (the agent needs CAP_SYS_TIME)"));
+    }
+    Ok(ClockResult { offset_ms, stepped: true })
 }
 
 fn info() -> AgentInfo {
@@ -399,6 +428,21 @@ mod tests {
         assert!(c.remove(dir.to_str().unwrap(), false).await.is_err(), "non-recursive on a tree");
         c.remove(dir.to_str().unwrap(), true).await.unwrap();
         assert!(!dir.exists());
+    }
+
+    #[tokio::test]
+    async fn set_clock_leaves_a_close_clock_alone_and_names_the_missing_capability() {
+        let mut c = client().await;
+        let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let r = c.set_clock(now).await.unwrap();
+        assert!(!r.stepped, "a clock within a second is not stepped");
+        assert!(r.offset_ms.abs() < CLOCK_STEP_MS);
+        // Only ask for a step where it must be refused: as root this would
+        // move the clock of the machine running the tests.
+        if unsafe { libc::getuid() } != 0 {
+            let err = c.set_clock(now + 3_600 * 1_000_000_000).await.unwrap_err().to_string();
+            assert!(err.contains("CAP_SYS_TIME"), "{err}");
+        }
     }
 
     #[tokio::test]

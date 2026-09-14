@@ -99,6 +99,8 @@ After=systemd-user-sessions.service
 ExecStart=/usr/local/bin/iso-guest-agent --port 5000
 User=coder
 Group=coder
+# The host tells the agent the time after a snapshot resume.
+AmbientCapabilities=CAP_SYS_TIME
 WorkingDirectory=/home/coder
 EnvironmentFile=-/etc/environment
 Restart=always

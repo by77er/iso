@@ -1212,11 +1212,13 @@ name = "iso-control-plane"
 version = "0.1.0"
 dependencies = [
  "iso-common",
+ "iso-guest-proto",
  "iso-policy",
  "rusqlite",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1246,6 +1248,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
+ "tracing-subscriber",
  "utoipa",
 ]
 

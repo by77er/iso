@@ -48,6 +48,9 @@ in
       # user's permissions (passwordless sudo is available inside commands).
       User = "coder";
       Group = "users";
+      # The host tells the agent the time after a snapshot resume; setting
+      # the clock is the one thing it does beyond the user's permissions.
+      AmbientCapabilities = [ "CAP_SYS_TIME" ];
       WorkingDirectory = "/home/coder";
       Restart = "always";
       RestartSec = 1;
