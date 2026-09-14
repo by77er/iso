@@ -62,7 +62,7 @@ droplet has no /dev/kvm. -/
 def hostUserData : String :=
   "#cloud-config\n" ++
   "package_update: true\n" ++
-  "packages: [lvm2, thin-provisioning-tools, mmdebstrap, nftables, curl, jq, rsync, ca-certificates, xz-utils]\n" ++
+  "packages: [lvm2, thin-provisioning-tools, mmdebstrap, debian-archive-keyring, nftables, curl, jq, rsync, ca-certificates, xz-utils]\n" ++
   "write_files:\n" ++
   "  - path: /etc/sysctl.d/90-iso.conf\n" ++
   "    content: |\n" ++

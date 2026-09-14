@@ -63,20 +63,42 @@ What it does, in order:
    (`nix build .#kernel .#iso-guest-agent-static`), the `image/` tree with
    the tier CA in it, and the edge identity. Installs the shared admin CA
    before `iso-controld` first starts, so the host adopts it instead of
-   generating its own. Starts controld on the private address and the edge
-   pointed at the tier, bakes a Debian template that trusts the tier CA, and
-   registers it.
+   generating its own. Puts the tier CA where `isoctl bake` reads the CA a
+   guest must trust (`/var/lib/iso/ca/ca.crt`, the spot `iso-cad` fills on a
+   single host). Starts controld on the private address and the edge pointed
+   at the tier, bakes a Debian template, and registers it.
 3. **You.** The exports it prints at the end make `isoctl vm …` talk to the
    fleet: create places on a host with a free slot, `exec` is routed by id,
    and a proxied request to `api.github.com` comes back with the token
    injected on the control host.
 
+## Check it end to end
+
+```bash
+./e2e.sh
+```
+
+With the exports from `deploy.sh` set, `e2e.sh` drives the rig through the
+fleet API alone: two healthy hosts with the template; a VM placed by the
+fleet whose agent answers; a request to `postman-echo.com` that comes back
+with the headers from `secrets.toml` injected on the control host; a URI
+rule that turns a path into a 403 naming the rule; a host no rule names
+refused at SNI time; a WebSocket upgrade tunnelled through to a 101; a
+policy change that bumps the generation and closes the old connections;
+a second VM landing on the other host; and a clean destroy. It ran green
+against `nyc3` on 2026-09-14, about 90 seconds end to end, with the guest
+agent answering roughly two seconds after `vm create` on nested KVM.
+
 ## Tear down
 
 ```bash
-inframe destroy --stack do
+inframe destroy --stack do -- -auto-approve
 rm -rf .deploy
 ```
+
+Then confirm nothing is left billing: `curl -H "Authorization: Bearer
+$DIGITALOCEAN_TOKEN" https://api.digitalocean.com/v2/droplets` should list
+no droplets tagged `iso`.
 
 `.deploy/` holds the host admin CA key and your operator key; it is ignored
 by git. Do not commit it.

@@ -35,6 +35,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// at most this long, and the proxy re-mints on expiry with no operator step.
 pub const LEAF_TTL: time::Duration = time::Duration::hours(24);
 
+/// How far into the past a leaf is valid from. A guest resumed from a
+/// snapshot keeps the wall clock it was baked with until something in it
+/// sets the time, so a leaf minted "now" would be not-yet-valid to any guest
+/// whose template is older than the skew allowed here. Back-dating costs
+/// nothing: the leaf is ours, and its expiry is what bounds exposure.
+pub const LEAF_BACKDATE: time::Duration = time::Duration::days(30);
+
 /// The RPC method name, over both transports.
 pub const METHOD: &str = "sign";
 
@@ -112,9 +119,8 @@ impl Ca {
     pub fn sign(&self, csr_pem: &str) -> Result<Signed> {
         let mut csr = CertificateSigningRequestParams::from_pem(csr_pem)?;
         let now = time::OffsetDateTime::now_utc();
-        // A minute of skew for a proxy whose clock is slightly ahead.
         let not_after = now + LEAF_TTL;
-        csr.params.not_before = now - time::Duration::minutes(1);
+        csr.params.not_before = now - LEAF_BACKDATE;
         csr.params.not_after = not_after;
         let leaf = csr.signed_by(&self.ca_cert, &self.ca_key)?;
         Ok(Signed {
@@ -269,7 +275,9 @@ mod tests {
             leaf.validity().not_after.timestamp() as u64,
             signed.not_after
         );
-        assert!(leaf.validity().not_before.timestamp() as u64 <= now);
+        // Valid to a guest whose clock froze at bake time weeks ago.
+        let not_before = leaf.validity().not_before.timestamp() as u64;
+        assert!(not_before <= now - 29 * 86_400, "leaf is not back-dated");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -11,7 +11,7 @@
 # Run from this directory after `inframe apply --stack do`, as the user who
 # built iso. Needs: the iso binaries (built here or with ISO_BIN), the guest
 # kernel and static agent (Nix, or ISO_KERNEL / ISO_AGENT_BIN), ssh access
-# as root to the droplets with the account key, rsync, jq. Idempotent-ish:
+# as root to the droplets with the account key, rsync, and jq or python3. Idempotent-ish:
 # rerunning reinstalls binaries and configs and skips the bake if a template
 # exists.
 #
@@ -36,7 +36,13 @@ say() { echo "[deploy] $*"; }
 
 # ---- what inframe made ----
 outputs=$("$INFRAME" --project "$HERE/inframe.toml" output --stack do)
-val() { echo "$outputs" | jq -r "$1"; }
+# jq if present, python otherwise: `val '.control_ip.value'`
+val() {
+  if command -v jq >/dev/null; then echo "$outputs" | jq -r "$1"; else
+    echo "$outputs" | python3 -c "import json,sys; d=json.load(sys.stdin)
+for k in sys.argv[1].strip('.').split('.'): d=d[k]
+print(d)" "$1"; fi
+}
 CONTROL=$(val '.control_ip.value'); CONTROL_PRIV=$(val '.control_private_ip.value')
 HOST_A=$(val '.host_ips.value.a'); HOST_A_PRIV=$(val '.host_private_ips.value.a')
 HOST_B=$(val '.host_ips.value.b'); HOST_B_PRIV=$(val '.host_private_ips.value.b')
@@ -91,17 +97,17 @@ rsync -az "$SECRETS_TOML" "root@$CONTROL:/var/lib/iso/secrets.toml"
 
 # One admin CA for every host, minted on the control host, and the identities
 # the control host's services present. The fleet's own API CA is separate.
-"${SSH[@]}" "root@$CONTROL" bash -s "$CONTROL_PRIV" "$HOST_A_PRIV" "$HOST_B_PRIV" <<'REMOTE'
+"${SSH[@]}" "root@$CONTROL" bash -s "$CONTROL_PRIV" "$HOST_A_PRIV" "$HOST_B_PRIV" "$CONTROL" <<'REMOTE'
 set -euo pipefail
-priv=$1; a=$2; b=$3
+priv=$1; a=$2; b=$3; pub=$4
 P=/var/lib/iso-fleet
 mkdir -p $P/hosts-pki $P/pki /etc/iso-fleet
 # hosts admin CA (issue with no SANs never reissues a server cert here)
 isoctl admin --pki-dir $P/hosts-pki ca >/dev/null
 [ -f /etc/iso-fleet/hosts/fleet.crt ] || isoctl admin --pki-dir $P/hosts-pki issue-client --name fleet --out /etc/iso-fleet/hosts 2>/dev/null
 [ -f /etc/iso-fleet/svc/control.crt ] || isoctl admin --pki-dir $P/hosts-pki issue-server --name control --san "$priv" --out /etc/iso-fleet/svc 2>/dev/null
-[ -f /etc/iso-fleet/edges/edge-a.crt ] || isoctl admin --pki-dir $P/hosts-pki issue-server --name edge-a --san "$a" --out /etc/iso-fleet/edges 2>/dev/null
-[ -f /etc/iso-fleet/edges/edge-b.crt ] || isoctl admin --pki-dir $P/hosts-pki issue-server --name edge-b --san "$b" --out /etc/iso-fleet/edges 2>/dev/null
+[ -f /etc/iso-fleet/edges/host-a.crt ] || isoctl admin --pki-dir $P/hosts-pki issue-server --name host-a --san "$a" --out /etc/iso-fleet/edges 2>/dev/null
+[ -f /etc/iso-fleet/edges/host-b.crt ] || isoctl admin --pki-dir $P/hosts-pki issue-server --name host-b --san "$b" --out /etc/iso-fleet/edges 2>/dev/null
 # the fleet API's own CA and an operator client
 isoctl admin --pki-dir $P/pki ca >/dev/null
 [ -f /etc/iso-fleet/operator/operator.crt ] || isoctl admin --pki-dir $P/pki issue-client --name operator --out /etc/iso-fleet/operator 2>/dev/null
@@ -122,6 +128,7 @@ cat > /etc/iso-fleet/fleet.toml <<EOT
 listen = "0.0.0.0:7080"
 db = "$P/fleet.db"
 pki_dir = "$P/pki"
+extra_sans = ["$pub", "$priv"]
 sync_every_ms = 3000
 [hosts_tls]
 ca = "/etc/iso-fleet/hosts/ca.crt"
@@ -160,6 +167,10 @@ host() { # name public private
   rsync -az "$ISO_KERNEL" "root@$ip:/opt/iso/vmlinux"
   rsync -az "$ISO_AGENT_BIN" "root@$ip:/opt/iso/iso-guest-agent"
   rsync -az --delete "$ISO_REPO/image/" "root@$ip:/opt/iso/image/"
+  # bake reads the CA guests must trust from the state directory, where
+  # iso-cad would have put it on a single host; here it is the tier's.
+  "${SSH[@]}" "root@$ip" "mkdir -p /var/lib/iso/ca"
+  rsync -az "$OUT/tier-ca.crt" "root@$ip:/var/lib/iso/ca/ca.crt"
   rsync -az "$OUT/tier-ca.crt" "root@$ip:/opt/iso/image/ca.crt"
   rsync -az "$OUT/edges/$name.crt" "$OUT/edges/$name.key" "$OUT/edges/ca.crt" "root@$ip:/etc/iso/"
   # the shared admin CA, before controld's first start so it is adopted
