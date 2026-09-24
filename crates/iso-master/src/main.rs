@@ -1,5 +1,6 @@
 mod config;
 mod engine;
+mod metrics;
 mod model;
 mod pi;
 mod plane;
@@ -36,6 +37,7 @@ async fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("Another master is using this data directory"))?;
     let store = Arc::new(store::Store::open(&cfg.data_dir.join("master.sqlite3"))?);
     let engine = engine::Engine::new(cfg.clone(), store)?;
+    engine.refresh_models().await;
     let web = web::Web {
         engine: engine.clone(),
         auth: Arc::new(auth),
@@ -54,9 +56,22 @@ async fn main() -> Result<()> {
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     let worker_app = web::worker_router(web.clone());
     let worker_server = tokio::spawn(async move { axum::serve(unix, worker_app).await });
+    let metrics_server = if cfg.metrics_bind.is_empty() {
+        None
+    } else {
+        let app = web::metrics_router(web.clone());
+        let listener = tokio::net::TcpListener::bind(&cfg.metrics_bind).await?;
+        eprintln!("iso-master metrics on {}", cfg.metrics_bind);
+        Some(tokio::spawn(
+            async move { axum::serve(listener, app).await },
+        ))
+    };
     let app = web::router(web);
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
     let timer = tokio::spawn(engine.clone().timer());
+    if cfg.auto_recover {
+        tokio::spawn(engine.clone().auto_recover());
+    }
     eprintln!(
         "iso-master listening on {}{}",
         cfg.bind,
@@ -84,6 +99,9 @@ async fn main() -> Result<()> {
         .await;
     engine.shutdown().await;
     worker_server.abort();
+    if let Some(server) = metrics_server {
+        server.abort();
+    }
     result?;
     Ok(())
 }

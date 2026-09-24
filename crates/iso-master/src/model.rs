@@ -37,14 +37,14 @@ impl Phase {
                 (Allocating, Starting | AllocationUnknown | Interrupted)
                     | (AllocationUnknown, Allocating | Interrupted | Closed)
                     | (Starting, Idle | Interrupted)
-                    | (Idle, Working | Sleeping | Interrupted | Closing)
-                    | (Working, Idle | Interrupted | Closing)
+                    | (Idle, Working | Sleeping | Stopping | Interrupted | Closing)
+                    | (Working, Idle | Stopping | Interrupted | Closing)
                     | (Sleeping, Asleep | Interrupted)
                     | (Asleep, Waking | Stopping | Closing | Interrupted)
                     | (Stopping, Stopped | Interrupted)
-                    | (Stopped, Waking | Interrupted)
+                    | (Stopped, Waking | Stopping | Interrupted | Closing)
                     | (Waking, Idle | Interrupted)
-                    | (Interrupted, Starting | Closing)
+                    | (Interrupted, Starting | Stopping | Closing)
                     | (Closing, Closed | Interrupted)
             );
         if !valid {
@@ -95,6 +95,33 @@ pub struct CreateOptions {
     pub swarm: bool,
     pub planner_model: Option<String>,
     pub worker_model: Option<String>,
+    /// The egress ACL to give this workspace — and, for a swarm root, every
+    /// worker spawned into it. Set at creation; changeable later per swarm.
+    #[serde(flatten)]
+    pub acl: Acl,
+}
+
+/// A swarm's (or a standalone workspace's) egress access-control list: the
+/// mode, the proxied-host allow-list, and optional URI-level rules. An empty
+/// ACL means "use the plane's configured defaults". One ACL governs a whole
+/// swarm; children inherit it at creation and live changes fan out to all.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct Acl {
+    /// `proxy` or `deny`; `None`/empty leaves the plane default.
+    pub egress: Option<String>,
+    pub allow: Vec<String>,
+    pub rules: Vec<String>,
+}
+
+impl Acl {
+    /// An ACL carries no operator intent when every field is empty; such an
+    /// ACL defers entirely to the plane's configured defaults.
+    pub fn is_empty(&self) -> bool {
+        self.egress.as_deref().unwrap_or("").is_empty()
+            && self.allow.is_empty()
+            && self.rules.is_empty()
+    }
 }
 
 #[cfg(test)]

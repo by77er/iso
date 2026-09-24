@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from "react";
 import { Box, X, Plus, LoaderCircle } from "lucide-react";
 import { api, type Session, type ModelCatalog } from "../api";
 import ModelSelect from "./ModelSelect";
+import AclEditor, { emptyDraft, draftToAcl, type AclDraft } from "./AclEditor";
 import { ErrorBanner } from "./shared";
 
 export default function NewAgent({
@@ -19,7 +20,8 @@ export default function NewAgent({
     [model, setModel] = useState(""),
     [swarm, setSwarm] = useState(false),
     [plannerModel, setPlannerModel] = useState(""),
-    [workerModel, setWorkerModel] = useState("");
+    [workerModel, setWorkerModel] = useState(""),
+    [acl, setAcl] = useState<AclDraft>(emptyDraft);
   useEffect(() => {
     ref.current?.showModal();
     let stopped = false;
@@ -50,6 +52,7 @@ export default function NewAgent({
           swarm,
           planner_model: plannerModel || null,
           worker_model: workerModel || null,
+          ...draftToAcl(acl),
         }),
       );
     } catch (e) {
@@ -135,6 +138,12 @@ export default function NewAgent({
             disabled={busy}
           />
         )}
+        <AclEditor
+          draft={acl}
+          onChange={setAcl}
+          disabled={busy}
+          title="Egress ACL"
+        />
         <ErrorBanner error={error} clear={() => setError("")} />
         <button
           className="primary wide"

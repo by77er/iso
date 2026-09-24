@@ -34,7 +34,7 @@ fn dns_probe() -> types::ExecRequest {
         max_output_bytes: Some(4096),
         stdin: None,
         user: None,
-                timeout_ms: Some(2000),
+        timeout_ms: Some(2000),
     }
 }
 
@@ -63,7 +63,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts, 3);
-        let error = wait_ready(Duration::from_millis(20), || std::future::pending::<bool>())
+        let error = wait_ready(Duration::from_millis(20), std::future::pending::<bool>)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("metadata.iso.internal"));
@@ -132,9 +132,27 @@ impl Plane {
             Ok(json!({}))
         }
     }
-    pub async fn create(&self, session: &str, name: &str) -> Result<String> {
-        let body = json!({"template":self.config.template,"egress":self.config.egress,
-            "allow":self.config.allow,"principal":self.config.principal,"lifecycle":"durable","restart":"never",
+    /// Create a VM. The swarm/workspace ACL overrides the plane's configured
+    /// egress, allow-list and rules where it sets them; an empty ACL keeps the
+    /// plane defaults. Principal stays a plane property.
+    pub async fn create(
+        &self,
+        session: &str,
+        name: &str,
+        acl: &crate::model::Acl,
+    ) -> Result<String> {
+        let egress = acl
+            .egress
+            .clone()
+            .filter(|e| !e.is_empty())
+            .unwrap_or_else(|| self.config.egress.clone());
+        let allow = if acl.allow.is_empty() && acl.rules.is_empty() {
+            self.config.allow.clone()
+        } else {
+            acl.allow.clone()
+        };
+        let body = json!({"template":self.config.template,"egress":egress,
+            "allow":allow,"rules":acl.rules,"principal":self.config.principal,"lifecycle":"durable","restart":"never",
             "labels":{"name":name,"managed-by":"iso-master","master-session":session}});
         if let Some(c) = &self.client {
             let body: types::CreateVmRequest = serde_json::from_value(body)?;
@@ -148,6 +166,31 @@ impl Plane {
             vm["state"] = json!("running");
             self.demo_vms.lock().await.insert(id.clone(), vm);
             Ok(id)
+        }
+    }
+    /// Apply an ACL to a running VM (PATCH /vms/{id}/policy). Bumps the VM's
+    /// policy generation; new connections carry it within a second.
+    pub async fn set_policy(&self, id: &str, acl: &crate::model::Acl) -> Result<()> {
+        let body = json!({
+            "egress": acl.egress,
+            "allow": acl.allow,
+            "rules": acl.rules,
+        });
+        if let Some(c) = &self.client {
+            let body: types::PolicyRequest = serde_json::from_value(body)?;
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                c.set_policy().id(id).body(body).send(),
+            )
+            .await??;
+            Ok(())
+        } else {
+            let mut vms = self.demo_vms.lock().await;
+            let vm = vms.get_mut(id).context("No such demo VM")?;
+            vm["egress"] = json!(acl.egress);
+            vm["allow"] = json!(acl.allow);
+            vm["rules"] = json!(acl.rules);
+            Ok(())
         }
     }
     pub async fn get(&self, id: &str) -> Result<Value> {

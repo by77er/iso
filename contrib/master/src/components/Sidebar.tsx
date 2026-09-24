@@ -8,6 +8,7 @@ import {
   Archive,
   GitBranch,
   Box,
+  Network,
 } from "lucide-react";
 import type { Session, User } from "../api";
 import { Brand, phaseLabel } from "./shared";
@@ -20,6 +21,8 @@ export default function Sidebar({
   newAgent,
   view,
   setView,
+  swarmRoot,
+  openSwarm,
   user,
   logout,
 }: {
@@ -29,6 +32,8 @@ export default function Sidebar({
   newAgent: () => void;
   view: string;
   setView: (v: string) => void;
+  swarmRoot: string | null;
+  openSwarm: (rootId: string) => void;
   user: User;
   logout: () => void;
 }) {
@@ -42,6 +47,7 @@ export default function Sidebar({
       .filter((child) => child.swarm?.parent === session.id)
       .sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
     const expanded = !collapsed.has(session.id);
+    const swarmOpen = view === "swarm" && swarmRoot === session.id;
     return (
       <li key={session.id}>
         <div className="sidebar-tree-row">
@@ -90,6 +96,17 @@ export default function Sidebar({
             </span>
             <i className={`status-dot ${session.phase}`} />
           </button>
+          {session.swarm?.root === session.id && (
+            <button
+              className={`swarm-enter ${swarmOpen ? "selected" : ""}`}
+              aria-label={`Enter swarm ${session.name}`}
+              title="Enter swarm"
+              aria-current={swarmOpen ? "page" : undefined}
+              onClick={() => openSwarm(session.id)}
+            >
+              <Network size={15} />
+            </button>
+          )}
         </div>
         {!!children.length && expanded && <ul>{children.map(node)}</ul>}
       </li>

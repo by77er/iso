@@ -25,11 +25,13 @@ export default function Chat({
   id,
   onUpdate,
   select,
+  openSwarm,
   sessions,
 }: {
   id: string;
   onUpdate: (s: Session) => void;
   select: (id: string) => void;
+  openSwarm: (rootId: string) => void;
   sessions: Session[];
 }) {
   const [session, setSession] = useState<Session | null>(null),
@@ -232,7 +234,10 @@ export default function Chat({
             models={models}
             value={session.model || ""}
             disabled={
-              busy || !["idle", "asleep", "stopped", "interrupted"].includes(session.phase)
+              busy ||
+              !["idle", "asleep", "stopped", "interrupted"].includes(
+                session.phase,
+              )
             }
             onChange={async (model) => {
               setBusy(true);
@@ -254,7 +259,7 @@ export default function Chat({
           />
         )}
       </div>
-      {session.swarm && <SwarmPanel session={session} />}
+      {session.swarm && <SwarmPanel session={session} openSwarm={openSwarm} />}
       {details && (
         <div className="workspace-details">
           <span>
@@ -288,7 +293,7 @@ export default function Chat({
             onClick={() => {
               if (
                 confirm(
-                  "Stop this agent's VM and discard its running/suspended execution state? Workspace files and conversation are retained. Recovery requires an explicit cold boot. Other swarm agents are unaffected.",
+                  "Stop this agent's VM and reclaim its resources? Workspace files and conversation are retained; your next message cold-boots it automatically. Other swarm agents are unaffected.",
                 )
               )
                 void act("stop-vm");

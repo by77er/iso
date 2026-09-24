@@ -1,13 +1,22 @@
 import { test, expect } from "@playwright/test";
 test.use({ colorScheme: "dark" });
 
-test("chat restores reading position and can jump to the bottom", async ({ page }, testInfo) => {
+test("chat restores reading position and can jump to the bottom", async ({
+  page,
+}, testInfo) => {
   const name = `Scroll history ${testInfo.repeatEachIndex}`;
-  await page.route("**/api/sessions/*/events?*", async route => {
+  await page.route("**/api/sessions/*/events?*", async (route) => {
     const response = await route.fetch();
     const body = await response.json();
-    body.events = new URL(route.request().url()).searchParams.get("after") === "0"
-      ? Array.from({ length: 80 }, (_, i) => ({ seq: i + 1, type: "message", role: "assistant", text: `History entry ${i}. This is a paragraph of retained conversation.` })) : [];
+    body.events =
+      new URL(route.request().url()).searchParams.get("after") === "0"
+        ? Array.from({ length: 80 }, (_, i) => ({
+            seq: i + 1,
+            type: "message",
+            role: "assistant",
+            text: `History entry ${i}. This is a paragraph of retained conversation.`,
+          }))
+        : [];
     await route.fulfill({ json: body });
   });
   await page.goto("/");
@@ -19,36 +28,76 @@ test("chat restores reading position and can jump to the bottom", async ({ page 
   await page.getByRole("button", { name: "Create agent", exact: true }).click();
   const transcript = page.locator(".transcript");
   await expect(transcript).toContainText("History entry 79");
-  await expect.poll(() => transcript.evaluate(n => n.scrollHeight - n.clientHeight - n.scrollTop)).toBeLessThan(5);
-  await transcript.evaluate(n => { n.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true })); n.scrollTop = 300; n.dispatchEvent(new Event("scroll")); });
-  await expect(page.getByRole("button", { name: "Go to bottom", exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Control planes", exact: true }).click();
-  await page.locator(".sidebar-tree .session-link").filter({ hasText: name }).click();
-  await expect.poll(() => transcript.evaluate(n => n.scrollTop)).toBe(300);
+  await expect
+    .poll(() =>
+      transcript.evaluate((n) => n.scrollHeight - n.clientHeight - n.scrollTop),
+    )
+    .toBeLessThan(5);
+  await transcript.evaluate((n) => {
+    n.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
+    n.scrollTop = 300;
+    n.dispatchEvent(new Event("scroll"));
+  });
+  await expect(
+    page.getByRole("button", { name: "Go to bottom", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Control planes", exact: true })
+    .click();
+  await page
+    .locator(".sidebar-tree .session-link")
+    .filter({ hasText: name })
+    .click();
+  await expect.poll(() => transcript.evaluate((n) => n.scrollTop)).toBe(300);
   await page.getByRole("button", { name: "Go to bottom", exact: true }).click();
-  await expect.poll(() => transcript.evaluate(n => n.scrollHeight - n.clientHeight - n.scrollTop)).toBeLessThan(5);
+  await expect
+    .poll(() =>
+      transcript.evaluate((n) => n.scrollHeight - n.clientHeight - n.scrollTop),
+    )
+    .toBeLessThan(5);
 });
 
-test("fleet supports backend-specific storage metrics and unknown values", async ({ page }) => {
-  await page.route("**/api/fleet", route => route.fulfill({ json: { planes: [
-    { id: "storage-host", available: true, capacity: 0, count: 0, storage: {
-      storage_backend: "example-backend", pool_capacity_bytes: 100 * 1024 ** 3,
-      pool_used_bytes: 95 * 1024 ** 3, data_percent: 95, snapshot_bytes: 0,
-    } },
-    { id: "legacy-host", available: true, capacity: 0, count: 0 },
-  ] } }));
+test("fleet supports backend-specific storage metrics and unknown values", async ({
+  page,
+}) => {
+  await page.route("**/api/fleet", (route) =>
+    route.fulfill({
+      json: {
+        planes: [
+          {
+            id: "storage-host",
+            available: true,
+            capacity: 0,
+            count: 0,
+            storage: {
+              storage_backend: "example-backend",
+              pool_capacity_bytes: 100 * 1024 ** 3,
+              pool_used_bytes: 95 * 1024 ** 3,
+              data_percent: 95,
+              snapshot_bytes: 0,
+            },
+          },
+          { id: "legacy-host", available: true, capacity: 0, count: 0 },
+        ],
+      },
+    }),
+  );
   await page.goto("/");
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("browser-test-password");
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  await page.getByRole("button", { name: "Control planes", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Control planes", exact: true })
+    .click();
   const card = page.locator(".plane-card").filter({ hasText: "storage-host" });
   await expect(card).toContainText("example-backend");
   await expect(card).toContainText("95 GiB / 100 GiB");
   await expect(card.getByRole("alert")).toBeVisible();
   await expect(card.locator("dd").nth(2)).toHaveText("0 GiB");
   await expect(card.locator("dd").nth(3)).toHaveText("Unknown");
-  await expect(page.locator(".plane-card").filter({ hasText: "legacy-host" })).toContainText("Unknown / Unknown");
+  await expect(
+    page.locator(".plane-card").filter({ hasText: "legacy-host" }),
+  ).toContainText("Unknown / Unknown");
 });
 
 test("busy agents expose a durable queue preview and cancellation", async ({

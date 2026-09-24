@@ -122,6 +122,9 @@ impl Ca {
         let not_after = now + LEAF_TTL;
         csr.params.not_before = now - LEAF_BACKDATE;
         csr.params.not_after = not_after;
+        // Python 3.13 verifies with VERIFY_X509_STRICT by default, which
+        // rejects leaves without an Authority Key Identifier.
+        csr.params.use_authority_key_identifier_extension = true;
         let leaf = csr.signed_by(&self.ca_cert, &self.ca_key)?;
         Ok(Signed {
             chain_der: vec![leaf.der().to_vec(), self.ca_cert_der.clone()],

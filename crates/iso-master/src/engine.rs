@@ -20,6 +20,9 @@ pub struct Engine {
     pub store: Arc<Store>,
     pub planes: Vec<Plane>,
     workers: Mutex<HashMap<String, Arc<Pi>>>,
+    /// What pi reported from `--list-models` at startup; empty when discovery
+    /// failed or found nothing, in which case the configured list stands alone.
+    discovered_models: StdMutex<Vec<String>>,
     locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
     placement: Mutex<()>,
     launch_gate: Mutex<()>,
@@ -39,6 +42,7 @@ impl Engine {
             store,
             planes,
             workers: Default::default(),
+            discovered_models: Default::default(),
             locks: Default::default(),
             placement: Default::default(),
             launch_gate: Default::default(),
@@ -99,22 +103,63 @@ impl Engine {
         } else {
             None
         };
-        self.create_node(name, model, swarm).await
+        self.create_node(name, model, swarm, options.acl).await
     }
     fn validate_model(&self, model: Option<&str>) -> Result<()> {
         if let Some(model) = model {
             ensure!(
-                self.cfg.models().iter().any(|m| m == model),
+                self.models().iter().any(|m| m == model),
                 "Model is not enabled on this master"
             );
         }
         Ok(())
+    }
+    /// Ask pi for its available models once, at startup. A failure is logged
+    /// and leaves the configured list in charge; demo mode never asks.
+    pub async fn refresh_models(&self) {
+        if self.cfg.demo {
+            return;
+        }
+        match crate::pi::discover_models(&self.cfg).await {
+            Ok(models) => {
+                eprintln!("iso-master: pi reports {} available models", models.len());
+                *self.discovered_models.lock().unwrap() = models;
+            }
+            Err(e) => {
+                eprintln!("iso-master: model discovery failed ({e}); using the configured list");
+            }
+        }
+    }
+    /// The models offered to the UI and accepted for sessions: what pi reports,
+    /// narrowed to `pi_models` when the operator set one. The configured
+    /// default is always offered, and the configured list stands alone when
+    /// discovery found nothing.
+    pub fn models(&self) -> Vec<String> {
+        let discovered = self.discovered_models.lock().unwrap().clone();
+        let mut models = if discovered.is_empty() {
+            self.cfg.models()
+        } else if self.cfg.pi_models.is_empty() {
+            discovered
+        } else {
+            let allowed = self.cfg.models();
+            discovered
+                .into_iter()
+                .filter(|m| allowed.contains(m))
+                .collect()
+        };
+        if let Some(model) = &self.cfg.pi_model {
+            models.push(model.clone());
+        }
+        models.sort();
+        models.dedup();
+        models
     }
     async fn create_node(
         &self,
         name: &str,
         model: Option<String>,
         mut swarm: Option<Swarm>,
+        acl: crate::model::Acl,
     ) -> Result<Session> {
         ensure!(
             (swarm.is_some() || !name.trim().is_empty()) && name.len() <= 120,
@@ -171,6 +216,13 @@ impl Engine {
         {
             s.root = id.clone();
         }
+        // The ACL is a swarm property (keyed by root), or the workspace's own
+        // for a standalone. Persist it so children inherit it and it can be
+        // edited later; the create below applies it to this VM.
+        let scope = swarm.as_ref().map_or(id.as_str(), |s| s.root.as_str());
+        if !acl.is_empty() {
+            self.store.set_swarm_policy(scope, &acl)?;
+        }
         let model = swarm
             .as_ref()
             .map(|s| {
@@ -196,7 +248,7 @@ impl Engine {
         self.store.insert(&s)?;
         let lock = self.lock(&id);
         let _guard = lock.lock().await;
-        match plane.create(&id, name).await {
+        match plane.create(&id, name, &acl).await {
             Ok(vm) => {
                 self.store.update(&id, |s| {
                     s.vm = Some(vm);
@@ -270,8 +322,18 @@ impl Engine {
             json!({"type":"notice","text":"Workspace ready; connecting agent…"}),
         )?;
         let worker = match Pi::start(&cfg, &plane.config, vm, id, self.store.clone(), swarm).await {
-            Ok(worker) => worker,
+            Ok(worker) => {
+                crate::metrics::Metrics::global()
+                    .workers
+                    .with_label_values(&["start", &s.name])
+                    .inc();
+                worker
+            }
             Err(e) => {
+                crate::metrics::Metrics::global()
+                    .workers
+                    .with_label_values(&["start_failed", &s.name])
+                    .inc();
                 self.worker_tokens.lock().unwrap().remove(id);
                 return Err(e);
             }
@@ -305,7 +367,8 @@ impl Engine {
         );
         let lock = self.lock(id);
         let _guard = lock.lock().await;
-        let phase = self.store.get(id)?.phase;
+        let session = self.store.get(id)?;
+        let phase = session.phase;
         ensure!(
             matches!(
                 phase,
@@ -313,6 +376,10 @@ impl Engine {
             ),
             "Wait for startup or explicitly recover this agent before sending"
         );
+        crate::metrics::Metrics::global()
+            .prompts
+            .with_label_values(&[&session.name, "operator"])
+            .inc();
         if phase == Phase::Working || self.store.has_pending_message(id)? {
             self.store.enqueue("operator", id, message)?;
             Ok(())
@@ -352,6 +419,28 @@ impl Engine {
             bail!("Prompt outcome unknown");
         }
         Ok(())
+    }
+    /// Recover every session this master's own restart interrupted — the one
+    /// interrupt class that is provably not a failure. Sequential, so a fleet
+    /// of workspaces doesn't reboot at once; each recovery still fences the
+    /// guest and replays nothing. Real failures keep requiring the operator.
+    pub async fn auto_recover(self: Arc<Self>) {
+        let Ok(sessions) = self.store.list() else {
+            return;
+        };
+        for s in sessions {
+            if s.phase == Phase::Interrupted
+                && matches!(
+                    s.error.as_deref(),
+                    Some(crate::store::RESTART_INTERRUPT) | Some(crate::store::SHUTDOWN_INTERRUPT)
+                )
+            {
+                eprintln!("iso-master: auto-recovering '{}' after restart", s.name);
+                if let Err(e) = self.recover_session(&s.id).await {
+                    eprintln!("iso-master: auto-recovery of '{}' failed: {e}", s.name);
+                }
+            }
+        }
     }
     pub async fn recover_session(&self, id: &str) -> Result<Session> {
         let lock = self.lock(id);
@@ -411,10 +500,11 @@ impl Engine {
             "This agent cannot be stopped in its current state"
         );
         let vm = s.vm.as_deref().context("No workspace")?;
-        self.store.interrupt(
+        self.store.phase(id, Phase::Stopping)?;
+        self.store.event(
             id,
-            "Stopping VM; workspace files and conversation are retained.",
-        );
+            json!({"type":"notice","text":"Stopping VM; workspace files and conversation are retained."}),
+        )?;
         self.stop_worker(id).await;
         let plane = self.plane(&s.plane)?;
         if let Err(error) = async {
@@ -427,10 +517,16 @@ impl Engine {
         }
         .await
         {
+            // A stop we couldn't confirm is the one case that still needs an
+            // explicit recovery — the guest's state is unknown.
             self.store.interrupt(id, "VM stop not confirmed. Check the plane and retry Stop VM; no prompts will be replayed.");
             return Err(error);
         }
-        self.store.interrupt(id, "VM stopped; workspace files retained. Recover explicitly to cold-boot it. No prompts will be replayed.");
+        self.store.phase(id, Phase::Stopped)?;
+        self.store.event(
+            id,
+            json!({"type":"notice","text":"VM stopped; resources reclaimed. Workspace files and conversation are retained — your next message cold-boots it."}),
+        )?;
         Ok(())
     }
     async fn sleep_locked(&self, id: &str) -> Result<()> {
@@ -652,7 +748,8 @@ impl Engine {
         );
         self.store.phase(id, Phase::Allocating)?;
         self.store.event(id, json!({"type":"notice","text":"Operator explicitly retried allocation after checking the plane. No prompts will be replayed."}))?;
-        match plane.create(id, &s.name).await {
+        let acl = self.store.get_swarm_policy(&self.policy_scope(&s))?;
+        match plane.create(id, &s.name, &acl).await {
             Ok(vm) => {
                 self.store.update(id, |session| {
                     session.vm = Some(vm);
@@ -676,10 +773,7 @@ impl Engine {
         let workers = std::mem::take(&mut *self.workers.lock().await);
         for (id, worker) in workers {
             worker.close().await;
-            self.store.interrupt(
-                &id,
-                "Master stopped. Recover to resume; no prompts will be replayed.",
-            );
+            self.store.interrupt(&id, crate::store::SHUTDOWN_INTERRUPT);
         }
     }
     pub async fn timer(self: Arc<Self>) {
@@ -729,6 +823,107 @@ impl Engine {
             .filter(|s| s.swarm.as_ref().is_some_and(|n| n.root == swarm.root))
             .collect())
     }
+    /// The board a session reads and writes: one per swarm, keyed by its root.
+    fn board_scope(&self, id: &str) -> Result<String> {
+        let s = self.store.get(id)?;
+        Ok(s.swarm.map_or_else(|| id.to_string(), |w| w.root))
+    }
+    /// The ACL scope a session belongs to: its swarm root, or itself.
+    fn policy_scope(&self, s: &Session) -> String {
+        s.swarm
+            .as_ref()
+            .map_or_else(|| s.id.clone(), |w| w.root.clone())
+    }
+    /// The swarm's (or workspace's) current egress ACL.
+    pub fn get_acl(&self, id: &str) -> Result<crate::model::Acl> {
+        let s = self.store.get(id)?;
+        self.store.get_swarm_policy(&self.policy_scope(&s))
+    }
+    /// Set the swarm's egress ACL and fan it out to every member holding a live
+    /// or suspended VM. Persisted first, so children created afterwards inherit
+    /// it and a partial fan-out can be retried. Returns a per-member outcome.
+    pub async fn set_acl(&self, id: &str, acl: crate::model::Acl) -> Result<Value> {
+        if let Some(mode) = acl.egress.as_deref().filter(|m| !m.is_empty()) {
+            ensure!(
+                matches!(mode, "proxy" | "deny"),
+                "Egress must be 'proxy' or 'deny'"
+            );
+        }
+        let scope = self.policy_scope(&self.store.get(id)?);
+        self.store.set_swarm_policy(&scope, &acl)?;
+        // Members: the whole swarm (by root), or just this workspace.
+        let members: Vec<Session> = self
+            .store
+            .list()?
+            .into_iter()
+            .filter(|s| self.policy_scope(s) == scope)
+            .collect();
+        let results = join_all(members.into_iter().map(|s| {
+            let acl = acl.clone();
+            async move {
+                if s.vm.is_none()
+                    || !matches!(
+                        s.phase,
+                        Phase::Idle | Phase::Working | Phase::Asleep | Phase::Starting
+                    )
+                {
+                    return json!({"agent":s.name,"applied":false,"reason":"no live workspace"});
+                }
+                match self.plane(&s.plane) {
+                    Ok(plane) => match plane.set_policy(s.vm.as_deref().unwrap_or(""), &acl).await {
+                        Ok(()) => {
+                            let _ = self.store.event(&s.id, json!({"type":"notice","text":"Egress ACL updated by the operator."}));
+                            json!({"agent":s.name,"applied":true})
+                        }
+                        Err(e) => json!({"agent":s.name,"applied":false,"reason":e.to_string()}),
+                    },
+                    Err(e) => json!({"agent":s.name,"applied":false,"reason":e.to_string()}),
+                }
+            }
+        }))
+        .await;
+        Ok(json!({"acl":acl,"applied_to":results}))
+    }
+    pub fn board_post(&self, id: &str, path: &str, body: &str) -> Result<Value> {
+        let path = board_path(path)?;
+        ensure!(
+            !body.trim().is_empty() && body.len() <= 64000,
+            "Post body must be 1–64000 bytes"
+        );
+        self.store
+            .board_create(&self.board_scope(id)?, &path, id, body)?;
+        Ok(json!({"path":path,"status":"posted"}))
+    }
+    pub fn board_update(&self, id: &str, path: &str, body: &str) -> Result<Value> {
+        let path = board_path(path)?;
+        ensure!(
+            !body.trim().is_empty() && body.len() <= 64000,
+            "Post body must be 1–64000 bytes"
+        );
+        self.store
+            .board_update(&self.board_scope(id)?, &path, id, body)?;
+        Ok(json!({"path":path,"status":"updated"}))
+    }
+    pub fn board_delete(&self, id: &str, path: &str) -> Result<Value> {
+        let path = board_path(path)?;
+        self.store.board_delete(&self.board_scope(id)?, &path)?;
+        Ok(json!({"path":path,"status":"deleted"}))
+    }
+    pub fn board_read(&self, id: &str, path: &str) -> Result<Value> {
+        self.store
+            .board_read(&self.board_scope(id)?, &board_path(path)?)
+    }
+    pub fn board_list(&self, id: &str, prefix: &str) -> Result<Value> {
+        let prefix = if prefix.trim().is_empty() {
+            String::new()
+        } else {
+            board_path(prefix)?
+        };
+        Ok(json!({
+            "prefix": prefix,
+            "posts": self.store.board_list(&self.board_scope(id)?, &prefix)?,
+        }))
+    }
     pub async fn spawn_child(
         &self,
         parent: &str,
@@ -762,6 +957,9 @@ impl Engine {
             crate::config::below_limit(self.tree(parent)?.len(), self.cfg.swarm_max_agents),
             "Swarm size limit reached"
         );
+        // Inherit the swarm's ACL so the child boots with the same egress
+        // policy as the rest of the swarm.
+        let acl = self.store.get_swarm_policy(&p.root)?;
         let child = self
             .create_node(
                 name,
@@ -775,6 +973,7 @@ impl Engine {
                     worker_model: p.worker_model,
                     task: task.into(),
                 }),
+                acl,
             )
             .await?;
         self.store.event(
@@ -782,6 +981,26 @@ impl Engine {
             json!({"type":"notice","text":format!("Scheduled {} ({})", child.name, child.id)}),
         )?;
         Ok(child)
+    }
+    /// A planner removes a direct child: delete its VM and disk (and, if the
+    /// child is itself a sub-planner, its whole descendant subtree), keeping the
+    /// conversations read-only. This is disposal, not a pause — the workspace is
+    /// gone and cannot be recovered.
+    pub async fn swarm_stop(&self, caller: &str, target: &str) -> Result<Value> {
+        let from = self.store.get(caller)?;
+        let planner = from.swarm.context("Caller is not in a swarm")?;
+        ensure!(
+            planner.role == Role::Planner,
+            "Only planners can remove workers"
+        );
+        let child = self.store.get(target)?;
+        let c = child.swarm.as_ref().context("Target is not in a swarm")?;
+        ensure!(
+            c.root == planner.root && c.parent.as_deref() == Some(caller),
+            "A planner can only remove its own direct children"
+        );
+        self.close_session(target).await?;
+        Ok(json!({"removed":target,"name":child.name,"status":"removed"}))
     }
     pub fn send_message(&self, sender: &str, recipient: &str, message: &str) -> Result<i64> {
         ensure!(
@@ -818,6 +1037,17 @@ impl Engine {
                 return;
             }
             if let Ok(Some((mid, sender, text))) = self.store.claim_message(&s.id) {
+                crate::metrics::Metrics::global()
+                    .prompts
+                    .with_label_values(&[
+                        s.name.as_str(),
+                        if sender == "operator" {
+                            "queued"
+                        } else {
+                            "swarm"
+                        },
+                    ])
+                    .inc();
                 let prompt = if sender == "operator" {
                     Ok((
                         text.clone(),
@@ -905,6 +1135,30 @@ impl Engine {
             json!({"type":"swarm_message","text":text,"source":{"id":sender,"name":from.name,"role":role,"relationship":relationship}}),
         ))
     }
+}
+
+/// A board path: forward-slash segments, no traversal, bounded. Normalized by
+/// trimming surrounding slashes so `a/b`, `/a/b` and `a/b/` name one post.
+fn board_path(path: &str) -> Result<String> {
+    let path = path.trim().trim_matches('/');
+    ensure!(
+        !path.is_empty() && path.len() <= 512,
+        "Path must be 1–512 bytes of forward-slash segments"
+    );
+    ensure!(
+        !path.chars().any(char::is_control),
+        "Path must not contain control characters"
+    );
+    let segments: Vec<&str> = path.split('/').collect();
+    ensure!(segments.len() <= 16, "Path is too deep (16 segments max)");
+    for segment in segments {
+        ensure!(
+            !segment.is_empty() && segment != "." && segment != "..",
+            "Path segments must be non-empty and not dots"
+        );
+        ensure!(segment.len() <= 128, "Path segment is too long");
+    }
+    Ok(path.into())
 }
 
 #[cfg(test)]
@@ -1264,10 +1518,16 @@ mod tests {
             .unwrap();
         assert!(e.reconcile(&id).await.is_err());
         assert!(e.planes[0].list().await.unwrap().is_empty());
-        let vm = e.planes[0].create(&id, "ambiguous").await.unwrap();
+        let vm = e.planes[0]
+            .create(&id, "ambiguous", &crate::model::Acl::default())
+            .await
+            .unwrap();
         assert!(e.retry_allocation(&id).await.is_err());
         assert_eq!(e.planes[0].list().await.unwrap().len(), 1);
-        let duplicate = e.planes[0].create(&id, "duplicate").await.unwrap();
+        let duplicate = e.planes[0]
+            .create(&id, "duplicate", &crate::model::Acl::default())
+            .await
+            .unwrap();
         assert!(e.reconcile(&id).await.is_err());
         assert!(e.retry_allocation(&id).await.is_err());
         assert_eq!(e.planes[0].list().await.unwrap().len(), 2);
@@ -1323,21 +1583,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_vm_retains_workspace_and_requires_explicit_recovery() {
+    async fn stop_vm_reclaims_resources_and_cold_boots_on_next_message() {
         let (_dir, e) = fixture();
         let s = e.create("stop test").await.unwrap();
         e.sleep(&s.id).await.unwrap();
         e.stop_vm(&s.id).await.unwrap();
-        e.stop_vm(&s.id).await.unwrap();
+        e.stop_vm(&s.id).await.unwrap(); // idempotent
         assert_eq!(
             e.planes[0].get(s.vm.as_deref().unwrap()).await.unwrap()["state"],
             "stopped"
         );
         assert_eq!(e.store.get(&s.id).unwrap().vm, s.vm);
-        assert_eq!(e.store.get(&s.id).unwrap().phase, Phase::Interrupted);
-        assert!(e.prompt(&s.id, "do not replay").await.is_err());
+        // A stopped worker rests as Stopped, not Interrupted: no explicit
+        // recovery, and the workspace is kept.
+        assert_eq!(e.store.get(&s.id).unwrap().phase, Phase::Stopped);
         assert!(e.workers.lock().await.is_empty());
-        assert_eq!(e.recover_session(&s.id).await.unwrap().vm, s.vm);
+        // The next message cold-boots the same workspace automatically.
+        e.prompt(&s.id, "resume where we left off").await.unwrap();
+        assert_eq!(e.store.get(&s.id).unwrap().vm, s.vm);
         e.close_session(&s.id).await.unwrap();
     }
 

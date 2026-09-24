@@ -186,7 +186,7 @@ process-wide file lock prevents two masters from using the same SQLite database.
 
 | Operation    | Behavior                                                                                                                                              |
 | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| New agent    | Persist session, create a **durable** VM, wait for its guest agent and internal DNS, start pi and require a remote-tool readiness handshake.         |
+| New agent    | Persist session, create a **durable** VM, wait for its guest agent and internal DNS, start pi and require a remote-tool readiness handshake.          |
 | Prompt       | One in flight per session. Conversation events are journaled and delivered to React using durable sequence cursors.                                   |
 | Idle timeout | Default 900 seconds, checked at most every 30 seconds. Only fully settled (`agent_settled`) sessions sleep. Browser polling does not keep them awake. |
 | Sleep        | Close the idle pi worker; ask iso to **suspend** the VM. Preserve disk, VM ID, history and assignment.                                                |
@@ -303,6 +303,7 @@ RUN_BROWSER_TESTS=1 scripts/check-master.sh
 
 Browser tests use a temporary database and two mock planes; they also check
 transcript replay, no client-side exceptions and mobile horizontal overflow.
+
 # Storage visibility
 
 The master retires suspended VMs after `suspended_seconds` (default 600; 0

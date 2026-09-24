@@ -22,6 +22,11 @@ pub struct Config {
     pub suspended_seconds: u64,
     pub max_agents: usize,
     pub demo: bool,
+    /// Prometheus text metrics listener; empty disables it.
+    pub metrics_bind: String,
+    /// Recover sessions the master's own restart interrupted, at startup.
+    /// Failure interrupts (worker crash, uncertain operations) stay manual.
+    pub auto_recover: bool,
     pub planes: Vec<PlaneConfig>,
 }
 impl Default for Config {
@@ -43,6 +48,8 @@ impl Default for Config {
             suspended_seconds: 600,
             max_agents: 0,
             demo: false,
+            metrics_bind: "127.0.0.1:9464".into(),
+            auto_recover: true,
             planes: vec![],
         }
     }
@@ -80,24 +87,6 @@ pub fn below_limit(count: usize, limit: usize) -> bool {
     limit == 0 || count < limit
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn omitted_caps_are_unlimited_and_positive_caps_remain_explicit() {
-        let cfg: Config = serde_json::from_value(serde_json::json!({
-            "demo": true, "planes": [{"id":"test", "server":"demo", "creds":"unused", "template":"debian"}]
-        })).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(cfg.max_agents, 0);
-        assert_eq!(cfg.swarm_max_depth, 5);
-        assert_eq!(cfg.swarm_max_agents, 0);
-        assert_eq!(cfg.planes[0].max_vms, 0);
-        assert!(below_limit(usize::MAX, 0));
-        assert!(below_limit(15, 16));
-        assert!(!below_limit(16, 16));
-    }
-}
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let mut cfg: Self = serde_json::from_slice(&std::fs::read(path)?)?;
@@ -180,5 +169,25 @@ impl Config {
         models.sort();
         models.dedup();
         models
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn omitted_caps_are_unlimited_and_positive_caps_remain_explicit() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "demo": true, "planes": [{"id":"test", "server":"demo", "creds":"unused", "template":"debian"}]
+        }))
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.max_agents, 0);
+        assert_eq!(cfg.swarm_max_depth, 5);
+        assert_eq!(cfg.swarm_max_agents, 0);
+        assert_eq!(cfg.planes[0].max_vms, 0);
+        assert!(below_limit(usize::MAX, 0));
+        assert!(below_limit(15, 16));
+        assert!(!below_limit(16, 16));
     }
 }

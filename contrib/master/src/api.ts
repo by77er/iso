@@ -32,6 +32,11 @@ export interface Session {
     task: string;
   } | null;
 }
+export interface Acl {
+  egress: string | null;
+  allow: string[];
+  rules: string[];
+}
 export interface ModelCatalog {
   models: string[];
   default: string | null;

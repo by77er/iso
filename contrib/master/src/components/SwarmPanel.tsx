@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { GitBranch, Send } from "lucide-react";
+import { FileText, GitBranch, Send } from "lucide-react";
 import { api, type Session } from "../api";
 import { ErrorBanner } from "./shared";
+import { fold, type BoardPost } from "./Board";
 
 interface Mail {
   id: number;
@@ -10,9 +11,16 @@ interface Mail {
   message: string;
   status: string;
 }
-export default function SwarmPanel({ session }: { session: Session }) {
+export default function SwarmPanel({
+  session,
+  openSwarm,
+}: {
+  session: Session;
+  openSwarm: (rootId: string) => void;
+}) {
   const [nodes, setNodes] = useState<Session[]>([]),
     [messages, setMessages] = useState<Mail[]>([]),
+    [posts, setPosts] = useState<BoardPost[]>([]),
     [error, setError] = useState(""),
     [adding, setAdding] = useState(false),
     [busy, setBusy] = useState(false),
@@ -24,12 +32,16 @@ export default function SwarmPanel({ session }: { session: Session }) {
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
       try {
-        const data = await api<{ nodes: Session[]; messages: Mail[] }>(
-          `/sessions/${session.id}/swarm`,
-        );
+        const [data, board] = await Promise.all([
+          api<{ nodes: Session[]; messages: Mail[] }>(
+            `/sessions/${session.id}/swarm`,
+          ),
+          api<{ posts: BoardPost[] }>(`/sessions/${session.id}/board`),
+        ]);
         if (!stopped) {
           setNodes(data.nodes);
           setMessages(data.messages);
+          setPosts(board.posts);
         }
       } catch (error) {
         if (!stopped) setError((error as Error).message);
@@ -62,6 +74,7 @@ export default function SwarmPanel({ session }: { session: Session }) {
       setBusy(false);
     }
   }
+  const boardDirs = [...fold(posts).dirs.keys()];
   return (
     <details className="swarm-panel">
       <summary>
@@ -123,6 +136,21 @@ export default function SwarmPanel({ session }: { session: Session }) {
             </button>
           </form>
         )}
+        <div className="board-summary">
+          <FileText size={14} />
+          <span>
+            Message board: {posts.length} post{posts.length === 1 ? "" : "s"}
+            {boardDirs.length
+              ? ` in ${boardDirs.map((dir) => `${dir}/`).join(", ")}`
+              : ""}
+          </span>
+          <button
+            className="secondary"
+            onClick={() => openSwarm(session.swarm?.root ?? session.id)}
+          >
+            Open swarm
+          </button>
+        </div>
         {!!messages.length && (
           <details className="swarm-mail">
             <summary>

@@ -97,14 +97,31 @@ export default function Transcript({
   const saved = useRef<{ top: number; bottom: boolean } | null>(null);
   useLayoutEffect(() => {
     try {
-      const value = JSON.parse(sessionStorage.getItem(`chat-scroll:${session.id}`) || "null");
-      if (value && Number.isFinite(value.top) && value.top >= 0 && typeof value.bottom === "boolean") saved.current = value;
-    } catch { /* Storage may be unavailable. */ }
+      const value = JSON.parse(
+        sessionStorage.getItem(`chat-scroll:${session.id}`) || "null",
+      );
+      if (
+        value &&
+        Number.isFinite(value.top) &&
+        value.top >= 0 &&
+        typeof value.bottom === "boolean"
+      )
+        saved.current = value;
+    } catch {
+      /* Storage may be unavailable. */
+    }
   }, [session.id]);
   function savePosition() {
     const node = ref.current;
     if (!node || !initialized.current) return;
-    try { sessionStorage.setItem(`chat-scroll:${session.id}`, JSON.stringify({ top: node.scrollTop, bottom: atBottom.current })); } catch { /* Optional persistence. */ }
+    try {
+      sessionStorage.setItem(
+        `chat-scroll:${session.id}`,
+        JSON.stringify({ top: node.scrollTop, bottom: atBottom.current }),
+      );
+    } catch {
+      /* Optional persistence. */
+    }
   }
   useLayoutEffect(() => {
     const node = ref.current;
@@ -116,7 +133,8 @@ export default function Transcript({
   }, [historyLoaded, items]);
   useEffect(() => {
     const node = ref.current;
-    if (!node || !historyLoaded || !initialized.current || !atBottom.current) return;
+    if (!node || !historyLoaded || !initialized.current || !atBottom.current)
+      return;
     if (node.scrollHeight - node.clientHeight - node.scrollTop < 1) return;
     if (
       !initialized.current ||
@@ -146,166 +164,188 @@ export default function Transcript({
   }, [items, phase, historyLoaded]);
   return (
     <div className="transcript-shell">
-    <div
-      className="transcript"
-      ref={ref}
-      onPointerDown={() => { atBottom.current = false; following.current = false; }}
-      onKeyDown={(event) => {
-        if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+      <div
+        className="transcript"
+        ref={ref}
+        onPointerDown={() => {
           atBottom.current = false;
           following.current = false;
-        }
-      }}
-      onWheel={(event) => {
-        if (event.deltaY < 0) {
+        }}
+        onKeyDown={(event) => {
+          if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+            atBottom.current = false;
+            following.current = false;
+          }
+        }}
+        onWheel={(event) => {
+          if (event.deltaY < 0) {
+            atBottom.current = false;
+            following.current = false;
+          }
+        }}
+        onTouchMove={() => {
           atBottom.current = false;
           following.current = false;
-        }
-      }}
-      onTouchMove={() => {
-        atBottom.current = false;
-        following.current = false;
-      }}
-      onScroll={() => {
-        if (following.current) return;
-        const n = ref.current!;
-        atBottom.current = n.scrollHeight - n.scrollTop - n.clientHeight < 100;
-        setShowBottom(!atBottom.current);
-        savePosition();
-      }}
-    >
-      <div className="transcript-inner">
-        {!items.length && (
-          <div className="empty-chat">
-            <Box size={29} />
-            <h2>What would you like to work on?</h2>
-            <p>
-              Your agent has a private workspace. Describe a task to get
-              started.
-            </p>
-          </div>
-        )}
-        {groupTranscript(presentSwarmSends(items, session, sessions)).map(
-          (i) =>
-            i.kind === "tools" ? (
-              <div
-                key={i.key}
-                className="tool-group"
-                role="group"
-                aria-label="Agent tool calls"
-              >
-                <Box size={19} className="tool-group-icon" aria-hidden="true" />
-                <div className="tool-pills">
-                  {i.items.map((item) => (
-                    <ToolCard key={item.key} item={item} />
-                  ))}
-                </div>
-              </div>
-            ) : i.kind === "swarm" ? (
-              <article
-                key={i.key}
-                className={`swarm-message ${i.source?.relationship || ""} ${i.outgoing ? "outgoing" : ""}`}
-                aria-label={`Message ${i.outgoing ? "to" : "from"} ${i.source?.relationship || "swarm"}`}
-              >
-                <header>
-                  {(i.source?.relationship === "parent") !== !!i.outgoing ? (
-                    <ArrowDownLeft size={17} aria-hidden="true" />
-                  ) : (
-                    <ArrowUpRight size={17} aria-hidden="true" />
-                  )}
-                  <span>
-                    {i.outgoing ? "To" : "From"}{" "}
-                    {i.source?.relationship || "swarm"}
-                  </span>
-                  {i.source && (
-                    <button
-                      onClick={() => select(i.source!.id)}
-                      title={`Open ${i.source.name} (${i.source.id})`}
-                    >
-                      {i.source.name}
-                    </button>
-                  )}
-                  <span className="swarm-sender-role">{i.source?.role}</span>
-                </header>
-                <SwarmMessageBody text={i.text} />
-                {i.outgoing && (
-                  <details className="swarm-send-result">
-                    <summary>
-                      {i.streaming
-                        ? "Sending…"
-                        : i.isError
-                          ? "Send failed — inspect before retrying"
-                          : i.result === undefined
-                            ? "Send unconfirmed"
-                            : "Queued"}
-                    </summary>
-                    <pre>
-                      {JSON.stringify(
-                        i.result ?? "No confirmation received",
-                        null,
-                        2,
-                      )}
-                    </pre>
-                  </details>
-                )}
-              </article>
-            ) : i.kind === "notice" ? (
-              <div className="notice" key={i.key}>
-                <Activity size={14} />
-                <span>{i.text}</span>
-              </div>
-            ) : (
-              <article
-                key={i.key}
-                className={`message ${i.kind}`}
-                aria-label={i.kind === "user" ? "You" : "Agent"}
-              >
-                {i.kind === "assistant" && (
-                  <div className="message-label" aria-hidden="true">
-                    <Box
-                      size={19}
-                      className={
-                        i.streaming && phase === "working" ? "stream-label" : ""
-                      }
-                    />
+        }}
+        onScroll={() => {
+          if (following.current) return;
+          const n = ref.current!;
+          atBottom.current =
+            n.scrollHeight - n.scrollTop - n.clientHeight < 100;
+          setShowBottom(!atBottom.current);
+          savePosition();
+        }}
+      >
+        <div className="transcript-inner">
+          {!items.length && (
+            <div className="empty-chat">
+              <Box size={29} />
+              <h2>What would you like to work on?</h2>
+              <p>
+                Your agent has a private workspace. Describe a task to get
+                started.
+              </p>
+            </div>
+          )}
+          {groupTranscript(presentSwarmSends(items, session, sessions)).map(
+            (i) =>
+              i.kind === "tools" ? (
+                <div
+                  key={i.key}
+                  className="tool-group"
+                  role="group"
+                  aria-label="Agent tool calls"
+                >
+                  <Box
+                    size={19}
+                    className="tool-group-icon"
+                    aria-hidden="true"
+                  />
+                  <div className="tool-pills">
+                    {i.items.map((item) => (
+                      <ToolCard key={item.key} item={item} />
+                    ))}
                   </div>
-                )}
-                <div className="message-body">
-                  <Markdown
-                    disallowedElements={["img"]}
-                    components={{
-                      a: ({ children, ...props }) => (
-                        <a {...props} target="_blank" rel="noopener noreferrer">
-                          {children}
-                        </a>
-                      ),
-                    }}
-                  >
-                    {i.text}
-                  </Markdown>
-                  {i.streaming && !i.text && phase === "working" && (
-                    <LoaderCircle size={16} className="spin" />
-                  )}
                 </div>
-              </article>
-            ),
-        )}
-        {phase === "working" && !items.some((i) => i.streaming) && (
-          <div className="notice">
-            <LoaderCircle size={14} className="spin" />
-            Agent is working…
-          </div>
-        )}
+              ) : i.kind === "swarm" ? (
+                <article
+                  key={i.key}
+                  className={`swarm-message ${i.source?.relationship || ""} ${i.outgoing ? "outgoing" : ""}`}
+                  aria-label={`Message ${i.outgoing ? "to" : "from"} ${i.source?.relationship || "swarm"}`}
+                >
+                  <header>
+                    {(i.source?.relationship === "parent") !== !!i.outgoing ? (
+                      <ArrowDownLeft size={17} aria-hidden="true" />
+                    ) : (
+                      <ArrowUpRight size={17} aria-hidden="true" />
+                    )}
+                    <span>
+                      {i.outgoing ? "To" : "From"}{" "}
+                      {i.source?.relationship || "swarm"}
+                    </span>
+                    {i.source && (
+                      <button
+                        onClick={() => select(i.source!.id)}
+                        title={`Open ${i.source.name} (${i.source.id})`}
+                      >
+                        {i.source.name}
+                      </button>
+                    )}
+                    <span className="swarm-sender-role">{i.source?.role}</span>
+                  </header>
+                  <SwarmMessageBody text={i.text} />
+                  {i.outgoing && (
+                    <details className="swarm-send-result">
+                      <summary>
+                        {i.streaming
+                          ? "Sending…"
+                          : i.isError
+                            ? "Send failed — inspect before retrying"
+                            : i.result === undefined
+                              ? "Send unconfirmed"
+                              : "Queued"}
+                      </summary>
+                      <pre>
+                        {JSON.stringify(
+                          i.result ?? "No confirmation received",
+                          null,
+                          2,
+                        )}
+                      </pre>
+                    </details>
+                  )}
+                </article>
+              ) : i.kind === "notice" ? (
+                <div className="notice" key={i.key}>
+                  <Activity size={14} />
+                  <span>{i.text}</span>
+                </div>
+              ) : (
+                <article
+                  key={i.key}
+                  className={`message ${i.kind}`}
+                  aria-label={i.kind === "user" ? "You" : "Agent"}
+                >
+                  {i.kind === "assistant" && (
+                    <div className="message-label" aria-hidden="true">
+                      <Box
+                        size={19}
+                        className={
+                          i.streaming && phase === "working"
+                            ? "stream-label"
+                            : ""
+                        }
+                      />
+                    </div>
+                  )}
+                  <div className="message-body">
+                    <Markdown
+                      disallowedElements={["img"]}
+                      components={{
+                        a: ({ children, ...props }) => (
+                          <a
+                            {...props}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            {children}
+                          </a>
+                        ),
+                      }}
+                    >
+                      {i.text}
+                    </Markdown>
+                    {i.streaming && !i.text && phase === "working" && (
+                      <LoaderCircle size={16} className="spin" />
+                    )}
+                  </div>
+                </article>
+              ),
+          )}
+          {phase === "working" && !items.some((i) => i.streaming) && (
+            <div className="notice">
+              <LoaderCircle size={14} className="spin" />
+              Agent is working…
+            </div>
+          )}
+        </div>
       </div>
-    </div>
-    {showBottom && <button className="go-to-bottom" onClick={() => {
-      atBottom.current = true;
-      following.current = false;
-      const node = ref.current;
-      if (node) node.scrollTop = node.scrollHeight;
-      setShowBottom(false);
-      savePosition();
-    }}><ArrowDown size={16} />Go to bottom</button>}
+      {showBottom && (
+        <button
+          className="go-to-bottom"
+          onClick={() => {
+            atBottom.current = true;
+            following.current = false;
+            const node = ref.current;
+            if (node) node.scrollTop = node.scrollHeight;
+            setShowBottom(false);
+            savePosition();
+          }}
+        >
+          <ArrowDown size={16} />
+          Go to bottom
+        </button>
+      )}
     </div>
   );
 }

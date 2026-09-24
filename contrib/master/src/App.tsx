@@ -8,12 +8,14 @@ import Sidebar from "./components/Sidebar";
 import Welcome from "./components/Welcome";
 import Chat from "./components/Chat";
 import Fleet from "./components/Fleet";
+import SwarmExplorer from "./components/SwarmExplorer";
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null),
     [loading, setLoading] = useState(true),
     [sessions, setSessions] = useState<Session[]>([]),
     [selected, setSelected] = useState<string | null>(null),
+    [swarmRoot, setSwarmRoot] = useState<string | null>(null),
     [view, setView] = useState("chat"),
     [creating, setCreating] = useState(false),
     [error, setError] = useState("");
@@ -26,6 +28,7 @@ export default function App() {
       setUser(null);
       setSessions([]);
       setSelected(null);
+      setSwarmRoot(null);
     };
     window.addEventListener("auth-expired", expired);
     return () => window.removeEventListener("auth-expired", expired);
@@ -58,12 +61,17 @@ export default function App() {
     setSelected(id);
     setView("chat");
   }
+  function openSwarm(rootId: string) {
+    setSwarmRoot(rootId);
+    setView("swarm");
+  }
   async function logout() {
     try {
       await api("/logout", "POST", {});
       setUser(null);
       setSessions([]);
       setSelected(null);
+      setSwarmRoot(null);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -85,6 +93,8 @@ export default function App() {
         newAgent={() => setCreating(true)}
         view={view}
         setView={setView}
+        swarmRoot={swarmRoot}
+        openSwarm={openSwarm}
         user={user}
         logout={logout}
       />
@@ -97,6 +107,13 @@ export default function App() {
         <ErrorBanner error={error} clear={() => setError("")} />
         {view === "fleet" ? (
           <Fleet />
+        ) : view === "swarm" && swarmRoot ? (
+          <SwarmExplorer
+            key={swarmRoot}
+            rootId={swarmRoot}
+            sessions={sessions}
+            select={select}
+          />
         ) : selected ? (
           <Chat
             sessions={sessions}
@@ -104,6 +121,7 @@ export default function App() {
             id={selected}
             onUpdate={update}
             select={select}
+            openSwarm={openSwarm}
           />
         ) : (
           <Welcome create={() => setCreating(true)} />

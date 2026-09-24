@@ -194,7 +194,7 @@ async fn create(State(web): State<Web>, Json(data): Json<New>) -> Api<Session> {
     ))
 }
 async fn models(State(web): State<Web>) -> Json<Value> {
-    Json(json!({"models":web.engine.cfg.models(),"default":web.engine.cfg.pi_model}))
+    Json(json!({"models":web.engine.models(),"default":web.engine.cfg.pi_model}))
 }
 #[derive(Deserialize)]
 struct ModelChoice {
@@ -214,6 +214,35 @@ async fn swarm(State(web): State<Web>, Path(id): Path<Uuid>) -> Api<Value> {
     Ok(Json(
         json!({"nodes":web.engine.tree(&id)?,"messages":web.engine.store.mailbox(&id)?}),
     ))
+}
+#[derive(Deserialize)]
+struct BoardQuery {
+    #[serde(default)]
+    path: String,
+}
+/// The swarm's message board, read-only for the operator: the listing without
+/// `path`, one post's body with it.
+async fn board(
+    State(web): State<Web>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<BoardQuery>,
+) -> Api<Value> {
+    let id = id.to_string();
+    Ok(Json(if query.path.is_empty() {
+        web.engine.board_list(&id, "")?
+    } else {
+        web.engine.board_read(&id, &query.path)?
+    }))
+}
+async fn get_acl(State(web): State<Web>, Path(id): Path<Uuid>) -> Api<Value> {
+    Ok(Json(json!(web.engine.get_acl(&id.to_string())?)))
+}
+async fn set_acl(
+    State(web): State<Web>,
+    Path(id): Path<Uuid>,
+    Json(acl): Json<crate::model::Acl>,
+) -> Api<Value> {
+    Ok(Json(web.engine.set_acl(&id.to_string(), acl).await?))
 }
 #[derive(Deserialize)]
 struct Child {
@@ -245,6 +274,12 @@ struct WorkerRequest {
     recipient: String,
     #[serde(default)]
     message: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    prefix: String,
 }
 async fn worker(
     State(web): State<Web>,
@@ -260,7 +295,16 @@ async fn worker(
         .engine
         .worker_identity(token)
         .map_err(|_| ApiError(StatusCode::UNAUTHORIZED, "Invalid worker identity".into()))?;
-    let value = match data.action.as_str() {
+    let (agent, swarm_label) = web
+        .engine
+        .store
+        .get(&id)
+        .map(|s| {
+            let swarm = web.engine.store.swarm_name(&s);
+            (s.name, swarm)
+        })
+        .unwrap_or_default();
+    let outcome: Result<Value, ApiError> = async { Ok(match data.action.as_str() {
         "spawn" => json!(
             web.engine
                 .spawn_child(
@@ -280,14 +324,30 @@ async fn worker(
         "status" => {
             json!({"self":id,"nodes":web.engine.tree(&id)?,"messages":web.engine.store.mailbox(&id)?})
         }
+        "board_post" => web.engine.board_post(&id, &data.path, &data.content)?,
+        "board_read" => web.engine.board_read(&id, &data.path)?,
+        "board_update" => web.engine.board_update(&id, &data.path, &data.content)?,
+        "board_delete" => web.engine.board_delete(&id, &data.path)?,
+        "board_list" => web.engine.board_list(&id, &data.prefix)?,
+        "stop_worker" => web.engine.swarm_stop(&id, &data.recipient).await?,
         _ => {
             return Err(ApiError(
                 StatusCode::BAD_REQUEST,
                 "Unknown swarm action".into(),
             ));
         }
-    };
-    Ok(Json(value))
+    })}
+    .await;
+    crate::metrics::Metrics::global()
+        .worker_actions
+        .with_label_values(&[
+            data.action.as_str(),
+            agent.as_str(),
+            swarm_label.as_str(),
+            if outcome.is_err() { "true" } else { "false" },
+        ])
+        .inc();
+    Ok(Json(outcome?))
 }
 pub fn worker_router(web: Web) -> Router {
     Router::new()
@@ -370,6 +430,122 @@ async fn fleet(State(web): State<Web>) -> Json<Value> {
     Json(json!({"planes":web.engine.fleet().await}))
 }
 
+/// Prometheus text: accumulated counters plus scrape-time state — sessions,
+/// board and mailbox depth, plane capacity and per-VM states. Served on its
+/// own loopback listener, unauthenticated by design.
+async fn metrics(State(web): State<Web>) -> Result<String, ApiError> {
+    use crate::metrics::{Metrics, label};
+    use std::fmt::Write;
+    let mut out = Metrics::global().encode();
+    let sessions = web.engine.store.list()?;
+    for s in &sessions {
+        let phase = serde_json::to_value(s.phase)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let swarm = web.engine.store.swarm_name(s);
+        let role = s.swarm.as_ref().map_or("standalone", |w| match w.role {
+            Role::Planner => "planner",
+            Role::Worker => "worker",
+        });
+        let _ = writeln!(
+            out,
+            "iso_master_session_info{{agent=\"{}\",phase=\"{}\",plane=\"{}\",model=\"{}\",swarm=\"{}\",role=\"{}\"}} 1",
+            label(&s.name),
+            phase,
+            label(&s.plane),
+            label(s.model.as_deref().unwrap_or("")),
+            label(&swarm),
+            role
+        );
+        let _ = writeln!(
+            out,
+            "iso_master_session_last_active_seconds{{agent=\"{}\"}} {}",
+            label(&s.name),
+            s.last_active
+        );
+    }
+    let name = |id: &str| {
+        sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| id.into())
+    };
+    for (scope, count) in web.engine.store.board_counts()? {
+        let _ = writeln!(
+            out,
+            "iso_master_board_posts{{swarm=\"{}\"}} {}",
+            label(&name(&scope)),
+            count
+        );
+    }
+    for (recipient, count) in web.engine.store.mailbox_pending()? {
+        let _ = writeln!(
+            out,
+            "iso_master_mailbox_pending{{agent=\"{}\"}} {}",
+            label(&name(&recipient)),
+            count
+        );
+    }
+    for plane in web.engine.fleet().await {
+        let id = label(plane["id"].as_str().unwrap_or(""));
+        let up = plane["available"].as_bool().unwrap_or(false);
+        let _ = writeln!(out, "iso_plane_up{{plane=\"{id}\"}} {}", u8::from(up));
+        let _ = writeln!(
+            out,
+            "iso_plane_vm_capacity{{plane=\"{id}\"}} {}",
+            plane["capacity"].as_u64().unwrap_or(0)
+        );
+        if let Some(count) = plane["count"].as_u64() {
+            let _ = writeln!(out, "iso_plane_vms{{plane=\"{id}\"}} {count}");
+        }
+        for (key, metric) in [
+            ("pool_used_bytes", "iso_plane_pool_used_bytes"),
+            ("pool_capacity_bytes", "iso_plane_pool_capacity_bytes"),
+            ("snapshot_bytes", "iso_plane_snapshot_bytes"),
+            (
+                "filesystem_available_bytes",
+                "iso_plane_filesystem_available_bytes",
+            ),
+            (
+                "filesystem_capacity_bytes",
+                "iso_plane_filesystem_capacity_bytes",
+            ),
+        ] {
+            if let Some(v) = plane["storage"][key].as_u64() {
+                let _ = writeln!(out, "{metric}{{plane=\"{id}\"}} {v}");
+            }
+        }
+        if let Some(vms) = plane["vms"].as_array() {
+            let mut states: std::collections::HashMap<(String, String), u64> =
+                std::collections::HashMap::new();
+            for vm in vms {
+                *states
+                    .entry((
+                        vm["template"].as_str().unwrap_or("").into(),
+                        vm["state"].as_str().unwrap_or("").into(),
+                    ))
+                    .or_default() += 1;
+            }
+            for ((template, state), count) in states {
+                let _ = writeln!(
+                    out,
+                    "iso_vm_states{{plane=\"{id}\",template=\"{}\",state=\"{}\"}} {count}",
+                    label(&template),
+                    label(&state)
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+pub fn metrics_router(web: Web) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics))
+        .with_state(web)
+}
+
 pub fn router(web: Web) -> Router {
     let api = Router::new()
         .route("/api/login", post(login))
@@ -381,6 +557,8 @@ pub fn router(web: Web) -> Router {
         .route("/api/sessions/{id}/events", get(events))
         .route("/api/sessions/{id}/model", post(set_model))
         .route("/api/sessions/{id}/swarm", get(swarm))
+        .route("/api/sessions/{id}/board", get(board))
+        .route("/api/sessions/{id}/acl", get(get_acl).put(set_acl))
         .route("/api/sessions/{id}/children", post(child))
         .route("/api/sessions/{id}/prompt", post(prompt))
         .route("/api/sessions/{id}/queue/{message}", delete(cancel_queued))

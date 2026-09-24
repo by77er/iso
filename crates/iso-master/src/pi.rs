@@ -217,7 +217,10 @@ impl Pi {
     }
 }
 
-fn configure(cmd: &mut Command, cfg: &Config, dir: &Path) -> Result<()> {
+/// The worker environment: cleared, then the configured provider values, a
+/// PATH, and a HOME under `dir`. Shared by the RPC workers and model discovery
+/// so pi answers both with the same providers authenticated.
+fn environment(cmd: &mut Command, cfg: &Config, dir: &Path) -> Result<()> {
     cmd.env_clear()
         .envs(cfg.pi_env()?)
         .env(
@@ -229,8 +232,53 @@ fn configure(cmd: &mut Command, cfg: &Config, dir: &Path) -> Result<()> {
         .env("PI_OFFLINE", "1")
         .env("PI_TELEMETRY", "0")
         .current_dir(dir)
-        .kill_on_drop(true)
-        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    Ok(())
+}
+
+/// Ask pi which models are actually available: run `pi --list-models` in the
+/// worker environment (providers authenticate from `pi_env`) and parse the
+/// table it prints — `provider  model  context  max-out  thinking  images`.
+/// pi is pinned to an exact version for RPC-protocol stability, and that pin
+/// covers this output too. Empty when no provider is authenticated.
+pub async fn discover_models(cfg: &Config) -> Result<Vec<String>> {
+    let dir = cfg.data_dir.join("models-probe");
+    std::fs::create_dir_all(&dir)?;
+    let mut cmd = Command::new(&cfg.pi_bin);
+    environment(&mut cmd, cfg, &dir)?;
+    cmd.arg("--list-models");
+    let out = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+        .await
+        .context("pi --list-models timed out")??;
+    if !out.status.success() {
+        bail!(
+            "pi --list-models failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut models = Vec::new();
+    for line in stdout.lines() {
+        if line.starts_with("No models available") {
+            break;
+        }
+        let mut fields = line.split_whitespace();
+        let (Some(provider), Some(model)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if provider == "provider" {
+            continue; // the table header
+        }
+        models.push(format!("{provider}/{model}"));
+    }
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+fn configure(cmd: &mut Command, cfg: &Config, dir: &Path) -> Result<()> {
+    environment(cmd, cfg, dir)?;
+    cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .args([

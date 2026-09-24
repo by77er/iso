@@ -67,14 +67,40 @@ export default function Fleet() {
                   : "Other control planes remain available."}
               </p>
               <dl className="storage-metrics">
-                <div><dt>Storage backend</dt><dd>{p.storage?.storage_backend ?? "Unknown"}</dd></div>
-                <div><dt>Pool used / capacity</dt><dd>{bytes(p.storage?.pool_used_bytes)} / {bytes(p.storage?.pool_capacity_bytes)}</dd></div>
-                <div><dt>VM suspension files</dt><dd>{bytes(p.storage?.snapshot_bytes)}</dd></div>
-                <div><dt>Backing filesystem capacity</dt><dd>{bytes(p.storage?.filesystem_capacity_bytes)}</dd></div>
-                <div><dt>Filesystem available</dt><dd>{bytes(p.storage?.filesystem_available_bytes)}</dd></div>
+                <div>
+                  <dt>Storage backend</dt>
+                  <dd>{p.storage?.storage_backend ?? "Unknown"}</dd>
+                </div>
+                <div>
+                  <dt>Pool used / capacity</dt>
+                  <dd>
+                    {bytes(p.storage?.pool_used_bytes)} /{" "}
+                    {bytes(p.storage?.pool_capacity_bytes)}
+                  </dd>
+                </div>
+                <div>
+                  <dt>VM suspension files</dt>
+                  <dd>{bytes(p.storage?.snapshot_bytes)}</dd>
+                </div>
+                <div>
+                  <dt>Backing filesystem capacity</dt>
+                  <dd>{bytes(p.storage?.filesystem_capacity_bytes)}</dd>
+                </div>
+                <div>
+                  <dt>Filesystem available</dt>
+                  <dd>{bytes(p.storage?.filesystem_available_bytes)}</dd>
+                </div>
               </dl>
-              {(p.storage?.data_percent ?? 0) >= 90 && <p role="alert">Storage pool nearly full. VM writes may fail.</p>}
-              <p className="muted">Snapshot files show allocated host space, not virtual disk sizes. Shared storage figures are not additive; unsupported metrics show Unknown.</p>
+              {(p.storage?.data_percent ?? 0) >= 90 && (
+                <p role="alert">
+                  Storage pool nearly full. VM writes may fail.
+                </p>
+              )}
+              <p className="muted">
+                Snapshot files show allocated host space, not virtual disk
+                sizes. Shared storage figures are not additive; unsupported
+                metrics show Unknown.
+              </p>
               <div className="plane-vms">
                 {p.vms?.map((vm) => (
                   <div key={vm.id}>

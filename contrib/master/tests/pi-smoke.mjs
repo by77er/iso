@@ -188,7 +188,19 @@ try {
   });
   assert.deepEqual(
     plannerTools.map((tool) => tool.name),
-    ["read", "list", "swarm_status", "swarm_send", "swarm_spawn"],
+    [
+      "read",
+      "list",
+      "board_post",
+      "board_read",
+      "board_update",
+      "board_delete",
+      "board_list",
+      "swarm_status",
+      "swarm_send",
+      "swarm_stop",
+      "swarm_spawn",
+    ],
   );
   await plannerTools
     .find((tool) => tool.name === "swarm_spawn")
@@ -239,7 +251,19 @@ try {
   extension({ registerTool: (tool) => workerTools.push(tool), on: () => {} });
   assert.deepEqual(
     workerTools.map((tool) => tool.name),
-    ["read", "write", "edit", "bash", "swarm_status", "swarm_send"],
+    [
+      "read",
+      "write",
+      "edit",
+      "bash",
+      "board_post",
+      "board_read",
+      "board_update",
+      "board_delete",
+      "board_list",
+      "swarm_status",
+      "swarm_send",
+    ],
   );
   delete process.env.MASTER_SWARM;
   delete process.env.MASTER_REMOTE;
