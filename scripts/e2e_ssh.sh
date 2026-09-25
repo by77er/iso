@@ -3,7 +3,7 @@
 # running iso deployment — it uses its own state dir and volume group):
 #   - bakes a NixOS rootfs into our OWN throwaway VG (isoe2e)
 #   - runs iso-controld, registers the template, and creates VMs via the HTTP API
-#   - SSHes into each VM and exercises Allow / Deny / Proxy egress
+#   - SSHes into each VM and exercises both egress modes, Deny and Proxy
 #   - in Proxy mode, verifies a stand-in proxy on 172.22.0.1 receives the conn
 # Run as root from a `nix develop` shell after `cargo build`. Needs the guest
 # ssh key at state/keys/test_ed25519 (override with ISO_SSH_KEY).
@@ -36,8 +36,6 @@ cleanup() {
   vgremove -f "$VG" 2>/dev/null
   for d in $(losetup -j "$STATE/storage.img" -O NAME --noheadings 2>/dev/null); do losetup -d "$d"; done
   ip link del dummy0 2>/dev/null
-  nft flush chain ip filter DOCKER-USER 2>/dev/null
-  nft add rule ip filter DOCKER-USER counter return 2>/dev/null
   rm -rf "$STATE"
 }
 trap cleanup EXIT
@@ -50,13 +48,6 @@ CONTROLD_PID=$!
 for i in $(seq 1 150); do [ -S "$SOCK" ] && lvs "$VG/pool" >/dev/null 2>&1 && break; sleep 0.2; done
 if ! lvs "$VG/pool" >/dev/null 2>&1; then echo "FAIL: controld didn't bring up the pool"; cat "$CONTROLD_LOG"; exit 1; fi
 echo "controld up; services dummy: $(ip -4 -o addr show dummy0 | awk '{print $4}')"
-
-# This host runs Docker (ip filter FORWARD policy drop). Allow-mode direct
-# egress (172.21.x) isn't matched by Docker's rules, so carve our veth traffic
-# into DOCKER-USER. Disjoint from docker (172.17); restored on cleanup.
-# Deny/Proxy don't need this.
-nft insert rule ip filter DOCKER-USER oifname "vm*" accept 2>/dev/null
-nft insert rule ip filter DOCKER-USER iifname "vm*" accept 2>/dev/null
 
 echo "== baking rootfs into $VG/tpl_base (nixos-install) =="
 lvcreate -y -V 8G --thinpool pool -n tpl_base "$VG" >/dev/null
@@ -105,8 +96,7 @@ test_mode() {
   sleep 1
 }
 
-test_mode allow REACHED
-test_mode deny  BLOCKED
+test_mode deny BLOCKED
 
 echo "== starting stand-in proxy on 172.22.0.1:3128 =="
 python3 -c '

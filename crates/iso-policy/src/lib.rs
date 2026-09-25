@@ -1,9 +1,8 @@
 //! iso-policy — the egress rule language and its matcher. Pure: no I/O, no
-//! async. Consumed by the proxy (both phases), the DNS redirect for Allow
-//! mode, the control plane's input validation, and the metadata endpoint
-//! that describes a VM's policy to the guest. [`signed`] is how a fleet
-//! vouches for a policy so a proxy tier can trust it without trusting the
-//! host that relays it.
+//! async. Consumed by the proxy (both phases), the control plane's input
+//! validation, and the metadata endpoint that describes a VM's policy to the
+//! guest. [`signed`] is how a fleet vouches for a policy so a proxy tier can
+//! trust it without trusting the host that relays it.
 //!
 //! ## Grammar
 //!

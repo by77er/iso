@@ -123,7 +123,8 @@ fi
 KEYS="$STATE/keys/authorized_keys"
 { grep -v -E '^\s*(#|$)' "$REPO/image/keys/authorized_keys" 2>/dev/null || true; cat "$STATE/keys/test_ed25519.pub"; } | sort -u > "$KEYS"
 
-# --- Docker's FORWARD policy would drop allow-mode egress; carve iso's veths out ---
+# --- Docker's FORWARD policy would drop the direct egress `isoctl bake --provision`
+#     gives its builder VM; carve iso's veths out ---
 if nft list chain ip filter DOCKER-USER >/dev/null 2>&1 && ! nft list chain ip filter DOCKER-USER | grep -q iso-vm-egress; then
   nft insert rule ip filter DOCKER-USER oifname "vm*" counter accept comment "iso-vm-egress"
   nft insert rule ip filter DOCKER-USER iifname "vm*" counter accept comment "iso-vm-egress"
@@ -154,7 +155,7 @@ cat <<EOF
 iso is up. For pi, in your own shell:
 
   export ISO_SERVER=https://127.0.0.1:7070 ISO_CREDS=$CREDS ISO_CLIENT=$USER_NAME
-  export ISO_TEMPLATE=$TEMPLATE ISO_EGRESS=allow
+  export ISO_TEMPLATE=$TEMPLATE ISO_EGRESS=proxy ISO_ALLOW='*'
   pi
 
 Each session creates a Debian VM on first tool use and destroys it on exit;

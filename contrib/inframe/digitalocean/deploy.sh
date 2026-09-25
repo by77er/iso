@@ -2,12 +2,12 @@
 # Turn the three droplets `inframe apply` created into a working iso fleet:
 #
 #   control  iso-fleetd (:7080, mTLS)     the one API clients use; signs every policy
-#            iso-proxyd --role proxy       the tier, :3129 on the private IP; verifies them
+#            iso-proxyd (role proxy)       the tier, :3129 on the private IP; verifies them
 #            iso-cad, iso-secretsd         :7443 / :7444 on the private IP, mTLS,
 #                                          answering the tier's identity only
 #   host-a/b iso-controld (:7070 private, mTLS, an identity the control host issued;
 #                                          no CA key on the host)
-#            iso-proxyd --role edge        carries guest connections to the tier
+#            iso-proxyd (role edge)        carries guest connections to the tier
 #            one baked Debian template
 #
 # Run from this directory after `inframe apply --stack do`, as the user who

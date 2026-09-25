@@ -31,7 +31,7 @@ pub struct PolicyClaims {
     /// The host the VM is placed on: must equal the edge's certificate name.
     pub host: String,
     pub vm: String,
-    /// `"proxy" | "deny"` (`"allow"` while it still exists).
+    /// `"proxy" | "deny"`.
     pub egress: String,
     pub principal: Option<String>,
     /// The effective rule set, expanded, in `iso-policy` syntax.

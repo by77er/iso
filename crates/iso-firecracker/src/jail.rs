@@ -49,11 +49,11 @@ pub struct JailerConfig {
 
 impl JailerConfig {
     /// Jailer settings from the environment, or `None` when `ISO_JAILER` is
-    /// unset or not one of `1`, `true`, `yes`. `ISO_JAILER_BIN` (default
-    /// `jailer`), `ISO_JAIL_DIR` (default `<state_dir>/jail`), `ISO_JAIL_UID` and
-    /// `ISO_JAIL_GID` (default 65534), `ISO_JAIL_CGROUP_VERSION` (default 2),
-    /// and the comma-separated `ISO_JAIL_CGROUPS` and `ISO_JAIL_RLIMITS` tune it.
-    /// Jailed unless explicitly turned off with `ISO_JAILER=0`.
+    /// one of `0`, `false`, `no`, `off`: jailed unless explicitly turned off.
+    /// `ISO_JAILER_BIN` (default `jailer`), `ISO_JAIL_DIR` (default
+    /// `<state_dir>/jail`), `ISO_JAIL_UID` and `ISO_JAIL_GID` (default 65534),
+    /// `ISO_JAIL_CGROUP_VERSION` (default 2), and the comma-separated
+    /// `ISO_JAIL_CGROUPS` and `ISO_JAIL_RLIMITS` tune it.
     ///
     /// The default is the safe one: a VMM that is a direct child of root is
     /// the exception, and has to be asked for. `None` therefore means "the

@@ -36,11 +36,11 @@ single   nft DNAT ─▶ iso-proxyd ─┬─ identify.sock (controld)      toda
                                  ├─ ca.sock (iso-cad)             everything on the host
                                  └─ secrets.sock (iso-secretsd)
 
-edge     nft DNAT ─▶ iso-proxyd --role edge ─▶ pooled mTLS HTTP/2 tunnel, one CONNECT ─▶ tier
+edge     nft DNAT ─▶ iso-proxyd (edge) ─▶ pooled mTLS HTTP/2 tunnel, one CONNECT ─▶ tier
                        └─ identify.sock (controld)      stream per guest connection, policy in headers
 
-proxy    edges ─mTLS─▶ iso-proxyd --role proxy ─┬─ https://…/sign     (iso-cad, mTLS)
-                                                 └─ https://…/headers  (iso-secretsd, mTLS)
+proxy    edges ─mTLS─▶ iso-proxyd (proxy) ─┬─ https://…/sign     (iso-cad, mTLS)
+                                           └─ https://…/headers  (iso-secretsd, mTLS)
 ```
 
 - **single**: accept the connections nftables steers to the services address,
@@ -76,14 +76,18 @@ why.
 
 ```text
    1. accept; policy ← identify(src ip) [single] or the CONNECT headers [proxy]
+      (a tier with the fleet's key enforces the signed claims instead)
    2. egress == deny? ──▶ DROP (a deny VM has no egress; reaching the services
       address is not a licence to proxy for it)
-   3. peek TLS ClientHello  ── not TLS / no SNI? ──▶ DROP
-   4. host phase: some allow rule names the SNI? ── no ──▶ DROP (never terminated,
+   3. original port != 443? ──▶ passthrough or nothing: a `tunnel` rule for the
+      name the VM resolved the address from ──▶ carry the bytes; else DROP
+   4. peek TLS ClientHello  ── not TLS / no SNI? ──▶ DROP
+   5. `tunnel tcp://SNI:443`? ──▶ carry the TLS session through untouched
+   6. host phase: some allow rule names the SNI? ── no ──▶ DROP (never terminated,
       no certificate minted)
-   5. CertAuthority.sign(SNI, csr) ──▶ leaf (cached until not_after − 10 min);
+   7. CertAuthority.sign(SNI, csr) ──▶ leaf (cached until not_after − 10 min);
       complete TLS to VM (ALPN h2, http/1.1)
-   6. per request/stream:
+   8. per request/stream:
         :authority/Host == SNI                       ── else 421
         URI phase: rules.evaluate(https|wss, host, path)  ── deny ──▶ 403 JSON
         hdrs = SecretProvider.headers(SNI, principal, path); set/override
@@ -98,14 +102,18 @@ Grammar and semantics live in `iso-policy` (pure, tested). In short:
 
 ```text
 rule    := ("allow" | "deny") pattern
+         | ("tunnel" | "deny") "tcp://" host ":" port
 pattern := scheme "://" host [":" port] path
 scheme  := "https" | "wss"        wss matches only Upgrade requests
 host    := exact | "*." suffix    one or more leading labels, never the apex
+         | "*"                    any host: `allow https://*/**` is the open policy
 path    := "/" segments           "*" = one segment, "**" = the rest (last only)
 ```
 
 - Default deny. Explicit deny wins regardless of order. Query strings are
   never matched.
+- `tunnel tcp://host:port` carries a connection through as bytes, never
+  terminated and never injected into (see Passthrough below).
 - Host phase at SNI time uses only allow rules' hosts; a host with deny rules
   only is never terminated.
 - URI phase runs after the authority check and before injection, so a denied
@@ -116,9 +124,8 @@ path    := "/" segments           "*" = one segment, "**" = the rest (last only)
 - The legacy `allow: [host]` list is sugar for `allow https://host/**` plus
   `allow wss://host/**`. Records and clients that only know `allow` keep
   working; the effective policy is `allow` expanded plus `rules`.
-- Consumers: both proxy phases, the DNS steer for Allow mode (host phase, so
-  `*.example.com` steers), control-plane validation (`400` on a bad rule),
-  and the metadata description (literal allow hosts only).
+- Consumers: both proxy phases, control-plane validation (`400` on a bad
+  rule), and the metadata description (literal allow hosts only).
 
 ## Identity, policy & principal
 
@@ -129,9 +136,11 @@ path    := "/" segments           "*" = one segment, "**" = the rest (last only)
 | `policy_gen` | VM record | bumped by every policy change |
 | secrets (headers) | secret provider | adapter: TOML, exec, … |
 
-`IdentifyResponse` now carries `vm`, `rules` (effective, expanded) and
-`policy_gen` beside `allow`, `principal` and `egress`. A proxy that predates
-`rules` still works from `allow`.
+`IdentifyResponse` carries `vm`, `rules` (effective, expanded) and
+`policy_gen` beside `allow`, `principal` and `egress`; `signed`, the fleet's
+signature, when a fleet placed the VM; and `dst_name`, the name the VM
+resolved a destination from, when the caller asks about one. A proxy that
+predates `rules` still works from `allow`.
 
 ## RPC boundaries (`iso-rpc`)
 
@@ -154,14 +163,19 @@ Fail-open: down or empty ⇒ inject nothing. Backends are adapters behind
 ```
 sign(domain, csr_pem) -> { chain_der_b64: [leaf, ca], not_after }
 ```
-Sign-only; leaves live 24 h; empty chain ⇒ refusal, proxy fails closed.
+Sign-only; leaves live 24 h, backdated 30 days (a guest resumed from a
+snapshot keeps the clock it was baked with until the host corrects it); empty
+chain ⇒ refusal, proxy fails closed.
 
 ## CA trust bootstrap
 
 One CA per **tier** (a single host is a tier of one), generated into
 `state/ca/`, private key only ever in `iso-cad`. Guests must trust `ca.crt`,
-baked into the template before the snapshot. Serving it from metadata at boot
-(so one template serves many hosts) is the next step, not this one.
+which `isoctl bake` reads from `state/ca/ca.crt` and builds into the template
+before the snapshot: into the system bundle, and for OCI images into every
+runtime's trust-store variable (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
+`NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, …) as well. Serving it from metadata
+at boot (so one template serves many hosts) is not built.
 
 ## Configuration (`iso-proxyd`)
 
@@ -171,6 +185,7 @@ three sockets under `ISO_STATE_DIR`. Otherwise `ISO_PROXY_CONFIG=file.toml`:
 ```toml
 role = "edge"                          # single | edge | proxy
 listen = ["172.22.0.1:3128", "172.22.0.1:443"]
+host_id = "hostA"                      # default: the hostname (or ISO_HOST_ID)
 [identify]  socket = "/var/lib/iso/identify.sock"   ttl_ms = 1000
 [tier]      addrs = ["10.0.0.9:3129"]  server_name = "proxy-1"
 [tls]       ca = "creds/ca.crt"  cert = "creds/edge.crt"  key = "creds/edge.key"
@@ -183,10 +198,14 @@ listen = ["0.0.0.0:3129"]
 [secrets]   url = "https://10.0.0.7:7444"
 [tls]       ca = "creds/ca.crt"  cert = "creds/proxy-1.crt"  key = "creds/proxy-1.key"
 [upstream]  extra_roots = ["/etc/ssl/corp-ca.pem"]  pins = { "api.internal" = "10.0.0.5:8443" }
+[fleet]     policy_key_file = "/etc/iso-fleet/policy-signing.pub"   # or policy_key = "base64…"
 ```
 
+`iso-proxyd`'s module docs have the full annotated file.
+
 `iso-cad` and `iso-secretsd` add the HTTPS listener with `ISO_CA_LISTEN` /
-`ISO_SECRETS_LISTEN` plus the `ISO_TLS_*` identity.
+`ISO_SECRETS_LISTEN` plus the `ISO_TLS_*` identity, and then require
+`ISO_ALLOWED_CLIENTS`: the certificate names allowed to call them.
 
 ## Signed policies
 
@@ -245,7 +264,10 @@ each way; a refused connection leaves a `phase = tcp` event saying why.
 
 ## Failure modes
 
-- Not TLS / no SNI ⇒ drop. No allow rule for the host ⇒ drop before minting.
+- Port 443, not TLS / no SNI ⇒ drop. No allow rule for the host ⇒ drop before
+  minting.
+- Any other port: an address the VM never resolved through the host, or no
+  `tunnel` rule for its name ⇒ refused, with a `phase = tcp` access event.
 - `:authority != SNI` ⇒ 421. URI rule deny ⇒ 403.
 - Unknown source / deny-mode VM ⇒ refused at the edge.
 - Tier with a fleet key: unsigned, expired, badly signed, or signed for
@@ -265,6 +287,7 @@ and `tests/multi_host.rs` (two edges, one replica, HTTPS mTLS to the CA and
 secrets services). They cover injection, the host and URI phases, deny-mode
 refusal, WebSocket tunnels with injection on the handshake, close-on-policy-
 change in both roles, the tier refusing non-admin-CA edges, a replica with a
-stranger identity failing closed at the CA, and twenty guest connections
-sharing at most two tunnels. `tests/e2e.rs` is the
+stranger identity failing closed at the CA, twenty guest connections
+sharing at most two tunnels, TCP and 443 passthroughs and their refusals,
+signed-policy verification on the tier, and the access log's fields. `tests/e2e.rs` is the
 `#[ignore]`d real-network check against an external echo service.

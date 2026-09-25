@@ -13,9 +13,12 @@ sync_every_ms = 3000
 create_grace_secs = 60
 
 # The identity the fleet presents to hosts. Every host trusts the same admin
-# CA: copy one ca.crt/ca.key into each host's ISO_ADMIN_TLS_DIR before its
-# controld first starts, then mint this identity from it:
-#   isoctl admin --pki-dir <that dir> issue-client --name fleet --out /etc/iso-fleet/hosts
+# CA, kept here and never copied to a host. Mint this identity from it:
+#   isoctl admin --pki-dir /var/lib/iso-fleet/hosts-pki issue-client --name fleet --out /etc/iso-fleet/hosts
+# and give each host a server identity plus ca.crt (no ca.key) in its
+# ISO_ADMIN_TLS_DIR before its controld first starts:
+#   isoctl admin --pki-dir /var/lib/iso-fleet/hosts-pki issue-server --name hostA --san 10.0.0.5 --out ./hostA
+#   (then copy hostA.crt and hostA.key there as server.crt and server.key)
 [hosts_tls]
 ca = "/etc/iso-fleet/hosts/ca.crt"
 cert = "/etc/iso-fleet/hosts/fleet.crt"

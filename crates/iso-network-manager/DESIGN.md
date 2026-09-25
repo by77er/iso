@@ -12,8 +12,8 @@ network manager.
   host by a deterministic per-host **Slot ID**, never by anything baked into the
   guest.
 - **Stateless, idempotent network manager.** All fixtures derive from the slot,
-  so `provision`/`teardown` are pure functions of `SlotId` and can be re-driven
-  for reconciliation/crash recovery.
+  so `apply`/`teardown` are pure functions of the slot and its policy, and can be
+  re-driven for reconciliation/crash recovery.
 - **Guest-tamper-proof enforcement.** Policy lives in namespaces and the host
   root namespace, both of which the guest cannot reach.
 
@@ -35,17 +35,21 @@ For log/trace correlation, the UUID is carried in the **tracing span context** a
 the call site, not as a function argument:
 
 ```text
-provision(slot: SlotId) -> Result<NetworkFixture>
-teardown(slot: SlotId)  -> Result<()>
+apply(slot: SlotId, policy: &NetworkPolicy) -> Result<NetworkFixture>
+teardown(slot: SlotId)                      -> Result<()>
 ```
 
 ### Slot allocator
 
 The Slot ID *is* the address allocation, so there is no separate IPAM. The only
-persisted state is the slot bitmap (`0..32767`) and the control plane's
-UUID↔slot binding. Slots are returned to the free pool **only after teardown
-fully completes** (netns gone, conntrack flushed); consider a short cooldown
-before reuse to avoid resurrecting stale neighbor/conntrack state.
+persisted state is the control plane's UUID↔slot binding in SQLite; the slot
+bitmap (`0..32767`) is rebuilt from it on startup. Slots are returned to the
+free pool **only after teardown fully completes** (netns gone, conntrack
+flushed), and allocation rotates from a cursor, so a freed slot is not reused
+straight away and cannot resurrect stale neighbor/conntrack state. A template
+bake borrows a slot the daemon doesn't know about (`isoctl bake --slot`,
+default 0, so pick a high one on a busy host; `dev-up.sh` uses 32767 and
+builds through the API use 32766).
 
 ## Topology
 
@@ -95,8 +99,14 @@ veth_host  = "vm<slot:04x>"            # host side
 veth_netns = "vp<slot:04x>"            # netns side
 vh_ip      = 172.21.(slot >> 7).((slot & 0x7f) << 1)        # /31 base
 vp_ip      = vh_ip + 1
-mac        = 02:xx:xx:xx:xx:xx         # constant
+mac        = 02:00:00:00:00:01         # guest, constant
+tap_mac    = 02:00:00:00:00:00         # gateway (the TAP), constant
 ```
+
+> **The TAP's MAC is constant too.** A resumed snapshot restores the guest's
+> ARP cache, which holds the gateway's MAC from bake time. With a random MAC
+> per TAP, every clone would spend its first ~30 seconds sending frames to a
+> MAC nobody answers for, until Linux times the stale entry out and re-ARPs.
 
 > **The TAP name is constant**, not slot-derived. The TAP lives inside the
 > isolated per-VM netns, so an identical name in every namespace is safe — and
@@ -117,8 +127,8 @@ mac        = 02:xx:xx:xx:xx:xx         # constant
 ### Kernel prerequisites
 
 - `net.ipv4.ip_forward = 1` in **both** the host and each netns.
-- `rp_filter = 2` (loose) on `eth0` and all `vh*` interfaces — strict RPF drops
-  the asymmetric-looking replies created by NAT and policy routing.
+- `rp_filter = 2` (loose) on the uplink and inside each netns — strict RPF
+  drops the asymmetric-looking replies created by NAT and policy routing.
 
 ## NAT strategy
 
@@ -143,6 +153,12 @@ inner 172.20.0.1 ──[netns SNAT → vp]──► host routes to dummy0 ──
 ```text
 inner 172.20.0.1 ──[netns SNAT → vp]──► host ──[masquerade → public]──► uplink
 ```
+
+A VM's own traffic never takes this path: in `Proxy` mode it terminates at the
+proxy on `172.22.0.1`, which opens its own upstream connection from the host.
+Only the bake's builder VM (`direct`, below) routes out this way. The masquerade
+rule is still part of every slot's table, so the path is there when it is
+needed.
 
 - The in-netns SNAT makes the source unique; the host masquerade gives it a
   public source. Both are required.
@@ -175,7 +191,7 @@ masquerade is still required, conntrack NAT is a flow-setup cost, and large
 ## Inbound: opening host ports that DNAT to a VM — two-layer DNAT
 
 The network manager can expose a port on the **main host** that forwards to a
-port on a VM (`add_port_forward` / `remove_port_forward`). A single DNAT straight
+port on a VM (the `ingress` list of the slot's `NetworkPolicy`). A single DNAT straight
 to the constant inner IP cannot work: the host has no
 unambiguous route to deliver the constant address to the right netns. The
 destination must be the **unique `vp`** at the point host routing decides. This
@@ -210,23 +226,35 @@ for the `ip rule` linear-scan scaling footgun plus a routing table per slot.
 
 ## Egress modes
 
-Each VM's egress is one of **three levels**, set declaratively via the `egress`
+Each VM's egress is one of **two levels**, set declaratively via the `egress`
 field of its [`NetworkPolicy`] and reconciled on `apply`. The levels govern only
 **external** traffic; access to the host's internal services on `172.22.0.1`
-(DNS, …) is an **always-on baseline** in every level.
+(DNS, metadata, the proxy) is an **always-on baseline** in every level.
 
 | Level   | Behaviour                                                              |
 | ------- | ---------------------------------------------------------------------- |
-| `Allow` | direct internet egress, **bypassing the proxy** (masquerade out uplink) |
-| `Proxy` | internet egress **transparently intercepted** by the proxy on `172.22.0.1:<proxyport>` |
+| `Proxy` | every flow bound beyond `172.22.0.1` is **transparently intercepted** to the proxy on `172.22.0.1:<proxyport>` |
 | `Deny`  | **no external egress** (internal-services baseline still applies)      |
 
-The `Proxy` redirect target is manager configuration, not per-VM policy. Level is
-held as **nft set membership keyed on the ingress veth**, so converging a
-VM to a new mode is an atomic set update — no rule reload. Because NAT/policy only
-apply to the first packet of a flow, a mode change affects **NEW connections
-only**; flush the VM's conntrack entries (matched by the `vp` source) if you need
-in-flight flows to re-evaluate immediately.
+There is no direct mode. Every byte a VM sends outward goes through the proxy,
+where its rules decide and the access log records it. How wide a VM's access is
+(`allow https://*/**`, `tunnel tcp://host:port`) is the rules' business, not the
+mode's; see `crates/iso-proxy/DESIGN.md`. The proxy port is manager
+configuration, not per-VM policy.
+
+`NetworkPolicy` also carries `direct: bool`, which only `isoctl bake` sets, for
+the builder VM that runs `--provision` commands. The builder is host tooling on
+a slot no VM occupies, with no policy and no proxy identity, so it gets a
+forward accept out the uplink instead of the intercept. No VM is ever `direct`.
+
+Each slot's rules live in a table of their own (`iso_vm<slot>` in the host root
+namespace, `iso` inside the netns), and `apply` resets the whole table in one
+atomic batch, so converging a VM to a new level is a single table replace.
+Because NAT and filtering decisions apply to the first packet of a flow, a level
+change affects **NEW connections only**; flush the VM's conntrack entries
+(matched by the `vp` source) if in-flight flows must re-evaluate immediately.
+(Rule changes inside `Proxy` are the proxy's business, and it closes
+connections admitted under an older policy generation itself.)
 
 ### `Proxy` level (transparent proxy intercept)
 
@@ -236,83 +264,78 @@ source to the unique `vp`, so the proxy sees a source IP that identifies the VM,
 and recovers the intended destination via `SO_ORIGINAL_DST`.
 
 ```nft
-# host root ns — runs in nat prerouting (after the in-netns SNAT)
-set redirect_ifaces { type ifname; }      # slots currently at the Proxy level
-
+# host root ns, table iso_vm<slot> — nat prerouting, after the in-netns SNAT
 chain prerouting {
   type nat hook prerouting priority dstnat;
-  iifname @redirect_ifaces ip daddr != 172.22.0.1 \
-    meta l4proto { tcp, udp } dnat to 172.22.0.1 : <proxyport>
+  iifname "vm<slot>" ip daddr != 172.22.0.1 tcp dnat to 172.22.0.1:<proxyport>
+  iifname "vm<slot>" ip daddr != 172.22.0.1 udp dnat to 172.22.0.1:<proxyport>
 }
 ```
 
-- The `ip daddr != 172.22.0.1` guard prevents redirect loops on already-internal
-  traffic.
+- The `ip daddr != 172.22.0.1` guard leaves traffic to the host's own services
+  (DNS, metadata) alone and prevents redirect loops.
 - DNAT to a **local** address routes the flow to the host `input` hook (not
-  `forward`), terminating at the proxy. Add a matching `input` accept for
-  `172.22.0.1:<proxyport>`.
+  `forward`), terminating at the proxy.
+- The proxy speaks TCP only, so intercepted UDP (anything but DNS to
+  `172.22.0.1`) reaches no listener and goes nowhere.
 - Source remains the unique `vp` end-to-end, so the proxy can map
   connection → VM with no extra signalling.
 
 ## Egress firewall policy
 
-For the `Allow`/`Deny` levels, policy is enforced in the **host `forward` chain,
-matched on the ingress veth** — the host-controlled trust boundary and the
-routing fork. (`Proxy` traffic never reaches `forward`; it is DNAT'd to the local
-dummy in prerouting and handled in `input`.) Filtering is *not* enforced on the
-dummy interface (that only protects the service, not lateral movement).
+Forwarded traffic is filtered in the **host `forward` chain, matched on the
+ingress veth** — the host-controlled trust boundary and the routing fork.
+(`Proxy` traffic never reaches `forward`; it is DNAT'd to the local dummy in
+prerouting and handled in `input`.) Filtering is *not* enforced on the dummy
+interface (that only protects the service, not lateral movement).
 
 **Filter on connection origin/state, never on `ip daddr` alone.** Destination is
 the wrong axis: the egress (reply) leg of an inbound-initiated flow has
-`daddr = client`, so a daddr test would wrongly drop it. The destination check
-must run only on the first packet of a **VM-initiated** connection.
+`daddr = client`, so a daddr test would wrongly drop it.
 
 ```nft
-# host root ns
-map vm_policy {                       # per-slot level, keyed by ingress veth
-  type ifname : verdict
-  elements = { "vm7fff" : jump deny, "vm0001" : jump allow }
-}                                     # Proxy slots are intercepted in prerouting; they map to `deny` here
-
+# host root ns, table iso_vm<slot>
 chain forward {
-  type filter hook forward priority filter;
+  type filter hook forward priority filter; policy accept;
 
-  # reply leg of ANY permitted flow (inbound- OR outbound-initiated) — no daddr test
+  # reply leg of ANY permitted flow (inbound- OR outbound-initiated)
   ct state established,related accept
 
   # inbound-initiated NEW (port-forwards) — let it into the VM
-  ct state new iifname "eth0" oifname "vm*" accept
+  ct state new iifname "eth0" oifname "vm<slot>" accept
 
-  # explicit lateral-movement drops (ip_forward is on; veths share the root ns)
-  ip daddr 172.21.0.0/16 drop          # VM ↔ VM
-  # (also drop toward host service IPs here)
+  # lateral movement: nothing from this VM to any other veth (ip_forward is on)
+  iifname "vm<slot>" ip daddr 172.21.0.0/16 drop
 
-  # always-on baseline: internal services (DNS, …) reachable in every level
-  ct state new iifname "vm*" ip daddr 172.22.0.1 accept
+  # direct only (the bake's builder): out the uplink
+  iifname "vm<slot>" oifname "eth0" accept
 
-  # ONLY now: VM-initiated NEW external egress, classified by level
-  ct state new iifname "vm*" vmap @vm_policy
-
-  drop
+  # everything else this VM starts
+  iifname "vm<slot>" drop
 }
 
-chain deny  { drop }                       # no external egress
-chain allow { oifname "eth0" accept; drop } # direct internet
+chain input {
+  type filter hook input priority filter; policy accept;
+  iifname "vm<slot>" ip daddr 172.22.0.1 accept   # services baseline
+}
+
+chain postrouting {
+  type nat hook postrouting priority srcnat;
+  ip saddr <vp_ip> oifname "eth0" masquerade
+}
 ```
 
-- `established,related accept` first means the daddr classification only ever
-  sees **VM-initiated NEW** packets. Reply legs of both inbound- and
-  outbound-initiated flows are accepted before reaching `@vm_policy`.
+- `established,related accept` first means the drops only ever see **new**
+  packets. Reply legs of both inbound- and outbound-initiated flows are accepted
+  before reaching them.
 - This yields the intended asymmetry: a `Deny` VM is **reachable inbound** (its
-  reply leg rides `established`) while unable to **initiate** outbound past the
+  reply leg rides `established`) while unable to **initiate** anything past the
   internal-services baseline.
-- The default `drop` plus explicit `172.21.0.0/16` drop blocks **lateral
-  movement** between VMs and to the host (necessary because `ip_forward` is on
-  and all veths live in the root namespace).
-- **Egress level is a per-slot attribute** → `vm_policy` verdict map (`allow`/
-  `deny`) keyed on the veth, plus `redirect_ifaces` membership for `Proxy`.
-  `Proxy` slots map to `deny` in `forward`; their external traffic is already
-  intercepted to the dummy in prerouting.
+- The chains' `accept` policy only matters for traffic that isn't this VM's;
+  every packet this VM starts ends at an explicit verdict.
+- The explicit `172.21.0.0/16` drop blocks **lateral movement** between VMs
+  (necessary because `ip_forward` is on and all veths live in the root
+  namespace).
 - If policies grow complex enough that "who initiated this" isn't obvious from
   the interface, stamp origin onto the conntrack at creation
   (`ct mark set <vm-initiated|inbound>`) and key policy on the mark — immune to
@@ -320,12 +343,13 @@ chain allow { oifname "eth0" accept; drop } # direct internet
 
 ### Defense in depth: netns routing as fail-closed backstop
 
-Give `Deny` VMs **no default route** in their netns — only a route to
+`Deny` VMs get **no default route** in their netns — only a route to
 `172.22.0.1`. A missing/botched host rule then still cannot leak: an
 internet-bound packet reaches the netns and dies for lack of a route. The netns
 routing table is host-controlled (not guest-reachable), so this is a legitimate
-control. The host `forward` chain remains the authoritative enforcement and
-logging/metrics point; netns routing is the backstop.
+control. `Proxy` VMs need the default route, since the intercept happens on the
+host. The host rules remain the authoritative enforcement; netns routing is the
+backstop.
 
 ## Interface contract summary
 
@@ -336,14 +360,20 @@ changed policy reconciles only the difference. This avoids add/remove ordering
 bugs and makes crash recovery a matter of re-applying.
 
 ```text
-apply(slot: SlotId, policy: &NetworkPolicy) -> Result<NetworkFixture>  # converge to present
-teardown(slot: SlotId)                      -> Result<()>             # converge to absent
+apply(slot: SlotId, policy: &NetworkPolicy)          -> Result<NetworkFixture>  # converge to present
+reapply_policy(slot: SlotId, policy: &NetworkPolicy) -> Result<()>              # nft only, for a running VM
+teardown(slot: SlotId)                               -> Result<()>              # converge to absent
 ```
+
+`reapply_policy` re-renders only the two nftables tables and leaves the
+interfaces alone, because a full `apply` on a running VM fails on the TAP the
+VMM holds open (`TUNSETIFF ... busy`).
 
 ```text
 struct NetworkPolicy {
-  egress:  EgressMode,        # Allow | Proxy | Deny
+  egress:  EgressMode,        # Proxy | Deny
   ingress: Vec<PortForward>,  # full desired set; (host_port, proto) unique
+  direct:  bool,              # the bake's builder only; never a VM
 }
 # Default = deny-by-default: Deny, no ingress.
 struct PortForward { host_port: u16, vm_port: u16, proto: Protocol }

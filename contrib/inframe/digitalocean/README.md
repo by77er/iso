@@ -5,8 +5,8 @@ rig for the distributed deployment, and a script that installs iso on it:
 
 | Droplet | Runs | Holds |
 | --- | --- | --- |
-| `iso-control` | `iso-fleetd` (:7080, the one API clients use), `iso-proxyd --role proxy` (the tier), `iso-cad`, `iso-secretsd` | the CA key, the leaf keys, the secret values |
-| `iso-host-a`, `iso-host-b` | `iso-controld`, `iso-proxyd --role edge`, one baked Debian template | nothing a guest's traffic could be read or forged with |
+| `iso-control` | `iso-fleetd` (:7080, the one API clients use), `iso-proxyd` as the tier (`role = "proxy"`), `iso-cad`, `iso-secretsd` | the CA key, the leaf keys, the secret values |
+| `iso-host-a`, `iso-host-b` | `iso-controld`, `iso-proxyd` as an edge (`role = "edge"`), one baked Debian template | nothing a guest's traffic could be read or forged with |
 
 The three sit on one VPC in `nyc3`. Only SSH and the fleet API (mutual TLS)
 are open to the internet; every other port is reachable from the VPC alone.
@@ -59,7 +59,7 @@ What it does, in order:
    Writes the tier and fleet configs and starts `iso-cad` and `iso-secretsd`
    (answering the control identity by name and nothing else), `iso-fleetd`
    (which mints its policy signing key on first start) and then
-   `iso-proxyd --role proxy` with the fleet's public key, so the tier serves
+   `iso-proxyd` as the tier with the fleet's public key, so the tier serves
    only policies the fleet signed. Fetches the tier CA (for the guests), the
    admin CA certificate, the host identities and your operator credentials
    into `.deploy/`.

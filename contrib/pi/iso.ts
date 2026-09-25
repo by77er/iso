@@ -16,9 +16,10 @@
  *   ISO_CLIENT        client certificate name  (default admin)
  *   ISO_INSECURE=1    plain HTTP, for a daemon started with ISO_ADMIN_INSECURE=1
  *   ISO_TEMPLATE      template to clone       (default base)      [--iso-template]
- *   ISO_EGRESS        allow | proxy | deny    (default proxy)     [--iso-egress]
+ *   ISO_EGRESS        proxy | deny            (default proxy)     [--iso-egress]
  *   ISO_PRINCIPAL     principal for injected credentials          [--iso-principal]
- *   ISO_ALLOW         comma-separated domains the proxy passes    [--iso-allow]
+ *   ISO_ALLOW         comma-separated domains the proxy passes,   [--iso-allow]
+ *                     `*.example.com` for subdomains, `*` for any host
  *   ISO_WORKDIR       working directory in the guest (default /home/coder)
  *   ISO_VM            attach to an existing VM instead of creating one [--iso-vm]
  *   ISO_KEEP=1        do not destroy the VM at session end        [--iso-keep]
@@ -484,7 +485,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerFlag("no-iso", { description: "Run pi's tools locally instead of in an iso VM", type: "boolean" });
 	pi.registerFlag("iso-vm", { description: "Attach to this iso VM id instead of creating one", type: "string" });
 	pi.registerFlag("iso-template", { description: "iso template to clone (default: base)", type: "string" });
-	pi.registerFlag("iso-egress", { description: "iso egress mode: allow, proxy, deny (default: proxy)", type: "string" });
+	pi.registerFlag("iso-egress", { description: "iso egress mode: proxy or deny (default: proxy)", type: "string" });
 	pi.registerFlag("iso-principal", { description: "iso principal whose credentials the proxy injects", type: "string" });
 	pi.registerFlag("iso-allow", { description: "Comma-separated domains the iso proxy passes", type: "string" });
 	pi.registerFlag("iso-keep", { description: "Keep the iso VM when the session ends", type: "boolean" });

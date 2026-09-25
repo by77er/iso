@@ -30,7 +30,7 @@ pub struct IdentifyRequest {
 pub struct IdentifyResponse {
     /// Whether `ip` mapped to a known VM.
     pub found: bool,
-    /// `"allow" | "proxy" | "deny"`.
+    /// `"proxy" | "deny"`.
     pub egress: String,
     /// Opaque principal the VM acts as (selects per-principal injected creds).
     pub principal: Option<String>,

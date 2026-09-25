@@ -105,8 +105,8 @@ fn env(key: &str) -> Option<String> {
 ///   and the admin socket.
 /// - `ISO_VG` (default `iso`), `ISO_UPLINK` (default: detected), and
 ///   `ISO_IMAGE_SIZE_GIB` (default `100`) tune the rest.
-/// - `ISO_FIRECRACKER_BIN` (default `firecracker`); `ISO_JAILER=1` runs every
-///   VM under `jailer`, see [`iso_firecracker::JailerConfig::from_env`].
+/// - `ISO_FIRECRACKER_BIN` (default `firecracker`); every VM runs under
+///   `jailer` unless `ISO_JAILER=0`, see [`iso_firecracker::JailerConfig::from_env`].
 /// - `ISO_VETH_NET` (default `172.21.0.0`): base of the /16 used for veth pairs.
 /// - `ISO_ADMIN_TCP` (default `<primary ip>:7070`), `ISO_ADMIN_TLS_DIR`
 ///   (default `<state>/admin-pki`), `ISO_ADMIN_SANS`, and `ISO_ADMIN_INSECURE=1`

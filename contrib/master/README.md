@@ -58,7 +58,7 @@ ones, or use a fresh demo data directory. Real VMs persist independently of the 
    A plane specifies its own template, credential principal, egress policy,
    domain allow-list, and maximum VM count. Restart the master to reload config.
 
-3. Configure the model used by headless pi via `pi_model`. Pinning pi to `0.85.1`
+3. Configure the model used by headless pi via `pi_model`. Pinning pi to `0.87.1`
    keeps the RPC protocol and extension APIs reproducible.
    `pi_env_file` points to a protected JSON object of provider environment variables,
    e.g. keys named `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, populated by your secret
@@ -92,10 +92,11 @@ Pending messages are shown above the composer and can be cancelled. Interrupted
 agents require explicit recovery before delivery resumes. A dispatch interrupted
 by failure/restart is marked uncertain, never automatically retried.
 
-`pi_models` is the operator-controlled list of `provider/model` IDs offered in
-the UI. `pi_model`, when configured, is also included and is the default. These
-must be models supported by the installed pi version and authenticated on the
-master. For example:
+At startup the master asks pi which models it can use (`pi --list-models`, with
+the provider credentials from `pi_env_file`) and offers those in the UI.
+`pi_models`, when set, narrows that to a list of `provider/model` IDs; if
+discovery fails or finds nothing, the configured list is offered as it is.
+`pi_model`, when configured, is always offered and is the default. For example:
 
 ```json
 {
@@ -116,9 +117,11 @@ planner model and every worker inherits the worker model. These role settings ar
 fixed for that tree; create a new swarm to use a different pair.
 
 Planners have only `read` and `list` for workspace inspection, plus `swarm_spawn`,
-`swarm_send`, and `swarm_status` for coordination. They cannot use shell commands,
-write, or edit. Workers get the normal remote read/write/edit/bash tools and
-messaging/status, but cannot spawn children. These restrictions are implemented
+`swarm_send`, `swarm_status`, and `swarm_stop` (reclaim a direct child's VM,
+keeping its disk, conversation and record) for coordination. They cannot use shell
+commands, write, or edit. Workers get the normal remote read/write/edit/bash tools and
+messaging/status, but cannot spawn children. Both roles share the swarm's message
+board (see below). These restrictions are implemented
 in the tool registrations and checked by the master for scheduling; they are not
 just prompt instructions. Each node has its own VM: disks are not shared, so
 tasks should include shared repository/message-board access instructions and an
@@ -144,6 +147,19 @@ their VM disks and suspension snapshots while keeping readable conversations.
 The confirmation explicitly covers the whole subtree. Partial failures remain
 fenced in Closing and can be retried without restarting completed agents.
 Unresolved allocations must be reconciled before deletion.
+
+Each swarm has a durable **message board**: posts at forward-slash paths (for
+example `plans/api.md`) that every member can create, read, update, delete and
+list with the `board_*` tools. It is the place for plans, findings and shared
+references that outlive one message. The operator can browse it as a directory
+tree in the **Swarm Explorer** view.
+
+Each swarm also has one **egress policy**: mode, allow-list and URI rules, as
+iso's `PATCH /vms/{id}/policy` takes them. It is set when the swarm is created,
+inherited by every child, and editable while the swarm runs; a change is saved
+first and then applied to every member with a live or suspended VM, and the
+result is reported per member so a partial change can be retried. An empty
+policy means the plane's defaults. A standalone agent has a policy of its own.
 
 **Workspace details → Stop VM** explicitly terminates just that agent's VM,
 discards its execution/suspension state, and preserves the durable workspace disk.
@@ -215,9 +231,12 @@ allocated. This version does not evict suspended VMs to cold storage.
   the workspace; simply restarting pi could otherwise overlap old/new commands.
   Unsaved guest RAM state is lost during recovery, but disk files survive.
 - Master restart preserves `asleep`, `closed`, and ambiguous-allocation states;
-  formerly live sessions become `interrupted`. The operator reviews history and
-  explicitly recovers them. A disconnected browser can reconnect without stopping
-  the agent or restarting any prompt.
+  formerly live sessions become `interrupted`. Because that interruption is known
+  not to be a failure, the master recovers those sessions one at a time when it
+  starts again (`auto_recover`, on by default), with the same fencing reboot as a
+  manual **Recover** and no replayed prompts. Interruptions caused by failures
+  still wait for the operator. A disconnected browser can reconnect without
+  stopping the agent or restarting any prompt.
 - Prompt rejection/timeout is surfaced; retry is a user decision. No exactly-once
   claim is made across an RPC/HTTP failure. Inspect history before resending.
 
@@ -269,6 +288,32 @@ registration, transcript deletion/retention job, or per-user RBAC yet. Plan stor
 retention externally. SQLite calls are short synchronous operations; this is not
 a high-throughput scheduler.
 
+## Storage visibility
+
+The master retires suspended VMs after `suspended_seconds` (default 600; 0
+disables). It resumes only for clean guest shutdown, then releases suspension
+files while preserving disk and conversation. Pending messages take priority.
+Stopped workspaces cold-boot for the next new message; old prompts are not replayed.
+Shutdown uncertainty requires explicit inspection/recovery, never automatic force.
+This requires a control plane supporting `/vms/{id}/retire-suspension`.
+
+Control planes shows backend-reported pool usage/capacity, allocated bytes of
+tracked VM suspension files, and the backing filesystem's total/available bytes.
+These optional `/stats` fields remain unknown when unsupported or unavailable;
+older control planes remain usable. LVM reports pool usage including shared
+template/VM disk blocks; it is not a sum of virtual disk sizes or independently
+reclaimable snapshot sizes. Suspension accounting deduplicates hard links and
+uses allocated blocks, excludes template and untracked files, and becomes unknown
+if a tracked file cannot be inspected. Do not add these overlapping figures.
+
+## Metrics
+
+The master serves Prometheus metrics on a separate listener, `metrics_bind`
+(default `127.0.0.1:9464`; empty disables it). Counters cover tool calls and their
+duration, worker actions, prompts, pi workers and phase transitions
+(`iso_master_*`), labelled by swarm, agent, tool and environment. Gauges for
+sessions, planes, VMs, board posts and mailboxes are computed at scrape time.
+
 ## Development and checks
 
 ```sh
@@ -303,21 +348,3 @@ RUN_BROWSER_TESTS=1 scripts/check-master.sh
 
 Browser tests use a temporary database and two mock planes; they also check
 transcript replay, no client-side exceptions and mobile horizontal overflow.
-
-# Storage visibility
-
-The master retires suspended VMs after `suspended_seconds` (default 600; 0
-disables). It resumes only for clean guest shutdown, then releases suspension
-files while preserving disk and conversation. Pending messages take priority.
-Stopped workspaces cold-boot for the next new message; old prompts are not replayed.
-Shutdown uncertainty requires explicit inspection/recovery, never automatic force.
-This requires a control plane supporting `/vms/{id}/retire-suspension`.
-
-Control planes shows backend-reported pool usage/capacity, allocated bytes of
-tracked VM suspension files, and the backing filesystem's total/available bytes.
-These optional `/stats` fields remain unknown when unsupported or unavailable;
-older control planes remain usable. LVM reports pool usage including shared
-template/VM disk blocks; it is not a sum of virtual disk sizes or independently
-reclaimable snapshot sizes. Suspension accounting deduplicates hard links and
-uses allocated blocks, excludes template and untracked files, and becomes unknown
-if a tracked file cannot be inspected. Do not add these overlapping figures.

@@ -102,7 +102,7 @@ the guest agent.
   in its own VM. It puts idle agents to sleep and can run swarms of planners
   and workers. [contrib/master](contrib/master/README.md).
 - **pi extension** (`contrib/pi/iso.ts`): runs the tools of the
-  [pi](https://github.com/badlogic/pi-mono) coding agent inside a fresh VM
+  [pi](https://github.com/earendil-works/pi) coding agent inside a fresh VM
   while pi itself stays on your machine.
 - **Harbor environment**: runs [Harbor](https://github.com/laude-institute/harbor)
   agent evaluations with one VM per trial.

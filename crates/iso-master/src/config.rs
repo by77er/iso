@@ -146,8 +146,8 @@ impl Config {
                 "Live planes require HTTPS"
             );
             ensure!(
-                matches!(p.egress.as_str(), "deny" | "proxy" | "allow"),
-                "Invalid egress mode"
+                matches!(p.egress.as_str(), "deny" | "proxy"),
+                "Invalid egress mode: use 'proxy' or 'deny'"
             );
             ensure!(!p.template.is_empty(), "Invalid plane capacity/template");
         }
@@ -189,5 +189,21 @@ mod tests {
         assert!(below_limit(usize::MAX, 0));
         assert!(below_limit(15, 16));
         assert!(!below_limit(16, 16));
+    }
+
+    #[test]
+    fn egress_is_proxy_or_deny() {
+        let plane = |egress: &str| -> Config {
+            serde_json::from_value(serde_json::json!({
+                "demo": true, "planes": [{"id":"test", "server":"demo", "creds":"unused",
+                "template":"debian", "egress": egress}]
+            }))
+            .unwrap()
+        };
+        plane("proxy").validate().unwrap();
+        plane("deny").validate().unwrap();
+        // The host maps any other value to deny without saying so, so a plane
+        // written for the removed `allow` mode must fail here instead.
+        assert!(plane("allow").validate().is_err());
     }
 }

@@ -97,7 +97,7 @@ where
             // How egress behaves for this VM, in the guest's terms.
             let (egress, egress_note) = match rec.egress {
                 EgressMode::Deny => ("deny", "No external egress. Host services (DNS, metadata) are reachable."),
-                EgressMode::Proxy => ("proxy", "All egress is intercepted. Only TLS to hosts in `allow` passes; anything else is reset, and plain HTTP is dropped."),
+                EgressMode::Proxy => ("proxy", "All egress goes through the proxy. HTTPS and WebSocket requests pass when `allow` or `rules` permit them; other TCP passes only through a `tunnel tcp://host:port` rule. Anything else is refused."),
             };
 
             Json(json!({

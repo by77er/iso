@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// A VM's resolved egress policy, as the proxy uses it.
 #[derive(Clone)]
 pub struct Policy {
-    /// `"allow" | "proxy" | "deny"`. `deny` is refused outright: such a VM
+    /// `"proxy" | "deny"`. `deny` is refused outright: such a VM
     /// has no egress, and the services address being reachable from it is
     /// not a licence to proxy for it.
     pub egress: String,

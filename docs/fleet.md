@@ -55,7 +55,7 @@ loop then lists every host every `sync_every_ms` and settles three cases:
 Principal and rules travel through the fleet API to the host record, where
 identify serves them locally and the generation is bumped as on a single
 host. The fleet is the only writer, so the host's store is its cache by
-fact. Whether a host runs the proxy inline (`--role single`) or only an edge
+fact. Whether a host runs the proxy inline (`role = "single"`) or only an edge
 in front of a separate tier is a per-host deployment choice the fleet does
 not see. Inline trusts the host with leaf keys and secret values in memory;
 the separate tier is the security boundary that keeps both off the host.
@@ -66,10 +66,17 @@ the separate tier is the security boundary that keeps both off the host.
   with `isoctl admin --pki-dir <pki_dir> issue-client`. `insecure = true`
   serves plain HTTP for development.
 - **Fleet → hosts**: one identity for every host, so every host must trust
-  the same admin CA. Copy one `ca.crt` and `ca.key` into each host's
-  `ISO_ADMIN_TLS_DIR` before its controld first starts; `load_or_generate`
-  keeps what it finds. Mint the fleet's identity from that CA and put its
-  three files in `[hosts_tls]`.
+  the same admin CA, and no host holds its key. Keep that CA on the control
+  machine (any `--pki-dir`; `isoctl admin` creates it on first use), mint the
+  fleet's client identity from it for `[hosts_tls]`, and mint each host a
+  server identity with `isoctl admin issue-server --name <host> --san <ip>`.
+  Before a host's controld first starts, put `ca.crt` and that identity, as
+  `server.crt` and `server.key`, into its `ISO_ADMIN_TLS_DIR`, with no
+  `ca.key`. The host then presents and verifies but can issue nothing. The
+  same identity is the client certificate the host's proxy edge presents to
+  the tier, so name each host in `[[hosts]]` exactly as its certificate is
+  named: the tier checks a signed policy's host against that name.
+  `contrib/inframe/digitalocean/deploy.sh` does all of this.
 
 ## Running more than one
 
