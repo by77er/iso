@@ -378,7 +378,7 @@ impl Engine {
         );
         crate::metrics::Metrics::global()
             .prompts
-            .with_label_values(&[&session.name, "operator"])
+            .with_label_values(&[session.name.as_str(), "operator"])
             .inc();
         if phase == Phase::Working || self.store.has_pending_message(id)? {
             self.store.enqueue("operator", id, message)?;
