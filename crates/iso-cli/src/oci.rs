@@ -2,7 +2,8 @@
 //!
 //! Three sources, one result: the image's filesystem laid out in a mounted
 //! volume, layer by layer with whiteouts honoured, plus the image config
-//! the guest's init needs (environment, working directory, user).
+//! the guest's init needs (environment, working directory, user). Every
+//! path an image names is resolved inside that volume (see `Rootfs`).
 //!
 //! - `pull(reference)`: the registry API, anonymous or with a bearer token
 //!   the registry hands out on demand (Docker Hub, GHCR, Quay all do), a
@@ -17,8 +18,11 @@
 //! that init and every runtime in the image will find them.
 
 use std::collections::HashMap;
+use std::ffi::{CString, OsStr};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -388,7 +392,13 @@ fn copy_tree(from: &Path, to: &Path) -> R<()> {
 
 /// Apply one layer tarball (gzip, zstd not supported, or plain) to `dest`:
 /// whiteouts delete, opaque whiteouts empty a directory, everything else
-/// is unpacked over what is there, ownership and modes kept.
+/// takes the place of what is there (a directory over a directory is
+/// merged into it), ownership and modes kept.
+///
+/// Every path is read the way the guest will read it, inside `dest` (see
+/// [`Rootfs`]), never on the host: a leading `/` is dropped and an entry
+/// with `..` in its path is skipped, as `tar` does, and a symlink an
+/// earlier layer left is followed with `dest` as `/`.
 pub fn apply_layer(path: &Path, media_type: &str, dest: &Path) -> R<()> {
     let file = std::fs::File::open(path)?;
     let mut magic = [0u8; 4];
@@ -407,37 +417,77 @@ pub fn apply_layer(path: &Path, media_type: &str, dest: &Path) -> R<()> {
     archive.set_preserve_ownerships(unsafe { libc::geteuid() } == 0);
     archive.set_unpack_xattrs(true);
     archive.set_overwrite(true);
+    let root = Rootfs::open(dest)?;
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let rel = entry.path()?.into_owned();
-        let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        let parent = rel.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let raw = entry.path()?.into_owned();
+        let at = |e: std::io::Error| format!("{}: {e}", raw.display());
+        let Some(rel) = in_image(&raw) else {
+            eprintln!("[bake] skipped {}: `..` in the path", raw.display());
+            continue;
+        };
+        // `./`, the rootfs itself, which `tar` leaves alone too.
+        let (Some(name), Some(parent)) = (rel.file_name(), rel.parent()) else { continue };
         if name == ".wh..wh..opq" {
-            let dir = dest.join(&parent);
-            if dir.is_dir() {
-                for e in std::fs::read_dir(&dir)? {
-                    remove_any(&e?.path())?;
+            if let Some(dir) = root.find_dir(parent).map_err(at)? {
+                for e in std::fs::read_dir(fd_path(&dir)).map_err(at)? {
+                    remove_any(&fd_path(&dir).join(e.map_err(at)?.file_name())).map_err(at)?;
                 }
             }
             continue;
         }
-        if let Some(victim) = name.strip_prefix(".wh.") {
-            remove_any(&dest.join(&parent).join(victim))?;
+        if let Some(victim) = name.as_bytes().strip_prefix(b".wh.") {
+            // `.wh.`, `.wh..` and `.wh...` would name the directory or its parent.
+            if !matches!(victim, b"" | b"." | b"..")
+                && let Some(dir) = root.find_dir(parent).map_err(at)?
+            {
+                remove_any(&fd_path(&dir).join(OsStr::from_bytes(victim))).map_err(at)?;
+            }
             continue;
         }
-        // A directory turning into something else, or the reverse.
-        let target = dest.join(&rel);
-        let is_dir_entry = entry.header().entry_type().is_dir();
-        if let Ok(meta) = std::fs::symlink_metadata(&target) {
-            if meta.is_dir() != is_dir_entry || meta.file_type().is_symlink() {
-                remove_any(&target)?;
-            }
+        let dir = root.make_dir(parent).map_err(at)?;
+        let target = fd_path(&dir).join(name);
+        // What is there goes unless both are directories: a file over a
+        // directory, a directory over a file or a symlink, a link over a file.
+        let kind = entry.header().entry_type();
+        if std::fs::symlink_metadata(&target).is_ok_and(|m| !(m.is_dir() && kind.is_dir())) {
+            remove_any(&target).map_err(at)?;
         }
-        entry.unpack_in(dest)?;
+        if kind.is_hard_link() {
+            // `tar` would take the link's target as a host path. It is a
+            // path in the image, with `..` stopping at the top, as for a
+            // symlink; the target itself is linked, not followed.
+            let link = entry.link_name()?.ok_or_else(|| format!("{}: a hard link without a target", raw.display()))?.into_owned();
+            let missing = || format!("{}: no {} in the image to link to", raw.display(), link.display());
+            let (Some(from), Some(from_dir)) = (link.file_name(), link.parent()) else {
+                return Err(missing().into());
+            };
+            let from_dir = root.find_dir(from_dir).map_err(at)?.ok_or_else(missing)?;
+            std::fs::hard_link(fd_path(&from_dir).join(from), &target).map_err(at)?;
+        } else {
+            entry.unpack(&target).map_err(at)?;
+        }
     }
     Ok(())
 }
 
+/// An entry's path relative to the rootfs, the way `tar`'s own `unpack_in`
+/// takes it: `/` and `.` components dropped, so `/etc/x` is the image's
+/// `etc/x`, and `None` for a path with `..` in it, which is skipped.
+fn in_image(path: &Path) -> Option<PathBuf> {
+    let mut rel = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::Normal(p) => rel.push(p),
+            Component::ParentDir => return None,
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    Some(rel)
+}
+
+/// Remove what `p` names without following it: a symlink goes, not what it
+/// points at. `remove_dir_all` does not follow symlinks below it either.
 fn remove_any(p: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
@@ -447,38 +497,150 @@ fn remove_any(p: &Path) -> std::io::Result<()> {
     }
 }
 
+// ---------------------------------------------------------------- rootfs ----
+
+/// The rootfs being laid out, held open, with every path in it looked up
+/// through `openat2(2)` and `RESOLVE_IN_ROOT`, which makes it `/` for the
+/// lookup: a path resolves the way it will in the guest. An absolute
+/// symlink in the image (Debian's `var/run -> /run`) lands on the image's
+/// `/run`, and `..` stops at the top, as in a chroot. The bake runs as
+/// root on the host, and this is what keeps what an image holds from
+/// naming a host file. Linux 5.6 or later.
+struct Rootfs(OwnedFd);
+
+impl Rootfs {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let dir = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(path)?;
+        Ok(Self(dir.into()))
+    }
+
+    /// `rel` opened under the rootfs; `mode` is for `O_CREAT`, else 0.
+    fn open_at(&self, rel: &Path, flags: libc::c_int, mode: libc::mode_t) -> std::io::Result<OwnedFd> {
+        let rel = if rel.as_os_str().is_empty() { Path::new(".") } else { rel };
+        let name = CString::new(rel.as_os_str().as_bytes())?;
+        // SAFETY: `open_how` is three integers, and zero is no flags.
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (flags | libc::O_CLOEXEC) as u64;
+        how.mode = mode.into();
+        how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
+        for _ in 0..64 {
+            // SAFETY: an open directory, a NUL-terminated path, `how` and its size.
+            let fd = unsafe {
+                libc::syscall(libc::SYS_openat2, self.0.as_raw_fd(), name.as_ptr(), &how as *const libc::open_how, std::mem::size_of::<libc::open_how>())
+            };
+            if fd >= 0 {
+                // SAFETY: a descriptor just opened, owned by nothing else.
+                return Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
+            }
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                // A rename or a mount somewhere on the host while the lookup
+                // went through `..`: the kernel asks for another try.
+                Some(libc::EAGAIN) => continue,
+                Some(libc::ENOSYS) => {
+                    return Err(std::io::Error::other("no openat2: baking an OCI image needs Linux 5.6 or later"));
+                }
+                _ => return Err(e),
+            }
+        }
+        Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+    }
+
+    /// The directory at `rel`, if there is one.
+    fn find_dir(&self, rel: &Path) -> std::io::Result<Option<OwnedFd>> {
+        match self.open_at(rel, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+            Ok(fd) => Ok(Some(fd)),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The directory at `rel`, made where it is missing, one component at a
+    /// time in the directory the one before resolved to (`mkdir -p` in the
+    /// guest). A file or a dangling symlink in the way is an error.
+    fn make_dir(&self, rel: &Path) -> std::io::Result<OwnedFd> {
+        if let Some(dir) = self.find_dir(rel)? {
+            return Ok(dir);
+        }
+        let mut dir = self.open_at(Path::new(""), libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let mut sofar = PathBuf::new();
+        for part in rel.iter() {
+            sofar.push(part);
+            dir = match self.find_dir(&sofar)? {
+                Some(next) => next,
+                None => {
+                    std::fs::create_dir(fd_path(&dir).join(part))?;
+                    self.open_at(&sofar, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
+                }
+            };
+        }
+        Ok(dir)
+    }
+
+    /// The file at `rel`, made or emptied, for writing.
+    fn create(&self, rel: &str, mode: libc::mode_t) -> std::io::Result<std::fs::File> {
+        let fd = self.open_at(Path::new(rel), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, mode);
+        Ok(fd.map_err(|e| std::io::Error::new(e.kind(), format!("{rel}: {e}")))?.into())
+    }
+
+    fn write(&self, rel: &str, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+        self.create(rel, 0o666)?.write_all(data.as_ref())
+    }
+
+    fn read(&self, rel: &str) -> std::io::Result<String> {
+        let mut s = String::new();
+        std::fs::File::from(self.open_at(Path::new(rel), libc::O_RDONLY, 0)?).read_to_string(&mut s)?;
+        Ok(s)
+    }
+
+    fn is_file(&self, rel: &str) -> bool {
+        let fd = self.open_at(Path::new(rel), libc::O_PATH, 0);
+        fd.and_then(|fd| std::fs::File::from(fd).metadata()).is_ok_and(|m| m.is_file())
+    }
+}
+
+/// The open directory `dir` as a path for the calls that want one: the
+/// kernel resolves `/proc/self/fd/N` to the directory itself, not to a
+/// name, so `fd_path(dir).join(name)` looks up `name` in `dir` and nothing
+/// else. What is done to such a path here never follows `name` itself.
+fn fd_path(dir: &OwnedFd) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+}
+
 // --------------------------------------------------------------- install ----
 
 /// What the bake adds on top of the image: the agent (as init and as the
 /// agent), the image config for the init, the resolver, the hostname, and
 /// the proxy's CA in the system bundle and in a bundle of our own that the
 /// environment points every runtime at. `ca` is the tier's certificate, PEM.
+/// Paths are the image's (see [`Rootfs`]): its own symlinks, such as a
+/// `resolv.conf` or Fedora's CA bundle links, are followed inside it.
 pub fn install(rootfs: &Path, agent_bin: &Path, mut config: ImageConfig, ca_pem: Option<&str>) -> R<()> {
-    let bin = rootfs.join("usr/local/bin");
-    std::fs::create_dir_all(&bin)?;
-    std::fs::copy(agent_bin, bin.join("iso-guest-agent"))?;
-    set_mode(&bin.join("iso-guest-agent"), 0o755)?;
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = Rootfs::open(rootfs)?;
+    root.make_dir(Path::new("usr/local/bin"))?;
+    let mut agent = root.create("usr/local/bin/iso-guest-agent", 0o755)?;
+    std::io::copy(&mut std::fs::File::open(agent_bin)?, &mut agent)?;
+    agent.set_permissions(std::fs::Permissions::from_mode(0o755))?;
 
-    let etc = rootfs.join("etc");
-    std::fs::create_dir_all(etc.join("iso"))?;
-    std::fs::write(etc.join("resolv.conf"), "nameserver 172.22.0.1\n")?;
-    std::fs::write(etc.join("hostname"), "iso-guest\n")?;
-    let hosts = etc.join("hosts");
-    let mut h = std::fs::read_to_string(&hosts).unwrap_or_default();
+    root.make_dir(Path::new("etc/iso"))?;
+    root.write("etc/resolv.conf", "nameserver 172.22.0.1\n")?;
+    root.write("etc/hostname", "iso-guest\n")?;
+    let mut h = root.read("etc/hosts").unwrap_or_default();
     if !h.contains("iso-guest") {
         h.push_str("127.0.0.1 localhost\n127.0.1.1 iso-guest\n");
-        std::fs::write(&hosts, h)?;
+        root.write("etc/hosts", h)?;
     }
 
     if let Some(ca) = ca_pem {
-        std::fs::write(etc.join("iso/ca.crt"), ca)?;
+        root.write("etc/iso/ca.crt", ca)?;
         // Into every system bundle the image has, so tools that read the
         // system store need nothing else.
         let mut bundle = String::new();
         for system in ["etc/ssl/certs/ca-certificates.crt", "etc/pki/tls/certs/ca-bundle.crt", "etc/ssl/cert.pem"] {
-            let p = rootfs.join(system);
-            if p.is_file() {
-                let mut existing = std::fs::read_to_string(&p).unwrap_or_default();
+            if root.is_file(system) {
+                let mut existing = root.read(system).unwrap_or_default();
                 if bundle.is_empty() {
                     bundle = existing.clone();
                 }
@@ -487,7 +649,7 @@ pub fn install(rootfs: &Path, agent_bin: &Path, mut config: ImageConfig, ca_pem:
                         existing.push('\n');
                     }
                     existing.push_str(ca);
-                    std::fs::write(&p, existing)?;
+                    root.write(system, existing)?;
                 }
             }
         }
@@ -495,10 +657,9 @@ pub fn install(rootfs: &Path, agent_bin: &Path, mut config: ImageConfig, ca_pem:
             bundle.push('\n');
         }
         bundle.push_str(ca);
-        std::fs::write(etc.join("iso/ca-bundle.crt"), bundle)?;
-        let anchors = rootfs.join("usr/local/share/ca-certificates");
-        std::fs::create_dir_all(&anchors)?;
-        std::fs::write(anchors.join("iso-egress-proxy.crt"), ca)?;
+        root.write("etc/iso/ca-bundle.crt", bundle)?;
+        root.make_dir(Path::new("usr/local/share/ca-certificates"))?;
+        root.write("usr/local/share/ca-certificates/iso-egress-proxy.crt", ca)?;
         // Runtimes that keep their own store read these; the init hands
         // them to the agent, the agent to every command.
         for (k, v) in [
@@ -518,9 +679,9 @@ pub fn install(rootfs: &Path, agent_bin: &Path, mut config: ImageConfig, ca_pem:
     if !config.env.iter().any(|e| e.starts_with("PATH=")) {
         config.env.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
     }
-    std::fs::write(etc.join("iso/image.json"), serde_json::to_string_pretty(&config)?)?;
-    std::fs::write(
-        etc.join("iso/AGENTS.md"),
+    root.write("etc/iso/image.json", serde_json::to_string_pretty(&config)?)?;
+    root.write(
+        "etc/iso/AGENTS.md",
         "# Notes for agents running in this VM\n\n\
          This VM is the image it was built from, booted under iso with the guest agent as init.\n\
          Outbound network goes through iso's egress proxy on the host: the proxy terminates TLS and\n\
@@ -529,11 +690,6 @@ pub fn install(rootfs: &Path, agent_bin: &Path, mut config: ImageConfig, ca_pem:
          system store and in /etc/iso/ca-bundle.crt, which SSL_CERT_FILE and friends point at.\n",
     )?;
     Ok(())
-}
-
-fn set_mode(p: &Path, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
 }
 
 #[cfg(test)]
@@ -598,6 +754,271 @@ mod tests {
         assert!(!dest.join("opt/x").exists() && !dest.join("opt/y").exists(), "an opaque whiteout empties");
         assert_eq!(std::fs::read(dest.join("opt/z")).unwrap(), b"z");
         assert!(!dest.join("etc/.wh.b").exists());
+    }
+
+    use tar::EntryType::{Directory as D, Link as H, Regular as F, Symlink as S};
+
+    /// A layer as an image may hold it, which `tar::Builder` will not
+    /// write: names as they are, absolute or with `..`. The third field is
+    /// a file's content or a link's target.
+    fn raw_layer(entries: &[(&str, tar::EntryType, &str)]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for &(path, kind, body) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+            h.set_entry_type(kind);
+            h.set_uid(0);
+            h.set_gid(0);
+            h.set_mtime(0);
+            h.set_mode(if kind.is_dir() { 0o755 } else { 0o644 });
+            let data = if kind.is_symlink() || kind.is_hard_link() {
+                h.as_old_mut().linkname[..body.len()].copy_from_slice(body.as_bytes());
+                &b""[..]
+            } else {
+                body.as_bytes()
+            };
+            h.set_size(data.len() as u64);
+            h.set_cksum();
+            b.append(&h, data).unwrap();
+        }
+        b.into_inner().unwrap()
+    }
+
+    /// A rootfs, and beside it `outside/` holding a decoy that no layer
+    /// may touch. `out` is that directory's absolute path, `inner` the
+    /// same path read inside the rootfs.
+    struct Fixture {
+        dir: tempfile::TempDir,
+        rootfs: PathBuf,
+        outside: PathBuf,
+        layers: std::cell::Cell<usize>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let rootfs = dir.path().join("rootfs");
+            let outside = dir.path().join("outside");
+            std::fs::create_dir_all(&rootfs).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("decoy"), "host").unwrap();
+            Self { dir, rootfs, outside, layers: Default::default() }
+        }
+        fn out(&self) -> String {
+            self.outside.to_str().unwrap().to_string()
+        }
+        fn inner(&self) -> String {
+            self.out()[1..].to_string()
+        }
+        fn apply(&self, entries: &[(&str, tar::EntryType, &str)]) -> R<()> {
+            let n = self.layers.get();
+            self.layers.set(n + 1);
+            let path = self.dir.path().join(format!("layer-{n}.tar"));
+            std::fs::write(&path, raw_layer(entries)).unwrap();
+            apply_layer(&path, "", &self.rootfs)
+        }
+        fn decoy(&self, name: &str) -> String {
+            std::fs::read_to_string(self.outside.join(name)).unwrap_or_else(|e| format!("{name}: {e}"))
+        }
+    }
+
+    #[test]
+    fn a_whiteout_with_an_absolute_path_is_read_inside_the_rootfs() {
+        let f = Fixture::new();
+        let (out, inner) = (f.out(), f.inner());
+        f.apply(&[(&format!("{inner}/"), D, ""), (&format!("{inner}/decoy"), F, "image")]).unwrap();
+        let r = f.apply(&[(&format!("{out}/.wh.decoy"), F, "")]);
+        assert_eq!(f.decoy("decoy"), "host");
+        r.unwrap();
+        assert!(!f.rootfs.join(&inner).join("decoy").exists(), "the leading / names the rootfs");
+    }
+
+    #[test]
+    fn a_whiteout_with_dotdot_is_skipped() {
+        let f = Fixture::new();
+        f.apply(&[("etc/", D, ""), ("etc/keep", F, "k")]).unwrap();
+        let r = f.apply(&[
+            ("../outside/.wh.decoy", F, ""),
+            ("etc/../../outside/.wh.decoy", F, ""),
+            ("etc/.wh...", F, ""),
+            (".wh...", F, ""),
+            (".wh..", F, ""),
+            (".wh.", F, ""),
+        ]);
+        assert_eq!(f.decoy("decoy"), "host");
+        r.unwrap();
+        assert_eq!(std::fs::read(f.rootfs.join("etc/keep")).unwrap(), b"k");
+    }
+
+    #[test]
+    fn a_whiteout_under_a_symlink_stays_in_the_rootfs() {
+        let f = Fixture::new();
+        std::fs::write(f.outside.join("decoy2"), "host").unwrap();
+        // `rel` climbs out of the rootfs when read on the host, and onto
+        // the rootfs's own `outside/` when read as the guest reads it.
+        f.apply(&[("abs", S, &f.out()), ("rel", S, "../outside"), ("outside/", D, ""), ("outside/decoy2", F, "image")]).unwrap();
+        let r = f.apply(&[("abs/.wh.decoy", F, ""), ("rel/.wh.decoy2", F, "")]);
+        assert_eq!((f.decoy("decoy").as_str(), f.decoy("decoy2").as_str()), ("host", "host"));
+        r.unwrap();
+        assert!(!f.rootfs.join("outside/decoy2").exists(), "`..` stops at the top of the rootfs");
+        assert!(f.rootfs.join("abs").symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn an_opaque_whiteout_under_a_symlink_stays_in_the_rootfs() {
+        let f = Fixture::new();
+        f.apply(&[("abs", S, &f.out()), ("rel", S, "../outside"), ("outside/", D, ""), ("outside/x", F, "image")]).unwrap();
+        let r = f.apply(&[("abs/.wh..wh..opq", F, ""), ("rel/.wh..wh..opq", F, "")]);
+        assert_eq!(f.decoy("decoy"), "host");
+        r.unwrap();
+        assert!(f.rootfs.join("outside").is_dir() && !f.rootfs.join("outside/x").exists());
+    }
+
+    #[test]
+    fn a_type_change_stays_in_the_rootfs() {
+        let f = Fixture::new();
+        let (out, inner) = (f.out(), f.inner());
+        std::fs::create_dir(f.outside.join("victim")).unwrap();
+        std::fs::write(f.outside.join("victim/decoy"), "host").unwrap();
+        f.apply(&[("abs", S, &out), (&format!("{inner}/"), D, ""), (&format!("{inner}/victim/"), D, ""), (&format!("{inner}/decoy"), F, "image")]).unwrap();
+        // A file where a directory is, through the symlink; a directory
+        // where a file is, by an absolute path.
+        let r = f.apply(&[("abs/victim", F, "file now"), (&format!("{out}/decoy/"), D, "")]);
+        assert_eq!((f.decoy("victim/decoy").as_str(), f.decoy("decoy").as_str()), ("host", "host"));
+        r.unwrap();
+        assert_eq!(std::fs::read(f.rootfs.join(&inner).join("victim")).unwrap(), b"file now");
+        assert!(f.rootfs.join(&inner).join("decoy").is_dir());
+    }
+
+    #[test]
+    fn entries_under_a_symlink_land_in_the_rootfs() {
+        let f = Fixture::new();
+        let (out, inner) = (f.out(), f.inner());
+        let pid = format!("{}.pid", f.dir.path().file_name().unwrap().to_str().unwrap());
+        // Debian's `var/run -> /run`, and a symlink naming a host directory.
+        f.apply(&[
+            ("run/", D, ""),
+            ("var/", D, ""),
+            ("var/run", S, "/run"),
+            ("abs", S, &out),
+            (&format!("{inner}/"), D, ""),
+            (&format!("{inner}/decoy"), F, "image"),
+        ])
+        .unwrap();
+        let r = f.apply(&[(&format!("var/run/{pid}"), F, "1"), ("abs/new", F, "new"), ("abs/sub/deeper", F, "deep"), ("hard", H, &format!("{out}/decoy"))]);
+        assert!(!Path::new("/run").join(&pid).exists());
+        assert!(!f.outside.join("new").exists() && !f.outside.join("sub").exists());
+        assert_eq!(f.decoy("decoy"), "host");
+        r.unwrap();
+        assert_eq!(std::fs::read(f.rootfs.join("run").join(&pid)).unwrap(), b"1", "an absolute symlink points into the image");
+        assert_eq!(std::fs::read(f.rootfs.join(&inner).join("new")).unwrap(), b"new");
+        assert_eq!(std::fs::read(f.rootfs.join(&inner).join("sub/deeper")).unwrap(), b"deep");
+        assert_eq!(std::fs::read(f.rootfs.join("hard")).unwrap(), b"image", "a hard link's target is in the image");
+    }
+
+    #[test]
+    fn an_entry_replaces_what_is_there_unless_both_are_directories() {
+        let f = Fixture::new();
+        f.apply(&[("bin/", D, ""), ("bin/perl5.36", F, "old"), ("bin/perl", F, "old"), ("b", F, "b"), ("c", S, "b"), ("d/", D, ""), ("d/x", F, "x")]).unwrap();
+        f.apply(&[("bin/perl5.36", F, "new"), ("bin/perl", H, "bin/perl5.36"), ("b/", D, ""), ("b/y", F, "y"), ("c/", D, ""), ("d/", D, "")]).unwrap();
+        assert_eq!(std::fs::read(f.rootfs.join("bin/perl")).unwrap(), b"new", "a hard link over a file");
+        assert_eq!(std::fs::read(f.rootfs.join("b/y")).unwrap(), b"y", "a directory over a file");
+        assert!(f.rootfs.join("c").symlink_metadata().unwrap().is_dir(), "a directory over a symlink");
+        assert_eq!(std::fs::read(f.rootfs.join("d/x")).unwrap(), b"x", "a directory over a directory keeps it");
+    }
+
+    #[test]
+    fn ordinary_layers_apply_as_before() {
+        let f = Fixture::new();
+        f.apply(&[
+            ("usr/", D, ""),
+            ("usr/bin/", D, ""),
+            ("bin", S, "usr/bin"),
+            ("a/", D, ""),
+            ("a/x", F, "x"),
+            ("gone/", D, ""),
+            ("gone/deep/", D, ""),
+            ("gone/deep/f", F, "f"),
+            ("link-out", S, &f.out()),
+            ("o/", D, ""),
+            ("o/old", F, "old"),
+        ])
+        .unwrap();
+        f.apply(&[
+            ("bin/tool", F, "tool"),
+            ("a", F, "a is a file now"),
+            (".wh.gone", F, ""),
+            (".wh.link-out", F, ""),
+            ("o/.wh..wh..opq", F, ""),
+            ("o/new", F, "new"),
+        ])
+        .unwrap();
+        let read = |p: &str| std::fs::read_to_string(f.rootfs.join(p)).unwrap();
+        assert_eq!(read("usr/bin/tool"), "tool", "a symlink inside the rootfs is followed");
+        assert_eq!(read("a"), "a is a file now");
+        assert!(!f.rootfs.join("gone").exists(), "a directory whited out with what is in it");
+        assert!(f.rootfs.join("link-out").symlink_metadata().is_err(), "the link goes");
+        assert_eq!(f.decoy("decoy"), "host", "not what it points at");
+        assert!(!f.rootfs.join("o/old").exists());
+        assert_eq!(read("o/new"), "new");
+    }
+
+    #[test]
+    fn modes_and_owners_are_kept() {
+        let f = Fixture::new();
+        let mut b = tar::Builder::new(Vec::new());
+        for (path, kind, mode) in [("tmp/", D, 0o1777), ("usr/", D, 0o755), ("usr/su", F, 0o4755), ("usr/sh", S, 0o777)] {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(kind);
+            h.set_mode(mode);
+            h.set_uid(1000);
+            h.set_gid(1000);
+            h.set_size(0);
+            if kind.is_symlink() {
+                h.set_link_name("su").unwrap();
+            }
+            h.set_cksum();
+            b.append_data(&mut h, path, std::io::empty()).unwrap();
+        }
+        let path = f.dir.path().join("modes.tar");
+        std::fs::write(&path, b.into_inner().unwrap()).unwrap();
+        apply_layer(&path, "", &f.rootfs).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let meta = |p: &str| std::fs::symlink_metadata(f.rootfs.join(p)).unwrap();
+        assert_eq!((meta("tmp").mode() & 0o7777, meta("usr/su").mode() & 0o7777), (0o1777, 0o4755));
+        assert_eq!(std::fs::read_link(f.rootfs.join("usr/sh")).unwrap(), Path::new("su"));
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!((meta("tmp").uid(), meta("usr/su").gid(), meta("usr/sh").uid()), (1000, 1000, 1000));
+        }
+    }
+
+    #[test]
+    fn install_writes_inside_the_rootfs() {
+        let f = Fixture::new();
+        let (out, inner) = (f.out(), f.inner());
+        std::fs::write(f.outside.join("resolv.conf"), "host").unwrap();
+        std::fs::write(f.outside.join("bundle.pem"), "HOST CA\n").unwrap();
+        // Absolute links as images have them (Fedora's CA bundles, a
+        // resolver's resolv.conf), here naming host paths.
+        let image = f.rootfs.join(&inner);
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::write(image.join("bundle.pem"), "IMAGE CA\n").unwrap();
+        std::fs::create_dir_all(f.rootfs.join("etc/ssl")).unwrap();
+        std::fs::create_dir_all(f.rootfs.join("usr")).unwrap();
+        std::os::unix::fs::symlink(format!("{out}/bundle.pem"), f.rootfs.join("etc/ssl/cert.pem")).unwrap();
+        std::os::unix::fs::symlink(format!("{out}/resolv.conf"), f.rootfs.join("etc/resolv.conf")).unwrap();
+        std::os::unix::fs::symlink(&out, f.rootfs.join("usr/local")).unwrap();
+        let agent = f.dir.path().join("agent");
+        std::fs::write(&agent, b"#!/bin/sh\n").unwrap();
+        let ca = "-----BEGIN CERTIFICATE-----\nISO\n-----END CERTIFICATE-----\n";
+        let r = install(&f.rootfs, &agent, ImageConfig::default(), Some(ca));
+        assert_eq!(f.decoy("resolv.conf"), "host");
+        assert_eq!(f.decoy("bundle.pem"), "HOST CA\n");
+        assert!(!f.outside.join("bin").exists() && !f.outside.join("share").exists());
+        r.unwrap();
+        assert_eq!(std::fs::read_to_string(image.join("resolv.conf")).unwrap(), "nameserver 172.22.0.1\n");
+        assert_eq!(std::fs::read_to_string(image.join("bundle.pem")).unwrap(), format!("IMAGE CA\n{ca}"));
+        assert!(image.join("bin/iso-guest-agent").is_file() && image.join("share/ca-certificates/iso-egress-proxy.crt").is_file());
     }
 
     #[test]
