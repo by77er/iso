@@ -28,7 +28,7 @@ vsock.
   a VM's traffic goes through a proxy on the host that enforces rules you set
   for that VM, and you can change them while it runs.
 - **Isolation.** Every VM runs under Firecracker's jailer, in its own chroot,
-  as an unprivileged user.
+  as an unprivileged user of its own, with CPU, memory and I/O limits.
 - **Lifecycle.** VMs can be stopped, started, suspended, and resumed. Durable
   VMs keep their disk when stopped. Ephemeral ones don't.
 

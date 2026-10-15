@@ -35,6 +35,12 @@
         VIRTIO_VSOCKETS = yes;
         VIRTIO_VSOCKETS_COMMON = yes;
 
+        # ---- virtio-rng: the host gives every VM an entropy device, which
+        #      is how a clone resumed from a shared snapshot gets randomness
+        #      of its own. Built in: the Debian rootfs carries no modules. ----
+        HW_RANDOM = yes;
+        HW_RANDOM_VIRTIO = yes;
+
         # ---- VM reset path (reboot=k pulses i8042) ----
         SERIO = yes;
         SERIO_I8042 = yes;

@@ -7,16 +7,21 @@
 //! restart via [`VmRuntime::status`].
 //!
 //! With [`Config::jailer`] set, the process is Firecracker's `jailer` instead:
-//! a chroot per VM, an unprivileged uid, the netns joined by the jailer. See
-//! [`jail`] for the layout.
+//! a chroot per VM, an unprivileged uid and gid per VM, the netns joined by
+//! the jailer, cgroup limits sized to the VM. See [`jail`] for the layout.
+//!
+//! Every freshly booted VM (so every template baked from now on, and its
+//! clones) gets a virtio entropy device and, unless [`Config::rate_limits`]
+//! is `None`, token-bucket limits on its disk, NIC and entropy device.
 
 mod client;
 pub mod jail;
+mod pidfile;
 
 pub use jail::JailerConfig;
 
 use std::collections::HashMap;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -56,6 +61,10 @@ pub struct Config {
     /// Run every VM under `jailer` with these settings; `None` runs
     /// `firecracker` directly as the daemon's own user.
     pub jailer: Option<JailerConfig>,
+    /// Limits Firecracker enforces on each VM's devices; `None` for none.
+    /// Set at boot, so a snapshot carries the limits of the VM it was taken
+    /// from: a template's clones get the bake's.
+    pub rate_limits: Option<RateLimits>,
 }
 
 impl Default for Config {
@@ -67,8 +76,46 @@ impl Default for Config {
             netns_dir: PathBuf::from("/var/run/netns"),
             boot_timeout: Duration::from_secs(10),
             jailer: None,
+            rate_limits: Some(RateLimits::default()),
         }
     }
+}
+
+/// Per-VM device limits, each a token bucket refilled every second. The
+/// defaults are generous on purpose: well above what one sandbox needs, low
+/// enough that one VM cannot take a host's whole disk or uplink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateLimits {
+    /// Root disk throughput, reads and writes together (default 1 GiB/s).
+    pub disk_bytes_per_sec: u64,
+    /// Root disk requests (default 50 000/s).
+    pub disk_ops_per_sec: u64,
+    /// NIC throughput in each direction (default 2 Gbit/s).
+    pub net_bytes_per_sec: u64,
+    /// Entropy device output (default 64 KiB/s): the guest kernel reads a
+    /// few dozen bytes at a time.
+    pub entropy_bytes_per_sec: u64,
+}
+
+impl Default for RateLimits {
+    fn default() -> Self {
+        Self {
+            disk_bytes_per_sec: 1 << 30,
+            disk_ops_per_sec: 50_000,
+            net_bytes_per_sec: 250_000_000,
+            entropy_bytes_per_sec: 64 << 10,
+        }
+    }
+}
+
+/// A Firecracker `rate_limiter` object: a bandwidth bucket of `bytes` per
+/// second and, when given, an operations bucket of `ops` per second.
+fn rate_limiter(bytes: u64, ops: Option<u64>) -> serde_json::Value {
+    let mut v = json!({ "bandwidth": { "size": bytes, "refill_time": 1000 } });
+    if let Some(ops) = ops {
+        v["ops"] = json!({ "size": ops, "refill_time": 1000 });
+    }
+    v
 }
 
 /// What Firecracker's API is told about a VM's files: host paths when it runs
@@ -115,7 +162,10 @@ impl FirecrackerRuntime {
 
     /// The jail root for `vm`, when jailing is on.
     fn jail_root(&self, vm: VmId) -> Option<PathBuf> {
-        self.cfg.jailer.as_ref().map(|j| j.jail_dir(&self.fc_bin, vm).join("root"))
+        self.cfg
+            .jailer
+            .as_ref()
+            .map(|j| j.jail_dir(&self.fc_bin, vm).join("root"))
     }
 
     fn socket(&self, vm: VmId) -> PathBuf {
@@ -160,10 +210,20 @@ impl FirecrackerRuntime {
         let fc = jail::resolve_bin(&self.cfg.bin)?;
         let plan = jail::plan(jailer, &fc, &self.cfg.netns_dir.join(&spec.netns), spec);
         if plan.root != self.jail_root(spec.vm).expect("jailer is configured") {
-            return Err(Error::Backend("jail path changed since the runtime was built".into()));
+            return Err(Error::Backend(
+                "jail path changed since the runtime was built".into(),
+            ));
         }
         jail::teardown(&plan.jail_dir);
         jail::materialize(&plan, jailer, &spec.rootfs_device)?;
+        if !spec.tap.is_empty() {
+            jail::give_tap(
+                &self.cfg.netns_dir.join(&spec.netns),
+                &spec.tap,
+                plan.uid,
+                plan.gid,
+            )?;
+        }
 
         let mut cmd = Command::new(&jailer.bin);
         cmd.args(&plan.args)
@@ -182,8 +242,10 @@ impl FirecrackerRuntime {
                 Ok(())
             });
         }
-        let child = cmd.spawn().map_err(|e| Error::Backend(format!("spawn {}: {e}", jailer.bin.display())))?;
-        std::fs::write(self.pidfile(spec.vm), child.id().to_string()).map_err(be)?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| Error::Backend(format!("spawn {}: {e}", jailer.bin.display())))?;
+        self.write_pidfile(spec.vm, &child)?;
         self.children.lock().unwrap().insert(spec.vm, child);
         Ok(ApiPaths {
             kernel: jail::GUEST_KERNEL.into(),
@@ -220,27 +282,51 @@ impl FirecrackerRuntime {
         // anyway.
         if let Some(j) = &self.cfg.jailer {
             jail::teardown(&j.jail_dir(&self.fc_bin, vm));
+            // Empty once the VMM is gone; a VMM still in it keeps it.
+            let _ = std::fs::remove_dir(jail::cgroup_dir(&self.fc_bin, vm));
         }
     }
 
-    fn pid_of(&self, vm: VmId) -> Option<i32> {
-        if let Some(c) = self.children.lock().unwrap().get(&vm) {
-            return Some(c.id() as i32);
-        }
-        std::fs::read_to_string(self.pidfile(vm))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
+    /// Record `child` as `vm`'s VMM: its pid and start time, so a later
+    /// daemon can tell it from whatever reuses the pid (see [`pidfile`]).
+    fn write_pidfile(&self, vm: VmId, child: &Child) -> Result<()> {
+        std::fs::write(self.pidfile(vm), pidfile::format(child.id())).map_err(be)
     }
 
+    fn recorded(&self, vm: VmId) -> Option<pidfile::Recorded> {
+        pidfile::parse(&std::fs::read_to_string(self.pidfile(vm)).ok()?)
+    }
+
+    /// Whether `args` are those of a VMM launched for `vm`: the jailer, and
+    /// Firecracker once the jailer has exec'd it, carry `--id <vm>`; an
+    /// unjailed Firecracker carries its own API socket. Both forms are
+    /// accepted whatever the current config says, so a VM started under the
+    /// other setting is still recognized (and stopped) as this VM's.
+    fn names_vm(&self, vm: VmId, args: &[Vec<u8>]) -> bool {
+        let unjailed_socket = self.cfg.socket_dir.join(format!("{vm}.sock"));
+        pidfile::has_pair(args, "--id", vm.to_string().as_bytes())
+            || pidfile::has_pair(args, "--api-sock", unjailed_socket.as_os_str().as_bytes())
+    }
+
+    /// Whether `vm`'s VMM is alive. Our own child is trusted (its pid cannot be
+    /// reused before we reap it); a pidfile's pid only once it checks out.
     fn pid_alive(&self, vm: VmId) -> bool {
-        self.pid_of(vm)
-            .map(|pid| unsafe { libc::kill(pid, 0) == 0 })
-            .unwrap_or(false)
+        if let Some(c) = self.children.lock().unwrap().get(&vm) {
+            return unsafe { libc::kill(c.id() as i32, 0) == 0 };
+        }
+        self.recorded(vm)
+            .is_some_and(|rec| pidfile::is_live(rec, |args| self.names_vm(vm, args)))
     }
 
     fn kill(&self, vm: VmId) {
-        if let Some(pid) = self.pid_of(vm) {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+        if let Some(c) = self.children.lock().unwrap().get(&vm) {
+            unsafe { libc::kill(c.id() as i32, libc::SIGKILL) };
+            return;
+        }
+        if let Some(rec) = self.recorded(vm) {
+            pidfile::signal_if(rec.pid, libc::SIGKILL, || {
+                pidfile::is_live(rec, |args| self.names_vm(vm, args))
+            });
         }
     }
 
@@ -268,14 +354,12 @@ impl FirecrackerRuntime {
         let _ = std::fs::remove_file(self.vsock_path(vm));
 
         let ns_path = self.cfg.netns_dir.join(netns);
-        let cpath = std::ffi::CString::new(ns_path.as_os_str().as_bytes()).map_err(be)?;
-        let nsfd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        if nsfd < 0 {
-            return Err(Error::Backend(format!(
-                "open netns {ns_path:?}: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
+        // Owned, so that every return from here on, a failed spawn included,
+        // closes it. The hook below uses the raw number in the child.
+        let ns: OwnedFd = std::fs::File::open(&ns_path)
+            .map_err(|e| Error::Backend(format!("open netns {ns_path:?}: {e}")))?
+            .into();
+        let nsfd = ns.as_raw_fd();
 
         // Prepare the bind paths as CStrings up front (no allocation in the
         // post-fork pre_exec hook, which must stay async-signal-safe).
@@ -338,10 +422,73 @@ impl FirecrackerRuntime {
             });
         }
         let child = cmd.spawn().map_err(be)?;
-        unsafe { libc::close(nsfd) };
-        std::fs::write(self.pidfile(vm), child.id().to_string()).map_err(be)?;
+        drop(ns);
+        self.write_pidfile(vm, &child)?;
         self.children.lock().unwrap().insert(vm, child);
         Ok(())
+    }
+
+    /// The API calls that define a freshly booted VM, in order: `(path, body)`
+    /// for a `PUT` each. `kernel` and `rootfs` are the paths as the VMM sees
+    /// them. A resumed VM gets none of this: its snapshot carries the devices
+    /// (and limits) of the VM it was taken from.
+    fn boot_config(
+        &self,
+        spec: &InstanceSpec,
+        kernel: &str,
+        rootfs: &str,
+    ) -> Vec<(&'static str, serde_json::Value)> {
+        let limits = self.cfg.rate_limits;
+        let mut calls = vec![
+            (
+                "/machine-config",
+                json!({ "vcpu_count": spec.vcpus, "mem_size_mib": spec.mem_mib }),
+            ),
+            (
+                "/boot-source",
+                json!({ "kernel_image_path": kernel, "boot_args": spec.boot_args }),
+            ),
+        ];
+        let mut drive = json!({
+            "drive_id": "rootfs",
+            "path_on_host": rootfs,
+            "is_root_device": true,
+            "is_read_only": false,
+            // Honor guest flush/FUA so ext4 journaling is actually durable.
+            // The Firecracker default ("Unsafe") silently drops flushes;
+            // combined with snapshot-then-SIGKILL (no clean unmount), that
+            // left the baked rootfs — notably a freshly-seeded `.git` — with
+            // torn metadata on the LV, so every CoW clone read a corrupt repo.
+            // Baked into the vmstate, so resumed clones inherit it too.
+            "cache_type": "Writeback",
+        });
+        if let Some(l) = limits {
+            drive["rate_limiter"] = rate_limiter(l.disk_bytes_per_sec, Some(l.disk_ops_per_sec));
+        }
+        calls.push(("/drives/rootfs", drive));
+        if !spec.tap.is_empty() {
+            let mut nic = json!({ "iface_id": "eth0", "host_dev_name": spec.tap, "guest_mac": spec.mac.to_string() });
+            if let Some(l) = limits {
+                nic["rx_rate_limiter"] = rate_limiter(l.net_bytes_per_sec, None);
+                nic["tx_rate_limiter"] = rate_limiter(l.net_bytes_per_sec, None);
+            }
+            calls.push(("/network-interfaces/eth0", nic));
+        }
+        if let Some(cid) = spec.vsock_cid {
+            // Relative path: resolved against the VMM's cwd (this VM's dir), and
+            // recorded as-is in any snapshot so clones get their own socket.
+            calls.push(("/vsock", json!({ "guest_cid": cid, "uds_path": VSOCK_UDS })));
+        }
+        // virtio-rng, fed from the host's getrandom. A clone resumes with the
+        // kernel RNG state of the snapshot it came from, the same in every
+        // clone; this is fresh host entropy for the guest to reseed from
+        // (`iso-guest-agent --reseed`, see `iso_guest_agent::reseed`).
+        let mut entropy = json!({});
+        if let Some(l) = limits {
+            entropy["rate_limiter"] = rate_limiter(l.entropy_bytes_per_sec, None);
+        }
+        calls.push(("/entropy", entropy));
+        calls
     }
 
     async fn wait_socket(&self, vm: VmId) -> Result<()> {
@@ -356,7 +503,9 @@ impl FirecrackerRuntime {
                 }
             }
             if !self.pid_alive(vm) {
-                return Err(Error::Backend("firecracker exited before its API socket was ready".into()));
+                return Err(Error::Backend(
+                    "firecracker exited before its API socket was ready".into(),
+                ));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -366,7 +515,10 @@ impl FirecrackerRuntime {
         if let Some(root) = self.jail_root(vm) {
             match std::fs::read_dir(&root) {
                 Ok(rd) => {
-                    let names: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+                    let names: Vec<String> = rd
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
                     listing = format!("; jail root {} holds {names:?}", root.display());
                 }
                 Err(e) => listing = format!("; jail root {} unreadable: {e}", root.display()),
@@ -396,8 +548,16 @@ impl VmRuntime for FirecrackerRuntime {
                 ApiPaths {
                     kernel: spec.kernel.to_string_lossy().into_owned(),
                     rootfs: spec.rootfs_device.to_string_lossy().into_owned(),
-                    snapshot_mem: spec.resume_from.as_ref().map(|s| s.mem_file.to_string_lossy().into_owned()).unwrap_or_default(),
-                    snapshot_vmstate: spec.resume_from.as_ref().map(|s| s.vmstate.to_string_lossy().into_owned()).unwrap_or_default(),
+                    snapshot_mem: spec
+                        .resume_from
+                        .as_ref()
+                        .map(|s| s.mem_file.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    snapshot_vmstate: spec
+                        .resume_from
+                        .as_ref()
+                        .map(|s| s.vmstate.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                 }
             }
         };
@@ -421,49 +581,8 @@ impl VmRuntime for FirecrackerRuntime {
             return Ok(());
         }
 
-        client::put(
-            &socket,
-            "/machine-config",
-            json!({ "vcpu_count": spec.vcpus, "mem_size_mib": spec.mem_mib }),
-        )
-        .await?;
-        client::put(
-            &socket,
-            "/boot-source",
-            json!({ "kernel_image_path": paths.kernel, "boot_args": spec.boot_args }),
-        )
-        .await?;
-        client::put(
-            &socket,
-            "/drives/rootfs",
-            json!({
-                "drive_id": "rootfs",
-                "path_on_host": paths.rootfs,
-                "is_root_device": true,
-                "is_read_only": false,
-                // Honor guest flush/FUA so ext4 journaling is actually durable.
-                // The Firecracker default ("Unsafe") silently drops flushes;
-                // combined with snapshot-then-SIGKILL (no clean unmount), that
-                // left the baked rootfs — notably a freshly-seeded `.git` — with
-                // torn metadata on the LV, so every CoW clone read a corrupt repo.
-                // Baked into the vmstate, so resumed clones inherit it too.
-                "cache_type": "Writeback",
-            }),
-        )
-        .await?;
-        if !spec.tap.is_empty() {
-            client::put(
-                &socket,
-                "/network-interfaces/eth0",
-                json!({ "iface_id": "eth0", "host_dev_name": spec.tap, "guest_mac": spec.mac.to_string() }),
-            )
-            .await?;
-        }
-        if let Some(cid) = spec.vsock_cid {
-            // Relative path: resolved against the VMM's cwd (this VM's dir), and
-            // recorded as-is in any snapshot so clones get their own socket.
-            client::put(&socket, "/vsock", json!({ "guest_cid": cid, "uds_path": VSOCK_UDS }))
-                .await?;
+        for (path, body) in self.boot_config(spec, &paths.kernel, &paths.rootfs) {
+            client::put(&socket, path, body).await?;
         }
         Ok(())
     }
@@ -474,7 +593,12 @@ impl VmRuntime for FirecrackerRuntime {
         if client::state(&socket).await? == "Paused" {
             client::patch(&socket, "/vm", json!({ "state": "Resumed" })).await
         } else {
-            client::put(&socket, "/actions", json!({ "action_type": "InstanceStart" })).await
+            client::put(
+                &socket,
+                "/actions",
+                json!({ "action_type": "InstanceStart" }),
+            )
+            .await
         }
     }
 
@@ -484,7 +608,10 @@ impl VmRuntime for FirecrackerRuntime {
         client::patch(&socket, "/vm", json!({ "state": "Paused" })).await?;
         let dir = self.snap_dir(vm);
         std::fs::create_dir_all(&dir).map_err(be)?;
-        let out = SnapshotRef { mem_file: dir.join("mem"), vmstate: dir.join("vmstate") };
+        let out = SnapshotRef {
+            mem_file: dir.join("mem"),
+            vmstate: dir.join("vmstate"),
+        };
 
         // Jailed, the VMM writes into its own `snapshot/out` — never over the
         // `snapshot/in` links, which share the template's inode with every
@@ -514,6 +641,10 @@ impl VmRuntime for FirecrackerRuntime {
             let snap_out = root.join("snapshot/out");
             move_out(&snap_out.join("vmstate"), &out.vmstate)?;
             move_out(&snap_out.join("mem"), &out.mem_file)?;
+            // The VMM's own uid created them; every VM resuming them has
+            // another, and none may write them.
+            jail::seal_snapshot_file(&out.vmstate)?;
+            jail::seal_snapshot_file(&out.mem_file)?;
         }
         Ok(out)
     }
@@ -555,7 +686,9 @@ impl VmRuntime for FirecrackerRuntime {
                     path.display()
                 ))
             })?;
-            s.write_all(format!("CONNECT {port}\n").as_bytes()).await.map_err(be)?;
+            s.write_all(format!("CONNECT {port}\n").as_bytes())
+                .await
+                .map_err(be)?;
             let mut line = Vec::with_capacity(16);
             let mut b = [0u8; 1];
             loop {
@@ -574,7 +707,9 @@ impl VmRuntime for FirecrackerRuntime {
             }
             let reply = String::from_utf8_lossy(&line);
             if !reply.starts_with("OK ") {
-                return Err(Error::Backend(format!("vsock CONNECT {port} failed: {reply}")));
+                return Err(Error::Backend(format!(
+                    "vsock CONNECT {port} failed: {reply}"
+                )));
             }
             let std = s.into_std().map_err(be)?;
             std.set_nonblocking(false).map_err(be)?;
@@ -608,8 +743,15 @@ impl VmRuntime for FirecrackerRuntime {
             Ok(s) if s == "Running" => Ok(VmStatus::Running),
             Ok(s) if s == "Paused" => Ok(VmStatus::Suspended),
             Ok(_) => Ok(VmStatus::Created),
+            // The process is there but its API did not answer in time: wedged,
+            // or busy (a snapshot of a large guest holds the API for minutes).
+            // It is alive, so report it as running, not as `Created` (never
+            // started) and never as `Stopped`/`Absent`, the two states the
+            // supervisor takes for an exit and restarts. The next poll asks
+            // again; only a process that is gone (or not this VM's) is
+            // `Stopped`.
             Err(_) => Ok(if self.pid_alive(vm) {
-                VmStatus::Created
+                VmStatus::Running
             } else {
                 VmStatus::Stopped
             }),
@@ -635,13 +777,272 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// A fresh scratch directory for one test.
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("iso-fc-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// An unjailed runtime rooted in `base`, whose `firecracker` does not exist.
+    fn unjailed(base: &Path) -> FirecrackerRuntime {
+        let rt = FirecrackerRuntime::new(Config {
+            bin: base.join("no-such-firecracker"),
+            socket_dir: base.join("sock"),
+            state_dir: base.join("state"),
+            netns_dir: base.join("netns"),
+            boot_timeout: Duration::from_secs(1),
+            jailer: None,
+            ..Config::default()
+        });
+        for d in [&rt.cfg.socket_dir, &rt.cfg.state_dir, &rt.cfg.netns_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        rt
+    }
+
+    /// A live process whose command line names `socket` the way an unjailed
+    /// VMM's does, in a process group of its own so the test can reap it whole.
+    fn fake_vmm(socket: &Path) -> std::process::Child {
+        let child = P::new("sh")
+            .args(["-c", "sleep 30; exit 0", "firecracker", "--api-sock"])
+            .arg(socket)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // `spawn` can return before the exec: wait for the command line.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pidfile::args(child.id() as i32)
+            .is_some_and(|a| pidfile::has_pair(&a, "--api-sock", socket.as_os_str().as_bytes()))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child
+    }
+
+    fn reap_group(mut child: std::process::Child) {
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        let _ = child.wait();
+    }
+
+    /// A VMM that is alive but whose API does not answer (wedged, or busy
+    /// writing a large snapshot) has not "never started": reporting `Created`
+    /// made the supervisor restart it as if it had died.
+    #[tokio::test]
+    async fn a_live_vmm_whose_api_does_not_answer_is_still_running() {
+        let base = scratch("status");
+        let rt = unjailed(&base);
+        let vm = VmId::from_u128(0x5747);
+        let socket = rt.socket(vm);
+        // Accepts, reads nothing, answers nothing.
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+        let vmm = fake_vmm(&socket);
+        std::fs::write(rt.pidfile(vm), vmm.id().to_string()).unwrap();
+
+        assert_eq!(rt.status(vm).await.unwrap(), VmStatus::Running);
+
+        // Once the process is gone, an API that does not answer means it exited.
+        reap_group(vmm);
+        hold.abort();
+        let _ = hold.await;
+        assert_eq!(rt.status(vm).await.unwrap(), VmStatus::Stopped);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// After a daemon restart the pidfile is all there is, and its pid may
+    /// since have been reused: whatever lives there now must not be killed.
+    #[tokio::test]
+    async fn a_pidfile_naming_another_process_kills_nothing() {
+        let base = scratch("pidreuse");
+        let rt = unjailed(&base);
+        let vm = VmId::from_u128(0x9e5);
+        let mut other = P::new("sleep").arg("30").spawn().unwrap();
+        std::fs::write(rt.pidfile(vm), other.id().to_string()).unwrap();
+
+        rt.halt(vm).await.unwrap();
+        // SIGKILL is not synchronous: give a wrongly signalled process time to die.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "halt killed the unrelated process"
+        );
+        assert_eq!(
+            rt.status(vm).await.unwrap(),
+            VmStatus::Absent,
+            "an unrelated process is not this VM"
+        );
+        rt.destroy(vm).await.unwrap();
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "destroy killed the unrelated process"
+        );
+        let _ = other.kill();
+        let _ = other.wait();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The check does not stop the runtime from stopping a VMM it re-adopted:
+    /// one that is this VM's by start time and arguments is still killed, and
+    /// one with this VM's arguments but another start time (its pid reused by
+    /// a later VMM for the same VM, say) is not.
+    #[tokio::test]
+    async fn a_readopted_vmm_is_killed_only_if_it_is_the_one_recorded() {
+        let base = scratch("readopt");
+        let rt = unjailed(&base);
+        let vm = VmId::from_u128(0xad0);
+        let vmm = fake_vmm(&rt.socket(vm));
+        let pid = vmm.id() as i32;
+        let rec = pidfile::parse(&pidfile::format(vmm.id())).unwrap();
+
+        let stale = format!("{pid} {}\n", rec.start.unwrap() + 1);
+        std::fs::write(rt.pidfile(vm), stale).unwrap();
+        assert_eq!(rt.status(vm).await.unwrap(), VmStatus::Absent);
+        rt.halt(vm).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            pidfile::start_time(pid).is_some(),
+            "killed a process the pidfile did not record"
+        );
+
+        std::fs::write(rt.pidfile(vm), pidfile::format(vmm.id())).unwrap();
+        assert_eq!(
+            rt.status(vm).await.unwrap(),
+            VmStatus::Created,
+            "alive, no API socket yet"
+        );
+        rt.destroy(vm).await.unwrap();
+        assert!(
+            pidfile::start_time(pid).is_none(),
+            "destroy left the VMM running"
+        );
+        reap_group(vmm);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn boot_spec() -> InstanceSpec {
+        InstanceSpec {
+            vm: VmId::from_u128(0xb007),
+            netns: "vm0001".into(),
+            tap: "tap0".into(),
+            mac: MacAddr([0x02, 0, 0, 0, 0, 1]),
+            rootfs_device: "/dev/iso/vm_b007".into(),
+            vcpus: 2,
+            mem_mib: 1024,
+            kernel: "/k/vmlinux".into(),
+            boot_args: "console=ttyS0".into(),
+            resume_from: None,
+            rootfs_backing: None,
+            vsock_cid: Some(3),
+        }
+    }
+
+    /// Every fresh VM gets a virtio entropy device (so a clone has host
+    /// randomness to reseed from), and its disk, NIC and entropy device are
+    /// rate limited unless the limits are turned off.
+    #[test]
+    fn boot_config_has_an_entropy_device_and_rate_limits() {
+        let base = scratch("bootcfg");
+        let rt = unjailed(&base);
+        let calls = rt.boot_config(&boot_spec(), "/k/vmlinux", "/rootfs");
+        let paths: Vec<&str> = calls.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            paths,
+            [
+                "/machine-config",
+                "/boot-source",
+                "/drives/rootfs",
+                "/network-interfaces/eth0",
+                "/vsock",
+                "/entropy"
+            ]
+        );
+        let body = |p: &str| calls.iter().find(|(q, _)| *q == p).unwrap().1.clone();
+        let l = RateLimits::default();
+        assert_eq!(
+            body("/entropy")["rate_limiter"]["bandwidth"]["size"],
+            l.entropy_bytes_per_sec
+        );
+        assert_eq!(
+            body("/drives/rootfs")["rate_limiter"]["bandwidth"]["size"],
+            l.disk_bytes_per_sec
+        );
+        assert_eq!(
+            body("/drives/rootfs")["rate_limiter"]["ops"]["size"],
+            l.disk_ops_per_sec
+        );
+        assert_eq!(body("/drives/rootfs")["cache_type"], "Writeback");
+        for dir in ["rx_rate_limiter", "tx_rate_limiter"] {
+            assert_eq!(
+                body("/network-interfaces/eth0")[dir]["bandwidth"]["refill_time"],
+                1000
+            );
+        }
+
+        let unlimited = FirecrackerRuntime::new(Config {
+            rate_limits: None,
+            ..rt.cfg.clone()
+        });
+        let calls = unlimited.boot_config(
+            &InstanceSpec {
+                tap: String::new(),
+                vsock_cid: None,
+                ..boot_spec()
+            },
+            "/k",
+            "/r",
+        );
+        let paths: Vec<&str> = calls.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            paths,
+            [
+                "/machine-config",
+                "/boot-source",
+                "/drives/rootfs",
+                "/entropy"
+            ]
+        );
+        assert!(calls.iter().all(|(_, b)| b.get("rate_limiter").is_none()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A spawn that fails after the netns was opened must not leave the
+    /// namespace fd open in the daemon.
+    #[test]
+    fn a_failed_spawn_does_not_leak_the_netns_fd() {
+        let base = scratch("nsfd");
+        let rt = unjailed(&base);
+        // A regular file: it opens, and `setns` on it then fails in the child.
+        let ns = rt.cfg.netns_dir.join("leak");
+        std::fs::write(&ns, b"").unwrap();
+
+        assert!(rt.spawn(VmId::from_u128(0x1ea4), "leak", None).is_err());
+        let still_open = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .any(|target| target == ns);
+        assert!(!still_open, "the netns fd outlived the failed spawn");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A Firecracker-compatible uncompressed guest kernel, from env or the nix store.
     fn find_kernel() -> Option<PathBuf> {
         if let Ok(p) = std::env::var("ISO_TEST_KERNEL") {
             return Some(p.into());
         }
         for e in std::fs::read_dir("/nix/store").ok()?.flatten() {
-            if e.file_name().to_string_lossy().contains("firecracker-vmlinux") {
+            if e.file_name()
+                .to_string_lossy()
+                .contains("firecracker-vmlinux")
+            {
                 let k = e.path().join("vmlinux");
                 if k.exists() {
                     return Some(k);
@@ -657,13 +1058,19 @@ mod tests {
     fn setup_netns(name: &str, owner: Option<(u32, u32)>) {
         let _ = sh(&["ip", "netns", "del", name]);
         assert!(sh(&["ip", "netns", "add", name]));
-        let (uid, gid) = owner.map(|(u, g)| (u.to_string(), g.to_string())).unwrap_or_default();
-        let mut add = vec!["ip", "netns", "exec", name, "ip", "tuntap", "add", "dev", "tap0", "mode", "tap"];
+        let (uid, gid) = owner
+            .map(|(u, g)| (u.to_string(), g.to_string()))
+            .unwrap_or_default();
+        let mut add = vec![
+            "ip", "netns", "exec", name, "ip", "tuntap", "add", "dev", "tap0", "mode", "tap",
+        ];
         if owner.is_some() {
             add.extend(["user", uid.as_str(), "group", gid.as_str()]);
         }
         assert!(sh(&add));
-        assert!(sh(&["ip", "netns", "exec", name, "ip", "link", "set", "tap0", "up"]));
+        assert!(sh(&[
+            "ip", "netns", "exec", name, "ip", "link", "set", "tap0", "up"
+        ]));
         let _ = sh(&["ip", "netns", "exec", name, "ip", "link", "set", "lo", "up"]);
     }
 
@@ -678,7 +1085,8 @@ mod tests {
         if let Ok(p) = std::env::var("ISO_TEST_AGENT") {
             return Some(p.into());
         }
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/iso-guest-agent");
+        let p =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/iso-guest-agent");
         p.exists().then_some(p)
     }
 
@@ -689,7 +1097,15 @@ mod tests {
     fn make_agent_rootfs(path: &str, agent: &Path) {
         let stage = PathBuf::from(format!("{path}.stage"));
         let _ = std::fs::remove_dir_all(&stage);
-        for d in ["etc", "tmp", "dev", "proc", "sys", "lib64", "lib/x86_64-linux-gnu"] {
+        for d in [
+            "etc",
+            "tmp",
+            "dev",
+            "proc",
+            "sys",
+            "lib64",
+            "lib/x86_64-linux-gnu",
+        ] {
             std::fs::create_dir_all(stage.join(d)).unwrap();
         }
         std::fs::copy(agent, stage.join("init")).expect("copy agent");
@@ -705,7 +1121,14 @@ mod tests {
         std::fs::write(stage.join("etc/hostname"), "fctest\n").unwrap();
         let _ = std::fs::remove_file(path);
         assert!(sh(&["truncate", "-s", "256M", path]));
-        assert!(sh(&["mkfs.ext4", "-F", "-q", "-d", stage.to_str().unwrap(), path]));
+        assert!(sh(&[
+            "mkfs.ext4",
+            "-F",
+            "-q",
+            "-d",
+            stage.to_str().unwrap(),
+            path
+        ]));
         let _ = std::fs::remove_dir_all(&stage);
     }
 
@@ -717,7 +1140,9 @@ mod tests {
         let fd = rt.guest_channel(vm, iso_guest_proto::DEFAULT_PORT).await?;
         let std = std::os::unix::net::UnixStream::from(fd);
         std.set_nonblocking(true).map_err(be)?;
-        Ok(iso_guest_proto::GuestClient::new(tokio::net::UnixStream::from_std(std).map_err(be)?))
+        Ok(iso_guest_proto::GuestClient::new(
+            tokio::net::UnixStream::from_std(std).map_err(be)?,
+        ))
     }
 
     /// Poll until the agent inside `vm` answers a ping.
@@ -741,26 +1166,42 @@ mod tests {
     /// with `mkfs.ext4 -d`. Needs mmdebstrap, root, network, and the static
     /// agent (`ISO_TEST_AGENT_STATIC`, or `nix build .#iso-guest-agent-static`).
     fn make_debian_rootfs(path: &str, agent: &Path) -> bool {
-        if P::new("mmdebstrap").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
+        if P::new("mmdebstrap")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
             eprintln!("skipping: mmdebstrap not on PATH");
             return false;
         }
         let stage = PathBuf::from(format!("{path}.stage"));
         let _ = std::fs::remove_dir_all(&stage);
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../image/debian/build-rootfs.sh");
+        let script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../image/debian/build-rootfs.sh");
         let ok = P::new("bash")
             .arg(&script)
             .env("ROOTFS_DIR", &stage)
             .env("AGENT_BIN", agent)
             .env("MODE", "root")
-            .env("SUITE", std::env::var("ISO_TEST_DEBIAN_SUITE").unwrap_or_else(|_| "trixie".into()))
+            .env(
+                "SUITE",
+                std::env::var("ISO_TEST_DEBIAN_SUITE").unwrap_or_else(|_| "trixie".into()),
+            )
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
         assert!(ok, "build-rootfs.sh failed");
         let _ = std::fs::remove_file(path);
         assert!(sh(&["truncate", "-s", "2G", path]));
-        assert!(sh(&["mkfs.ext4", "-F", "-q", "-d", stage.to_str().unwrap(), path]));
+        assert!(sh(&[
+            "mkfs.ext4",
+            "-F",
+            "-q",
+            "-d",
+            stage.to_str().unwrap(),
+            path
+        ]));
         let _ = std::fs::remove_dir_all(&stage);
         true
     }
@@ -780,7 +1221,9 @@ mod tests {
             return;
         };
         let Ok(agent) = std::env::var("ISO_TEST_AGENT_STATIC").map(PathBuf::from) else {
-            eprintln!("skipping: set ISO_TEST_AGENT_STATIC to a static iso-guest-agent (nix build .#iso-guest-agent-static)");
+            eprintln!(
+                "skipping: set ISO_TEST_AGENT_STATIC to a static iso-guest-agent (nix build .#iso-guest-agent-static)"
+            );
             return;
         };
 
@@ -788,12 +1231,15 @@ mod tests {
         let base = PathBuf::from("/var/tmp/iso-fc-debian");
         let rootfs = "/var/tmp/iso-fc-debian/rootfs.ext4";
         let cfg = Config {
-            bin: std::env::var("ISO_TEST_FC").unwrap_or_else(|_| "firecracker".into()).into(),
+            bin: std::env::var("ISO_TEST_FC")
+                .unwrap_or_else(|_| "firecracker".into())
+                .into(),
             socket_dir: base.join("sock"),
             state_dir: base.join("state"),
             netns_dir: "/var/run/netns".into(),
             boot_timeout: Duration::from_secs(10),
             jailer: JailerConfig::from_env(&base),
+            ..Config::default()
         };
         let rt = FirecrackerRuntime::new(cfg.clone());
         let vm = VmId::from_u128(0xdeb);
@@ -814,7 +1260,8 @@ mod tests {
             vcpus: 2,
             mem_mib: 1024,
             kernel,
-            boot_args: "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/sbin/init".into(),
+            boot_args: "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/sbin/init"
+                .into(),
             resume_from: None,
             rootfs_backing: None,
             vsock_cid: Some(3),
@@ -832,19 +1279,41 @@ mod tests {
             timeout_ms: Some(60_000),
             ..Default::default()
         };
-        let r = c.exec(run(". /etc/os-release; echo $ID; systemctl is-system-running || true; whoami")).await.unwrap();
+        let r = c
+            .exec(run(
+                ". /etc/os-release; echo $ID; systemctl is-system-running || true; whoami",
+            ))
+            .await
+            .unwrap();
         assert_eq!(r.exit_code, Some(0), "{r:?}");
         let out: Vec<&str> = r.stdout.lines().collect();
         assert_eq!(out[0], "debian");
-        assert!(matches!(out[1], "running" | "degraded" | "starting"), "systemd state: {}", out[1]);
+        assert!(
+            matches!(out[1], "running" | "degraded" | "starting"),
+            "systemd state: {}",
+            out[1]
+        );
         assert_eq!(out[2], "coder");
         // apt itself works offline; installing needs egress this test has none of.
         let r = c.exec(run("sudo -n apt-get --version | head -1 && test -f /etc/apt/sources.list && grep -c https /etc/apt/sources.list")).await.unwrap();
         assert_eq!(r.exit_code, Some(0), "{r:?}");
         assert!(r.stdout.starts_with("apt "), "{r:?}");
-        let r = c.exec(run("cat /etc/resolv.conf; test -f /etc/iso/AGENTS.md && echo notes")).await.unwrap();
-        assert!(r.stdout.contains("172.22.0.1") && r.stdout.contains("notes"), "{r:?}");
-        assert_eq!(c.write_file("/home/coder/hello.txt", "aGk=".into(), None, false).await.unwrap(), 2);
+        let r = c
+            .exec(run(
+                "cat /etc/resolv.conf; test -f /etc/iso/AGENTS.md && echo notes",
+            ))
+            .await
+            .unwrap();
+        assert!(
+            r.stdout.contains("172.22.0.1") && r.stdout.contains("notes"),
+            "{r:?}"
+        );
+        assert_eq!(
+            c.write_file("/home/coder/hello.txt", "aGk=".into(), None, false)
+                .await
+                .unwrap(),
+            2
+        );
         drop(c);
 
         rt.destroy(vm).await.expect("destroy");
@@ -860,7 +1329,9 @@ mod tests {
     #[tokio::test]
     async fn live_guest_agent_over_vsock_survives_snapshot_clone() {
         if !is_root() {
-            eprintln!("skipping live_guest_agent_over_vsock_survives_snapshot_clone: requires root + KVM");
+            eprintln!(
+                "skipping live_guest_agent_over_vsock_survives_snapshot_clone: requires root + KVM"
+            );
             return;
         }
         let Some(kernel) = find_kernel() else {
@@ -868,7 +1339,9 @@ mod tests {
             return;
         };
         let Some(agent) = find_agent() else {
-            eprintln!("skipping: no guest agent binary (cargo build -p iso-guest-agent, or set ISO_TEST_AGENT)");
+            eprintln!(
+                "skipping: no guest agent binary (cargo build -p iso-guest-agent, or set ISO_TEST_AGENT)"
+            );
             return;
         };
 
@@ -880,12 +1353,15 @@ mod tests {
         let rootfs = "/var/tmp/iso-fc-vsock/rootfs.ext4";
         let rootfs2 = "/var/tmp/iso-fc-vsock/rootfs-clone.ext4";
         let cfg = Config {
-            bin: std::env::var("ISO_TEST_FC").unwrap_or_else(|_| "firecracker".into()).into(),
+            bin: std::env::var("ISO_TEST_FC")
+                .unwrap_or_else(|_| "firecracker".into())
+                .into(),
             socket_dir: base.join("sock"),
             state_dir: base.join("state"),
             netns_dir: "/var/run/netns".into(),
             boot_timeout: Duration::from_secs(10),
             jailer: JailerConfig::from_env(&base),
+            ..Config::default()
         };
         eprintln!("jailer: {}", cfg.jailer.is_some());
         let rt = FirecrackerRuntime::new(cfg.clone());
@@ -924,10 +1400,21 @@ mod tests {
         // --- files through the agent ---
         {
             let mut c = agent_client(&rt, vm1).await.unwrap();
-            assert_eq!(c.write_file("/tmp/hello", "aGk=".into(), Some(0o600), false).await.unwrap(), 2);
+            assert_eq!(
+                c.write_file("/tmp/hello", "aGk=".into(), Some(0o600), false)
+                    .await
+                    .unwrap(),
+                2
+            );
             let f = c.read_file("/tmp/hello", None).await.unwrap();
             assert_eq!(f.content_b64, "aGk=");
-            let names: Vec<String> = c.list_dir("/").await.unwrap().into_iter().map(|e| e.name).collect();
+            let names: Vec<String> = c
+                .list_dir("/")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
             assert!(names.contains(&"init".to_string()), "{names:?}");
             // closed before the snapshot: Firecracker wants no live vsock connections then.
         }
@@ -948,19 +1435,30 @@ mod tests {
             vm: vm2,
             rootfs_device: rootfs2.into(),
             rootfs_backing: Some(rootfs.into()),
-            resume_from: Some(SnapshotRef { mem_file: tpl.join("mem"), vmstate: tpl.join("vmstate") }),
+            resume_from: Some(SnapshotRef {
+                mem_file: tpl.join("mem"),
+                vmstate: tpl.join("vmstate"),
+            }),
             ..spec.clone()
         };
         rt.create(&clone).await.expect("create vm2 (load snapshot)");
         rt.start(vm2).await.expect("resume vm2");
         let info2 = wait_agent(&rt, vm2).await;
         assert_eq!(info2.hostname, "fctest");
-        assert!(rt.vsock_path(vm2).exists(), "the resumed VM re-bound its vsock under its own directory");
+        assert!(
+            rt.vsock_path(vm2).exists(),
+            "the resumed VM re-bound its vsock under its own directory"
+        );
         {
             // the clone still has the file the template wrote, and writes go to its own copy
             let mut c = agent_client(&rt, vm2).await.unwrap();
-            assert_eq!(c.read_file("/tmp/hello", None).await.unwrap().content_b64, "aGk=");
-            c.write_file("/tmp/clone-only", "eA==".into(), None, false).await.unwrap();
+            assert_eq!(
+                c.read_file("/tmp/hello", None).await.unwrap().content_b64,
+                "aGk="
+            );
+            c.write_file("/tmp/clone-only", "eA==".into(), None, false)
+                .await
+                .unwrap();
         }
         rt.destroy(vm2).await.expect("destroy vm2");
 
@@ -991,12 +1489,15 @@ mod tests {
         make_rootfs(rootfs);
 
         let cfg = Config {
-            bin: std::env::var("ISO_TEST_FC").unwrap_or_else(|_| "firecracker".into()).into(),
+            bin: std::env::var("ISO_TEST_FC")
+                .unwrap_or_else(|_| "firecracker".into())
+                .into(),
             socket_dir: base.join("sock"),
             state_dir: base.join("state"),
             netns_dir: "/var/run/netns".into(),
             boot_timeout: Duration::from_secs(10),
             jailer: None,
+            ..Config::default()
         };
         let rt = FirecrackerRuntime::new(cfg.clone());
 
@@ -1019,7 +1520,11 @@ mod tests {
         rt.create(&spec).await.expect("create vm1");
         rt.start(vm1).await.expect("start vm1");
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(rt.status(vm1).await.unwrap(), VmStatus::Running, "vm1 running");
+        assert_eq!(
+            rt.status(vm1).await.unwrap(),
+            VmStatus::Running,
+            "vm1 running"
+        );
 
         // --- suspend + snapshot ---
         rt.suspend(vm1).await.expect("suspend vm1");

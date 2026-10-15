@@ -28,15 +28,26 @@ pub(crate) struct SocketPath {
 impl SocketPath {
     pub fn new(path: &Path) -> std::io::Result<Self> {
         if path.as_os_str().len() <= SUN_PATH_MAX {
-            return Ok(Self { path: path.to_path_buf(), _dir: None });
+            return Ok(Self {
+                path: path.to_path_buf(),
+                _dir: None,
+            });
         }
         let (dir, name) = match (path.parent(), path.file_name()) {
             (Some(d), Some(n)) if !d.as_os_str().is_empty() => (d, n),
-            _ => return Err(std::io::Error::other(format!("socket path {} has no directory", path.display()))),
+            _ => {
+                return Err(std::io::Error::other(format!(
+                    "socket path {} has no directory",
+                    path.display()
+                )));
+            }
         };
         let dir = std::fs::File::open(dir)?;
         let via = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name);
-        Ok(Self { path: via, _dir: Some(dir.into()) })
+        Ok(Self {
+            path: via,
+            _dir: Some(dir.into()),
+        })
     }
 }
 
@@ -77,7 +88,10 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn content_length(headers: &str) -> Option<usize> {
     headers
         .lines()
-        .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("content-length")))
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        })
         .and_then(|(_, v)| v.trim().parse().ok())
 }
 
@@ -194,7 +208,8 @@ mod tests {
         assert!(sock.as_os_str().len() > SUN_PATH_MAX);
 
         let bind_at = SocketPath::new(&sock).unwrap();
-        let listener = tokio::net::UnixListener::bind(&bind_at.path).expect("bind through /proc/self/fd");
+        let listener =
+            tokio::net::UnixListener::bind(&bind_at.path).expect("bind through /proc/self/fd");
         assert!(sock.exists(), "the socket really is at the long path");
 
         let (client, server) = tokio::join!(connect(&sock), listener.accept());

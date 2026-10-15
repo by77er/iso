@@ -84,9 +84,11 @@ cat > "$R/etc/ssh/sshd_config.d/iso.conf" <<'SSHD'
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 SSHD
-# ssh host keys are generated at first boot by ssh-keygen -A (Debian's unit
-# does this when they are missing), so every clone of a template shares the
-# ones the bake's boot generated — same as the NixOS image.
+# The template's ssh host keys end up in its snapshot and on its disk, so
+# every clone resumes with the same ones (as on the NixOS image), along with
+# the same kernel RNG state. `iso-guest-agent --reseed --ssh-host-keys`, run
+# as root after a clone's first resume, gives it its own of both: it replaces
+# each ssh_host_*_key with a new one of the same type and restarts sshd.
 
 # --- the guest agent: static binary, a unit that runs it as coder on vsock ---
 install -m 0755 "$AGENT_BIN" "$R/usr/local/bin/iso-guest-agent"
@@ -99,7 +101,8 @@ After=systemd-user-sessions.service
 ExecStart=/usr/local/bin/iso-guest-agent --port 5000
 User=coder
 Group=coder
-# The host tells the agent the time after a snapshot resume.
+# The host tells the agent the time after a snapshot resume. (Reseeding a
+# clone takes root: the host runs `sudo -n iso-guest-agent --reseed`.)
 AmbientCapabilities=CAP_SYS_TIME
 WorkingDirectory=/home/coder
 EnvironmentFile=-/etc/environment

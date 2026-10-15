@@ -51,7 +51,15 @@ fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str
         std::ffi::CString::new(fstype).unwrap(),
         std::ffi::CString::new(data).unwrap(),
     );
-    let rc = unsafe { libc::mount(s.as_ptr(), t.as_ptr(), f.as_ptr(), flags, d.as_ptr() as *const libc::c_void) };
+    let rc = unsafe {
+        libc::mount(
+            s.as_ptr(),
+            t.as_ptr(),
+            f.as_ptr(),
+            flags,
+            d.as_ptr() as *const libc::c_void,
+        )
+    };
     if rc != 0 {
         let e = std::io::Error::last_os_error();
         // Already mounted (the kernel mounted devtmpfs, say) is fine.
@@ -64,13 +72,49 @@ fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str
 /// Run as init. Never returns.
 pub fn run(agent_args: &[String]) -> ! {
     log("running as PID 1");
-    mount("proc", "/proc", "proc", libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV, "");
-    mount("sysfs", "/sys", "sysfs", libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV, "");
+    mount(
+        "proc",
+        "/proc",
+        "proc",
+        libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
+        "",
+    );
+    mount(
+        "sysfs",
+        "/sys",
+        "sysfs",
+        libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
+        "",
+    );
     mount("devtmpfs", "/dev", "devtmpfs", libc::MS_NOSUID, "mode=0755");
-    mount("devpts", "/dev/pts", "devpts", libc::MS_NOSUID | libc::MS_NOEXEC, "gid=5,mode=620,ptmxmode=666");
-    mount("tmpfs", "/dev/shm", "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=1777");
-    mount("tmpfs", "/run", "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=0755");
-    mount("tmpfs", "/tmp", "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=1777");
+    mount(
+        "devpts",
+        "/dev/pts",
+        "devpts",
+        libc::MS_NOSUID | libc::MS_NOEXEC,
+        "gid=5,mode=620,ptmxmode=666",
+    );
+    mount(
+        "tmpfs",
+        "/dev/shm",
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        "mode=1777",
+    );
+    mount(
+        "tmpfs",
+        "/run",
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        "mode=0755",
+    );
+    mount(
+        "tmpfs",
+        "/tmp",
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        "mode=1777",
+    );
     let _ = std::fs::create_dir_all("/run/lock");
     if let Ok(h) = std::fs::read_to_string("/etc/hostname") {
         let h = h.trim();
@@ -98,17 +142,26 @@ pub fn run(agent_args: &[String]) -> ! {
         }
         let mut cmd = std::process::Command::new(&exe);
         cmd.args(agent_args).env_clear();
-        cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-        cmd.env("HOME", "/root").env("USER", "root").env("LOGNAME", "root").env("TERM", "xterm");
+        cmd.env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+        cmd.env("HOME", "/root")
+            .env("USER", "root")
+            .env("LOGNAME", "root")
+            .env("TERM", "xterm");
         for kv in &image.env {
             if let Some((k, v)) = kv.split_once('=') {
                 cmd.env(k, v);
             }
         }
-        if let Some(u) = &image.user {
-            if !u.is_empty() && u != "root" && u != "0" {
-                cmd.env("ISO_DEFAULT_USER", u);
-            }
+        // (No let-chains: the guest image builds this crate on stable.)
+        if let Some(u) = image
+            .user
+            .as_deref()
+            .filter(|u| !u.is_empty() && *u != "root" && *u != "0")
+        {
+            cmd.env("ISO_DEFAULT_USER", u);
         }
         if let Some(w) = image.workdir.as_deref().filter(|w| !w.is_empty()) {
             let _ = std::fs::create_dir_all(w);

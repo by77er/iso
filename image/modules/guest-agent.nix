@@ -40,6 +40,9 @@ in
   systemd.services.iso-guest-agent = {
     description = "iso guest agent (host exec and file access over vsock)";
     wantedBy = [ "multi-user.target" ];
+    # A unit's PATH holds neither the setuid wrappers nor the agent itself,
+    # and the host runs `sudo -n iso-guest-agent --reseed` after a resume.
+    path = [ "/run/wrappers" config.iso.guestAgent.package ];
     # vsock needs no network; start as early as the user database allows.
     after = [ "systemd-user-sessions.service" ];
     serviceConfig = {
@@ -50,6 +53,8 @@ in
       Group = "users";
       # The host tells the agent the time after a snapshot resume; setting
       # the clock is the one thing it does beyond the user's permissions.
+      # (Reseeding a clone's RNG and host keys takes root: the host runs
+      # `sudo -n iso-guest-agent --reseed` through it instead.)
       AmbientCapabilities = [ "CAP_SYS_TIME" ];
       WorkingDirectory = "/home/coder";
       Restart = "always";

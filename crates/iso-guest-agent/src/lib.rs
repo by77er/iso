@@ -1,7 +1,9 @@
 //! iso-guest-agent — runs inside the VM and answers [`iso_guest_proto`]
 //! requests: run a program, read or write a file, list a directory, and set
 //! the clock after a snapshot resume (the one privileged thing it does; its
-//! unit grants `CAP_SYS_TIME` for it).
+//! unit grants `CAP_SYS_TIME` for it). A resume also leaves a clone with its
+//! template's RNG state and SSH host keys; [`reseed`] fixes both, run by the
+//! host as `sudo -n iso-guest-agent --reseed`.
 //!
 //! The library half is transport-agnostic ([`serve_connection`] takes any
 //! stream) so the host can exercise the real handlers in tests over a
@@ -16,6 +18,7 @@
 //! with the compiler nixpkgs ships, not the workspace's nightly.
 
 pub mod init;
+pub mod reseed;
 pub mod user;
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -25,8 +28,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use base64::Engine as _;
 use iso_guest_proto::{
-    AgentInfo, ClockResult, DirEntry, ExecRequest, ExecResult, FileContent, FileKind, FileStat, Request,
-    Response, ResponseBody, DEFAULT_EXEC_TIMEOUT_MS, DEFAULT_MAX_OUTPUT, DEFAULT_MAX_READ,
+    AgentInfo, ClockResult, DEFAULT_EXEC_TIMEOUT_MS, DEFAULT_MAX_OUTPUT, DEFAULT_MAX_READ,
+    DirEntry, ExecRequest, ExecResult, FileContent, FileKind, FileStat, Request, Response,
+    ResponseBody,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -46,7 +50,9 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) 
             Err(e) => {
                 // A malformed frame gets an error reply, then we close: the
                 // stream position is no longer trustworthy.
-                let _ = iso_guest_proto::send(&mut stream, &Response::err(format!("bad request: {e}"))).await;
+                let _ =
+                    iso_guest_proto::send(&mut stream, &Response::err(format!("bad request: {e}")))
+                        .await;
                 return;
             }
         };
@@ -69,15 +75,34 @@ async fn dispatch(req: Request) -> Result<ResponseBody, String> {
     match req {
         Request::Ping => Ok(ResponseBody::Pong(info())),
         Request::Exec(e) => exec(e).await.map(ResponseBody::Exec),
-        Request::ReadFile { path, max_bytes } => read_file(&path, max_bytes).await.map(ResponseBody::File),
-        Request::WriteFile { path, content_b64, mode, mkdir } => {
-            write_file(&path, &content_b64, mode, mkdir).await.map(|bytes| ResponseBody::Written { bytes })
+        Request::ReadFile { path, max_bytes } => {
+            read_file(&path, max_bytes).await.map(ResponseBody::File)
         }
-        Request::ListDir { path } => list_dir(&path).await.map(|entries| ResponseBody::Dir { entries }),
+        Request::WriteFile {
+            path,
+            content_b64,
+            mode,
+            mkdir,
+        } => write_file(&path, &content_b64, mode, mkdir)
+            .await
+            .map(|bytes| ResponseBody::Written { bytes }),
+        Request::ListDir { path } => list_dir(&path)
+            .await
+            .map(|entries| ResponseBody::Dir { entries }),
         Request::Stat { path } => stat(&path).await.map(ResponseBody::Stat),
-        Request::Remove { path, recursive } => remove(&path, recursive).await.map(|_| ResponseBody::Done),
+        Request::Remove { path, recursive } => {
+            remove(&path, recursive).await.map(|_| ResponseBody::Done)
+        }
         Request::Mkdir { path, parents } => mkdir(&path, parents).await.map(|_| ResponseBody::Done),
-        Request::SetClock { unix_nanos } => set_clock(unix_nanos).map(ResponseBody::Clock),
+        Request::SetClock { unix_nanos } => {
+            let clock = set_clock(unix_nanos).map(ResponseBody::Clock);
+            // The host sends this after every resume, the moment a clone's
+            // RNG state stops being its own. Reseeding takes root, so this
+            // only lands where the agent is root (an OCI template); elsewhere
+            // the host runs `--reseed` through sudo. Best effort either way.
+            let _ = reseed::reseed_kernel_rng(&[]);
+            clock
+        }
     }
 }
 
@@ -86,10 +111,15 @@ async fn dispatch(req: Request) -> Result<ResponseBody, String> {
 /// `CAP_SYS_TIME` the step fails, and the error says which capability.
 fn set_clock(unix_nanos: u64) -> Result<ClockResult, String> {
     let host = Duration::from_nanos(unix_nanos);
-    let guest = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let guest = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let offset_ms = host.as_millis() as i64 - guest.as_millis() as i64;
     if offset_ms.abs() < CLOCK_STEP_MS {
-        return Ok(ClockResult { offset_ms, stepped: false });
+        return Ok(ClockResult {
+            offset_ms,
+            stepped: false,
+        });
     }
     // Built field by field: some libc targets pad `timespec`.
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
@@ -99,7 +129,10 @@ fn set_clock(unix_nanos: u64) -> Result<ClockResult, String> {
         let e = std::io::Error::last_os_error();
         return Err(format!("set clock: {e} (the agent needs CAP_SYS_TIME)"));
     }
-    Ok(ClockResult { offset_ms, stepped: true })
+    Ok(ClockResult {
+        offset_ms,
+        stepped: true,
+    })
 }
 
 fn info() -> AgentInfo {
@@ -110,7 +143,9 @@ fn info() -> AgentInfo {
             .map(|s| s.trim().to_string())
             .unwrap_or_default(),
         uid: unsafe { libc::getuid() },
-        cwd: std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+        cwd: std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -145,7 +180,11 @@ async fn exec(req: ExecRequest) -> Result<ExecResult, String> {
 
     let mut cmd = tokio::process::Command::new(&req.cmd);
     cmd.args(&req.args)
-        .stdin(if req.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdin(if req.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Own process group, so a timeout can take the whole tree down.
@@ -153,7 +192,11 @@ async fn exec(req: ExecRequest) -> Result<ExecResult, String> {
         .kill_on_drop(true);
     // Whose command this is: the requested user, else the agent's default
     // (the image's USER under an OCI template), else the agent itself.
-    let wanted = req.user.clone().or_else(|| std::env::var("ISO_DEFAULT_USER").ok().filter(|u| !u.is_empty()));
+    let wanted = req.user.clone().or_else(|| {
+        std::env::var("ISO_DEFAULT_USER")
+            .ok()
+            .filter(|u| !u.is_empty())
+    });
     if let Some(u) = wanted.as_deref() {
         let who = user::resolve(u).map_err(|e| format!("user {u:?}: {e}"))?;
         if who.uid != unsafe { libc::getuid() } {
@@ -161,7 +204,9 @@ async fn exec(req: ExecRequest) -> Result<ExecResult, String> {
                 return Err(format!("cannot run as {u:?}: the agent is not root"));
             }
             cmd.uid(who.uid).gid(who.gid);
-            cmd.env("HOME", &who.home).env("USER", &who.name).env("LOGNAME", &who.name);
+            cmd.env("HOME", &who.home)
+                .env("USER", &who.name)
+                .env("LOGNAME", &who.name);
         }
     }
     cmd.envs(&req.env);
@@ -195,7 +240,11 @@ async fn exec(req: ExecRequest) -> Result<ExecResult, String> {
     };
 
     let (truncated, status, timed_out) = match tokio::time::timeout(timeout, run).await {
-        Ok((truncated, status)) => (truncated, Some(status.map_err(|e| format!("wait: {e}"))?), false),
+        Ok((truncated, status)) => (
+            truncated,
+            Some(status.map_err(|e| format!("wait: {e}"))?),
+            false,
+        ),
         Err(_) => {
             if let Some(pid) = pid {
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
@@ -226,14 +275,22 @@ async fn exec(req: ExecRequest) -> Result<ExecResult, String> {
 
 async fn read_file(path: &str, max_bytes: Option<u64>) -> Result<FileContent, String> {
     let cap = max_bytes.unwrap_or(DEFAULT_MAX_READ);
-    let meta = tokio::fs::metadata(path).await.map_err(|e| io_err("stat", path, e))?;
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| io_err("stat", path, e))?;
     if !meta.is_file() {
         return Err(format!("read {path}: not a regular file"));
     }
     let size = meta.len();
-    let mut f = tokio::fs::File::open(path).await.map_err(|e| io_err("open", path, e))?;
+    let mut f = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| io_err("open", path, e))?;
     let mut buf = Vec::with_capacity(size.min(cap) as usize);
-    (&mut f).take(cap).read_to_end(&mut buf).await.map_err(|e| io_err("read", path, e))?;
+    (&mut f)
+        .take(cap)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| io_err("read", path, e))?;
     Ok(FileContent {
         path: path.into(),
         size,
@@ -242,11 +299,20 @@ async fn read_file(path: &str, max_bytes: Option<u64>) -> Result<FileContent, St
     })
 }
 
-async fn write_file(path: &str, content_b64: &str, mode: Option<u32>, mkdir: bool) -> Result<u64, String> {
-    let bytes = B64.decode(content_b64).map_err(|e| format!("write {path}: content is not base64: {e}"))?;
+async fn write_file(
+    path: &str,
+    content_b64: &str,
+    mode: Option<u32>,
+    mkdir: bool,
+) -> Result<u64, String> {
+    let bytes = B64
+        .decode(content_b64)
+        .map_err(|e| format!("write {path}: content is not base64: {e}"))?;
     // (No let-chains here: the guest image builds this crate on stable.)
     let parent = if mkdir {
-        Path::new(path).parent().filter(|p| !p.as_os_str().is_empty())
+        Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
     } else {
         None
     };
@@ -255,7 +321,9 @@ async fn write_file(path: &str, content_b64: &str, mode: Option<u32>, mkdir: boo
             .await
             .map_err(|e| io_err("mkdir", &parent.display().to_string(), e))?;
     }
-    tokio::fs::write(path, &bytes).await.map_err(|e| io_err("write", path, e))?;
+    tokio::fs::write(path, &bytes)
+        .await
+        .map_err(|e| io_err("write", path, e))?;
     if let Some(mode) = mode {
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
             .await
@@ -277,7 +345,9 @@ fn kind_of(ft: std::fs::FileType) -> FileKind {
 }
 
 async fn list_dir(path: &str) -> Result<Vec<DirEntry>, String> {
-    let mut rd = tokio::fs::read_dir(path).await.map_err(|e| io_err("list", path, e))?;
+    let mut rd = tokio::fs::read_dir(path)
+        .await
+        .map_err(|e| io_err("list", path, e))?;
     let mut entries = Vec::new();
     while let Some(entry) = rd.next_entry().await.map_err(|e| io_err("list", path, e))? {
         // symlink_metadata: report the link itself, never follow it.
@@ -297,7 +367,9 @@ async fn list_dir(path: &str) -> Result<Vec<DirEntry>, String> {
 }
 
 async fn stat(path: &str) -> Result<FileStat, String> {
-    let meta = tokio::fs::symlink_metadata(path).await.map_err(|e| io_err("stat", path, e))?;
+    let meta = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|e| io_err("stat", path, e))?;
     Ok(FileStat {
         path: path.into(),
         kind: kind_of(meta.file_type()),
@@ -314,7 +386,9 @@ async fn stat(path: &str) -> Result<FileStat, String> {
 }
 
 async fn remove(path: &str, recursive: bool) -> Result<(), String> {
-    let meta = tokio::fs::symlink_metadata(path).await.map_err(|e| io_err("remove", path, e))?;
+    let meta = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|e| io_err("remove", path, e))?;
     let r = if meta.is_dir() {
         if recursive {
             tokio::fs::remove_dir_all(path).await
@@ -373,7 +447,9 @@ mod tests {
                 cmd: "sh".into(),
                 args: vec!["-c".into(), "cat; echo $ISO_X; pwd".into()],
                 cwd: Some("/tmp".into()),
-                env: [("ISO_X".to_string(), "y".to_string())].into_iter().collect(),
+                env: [("ISO_X".to_string(), "y".to_string())]
+                    .into_iter()
+                    .collect(),
                 stdin: Some("in\n".into()),
                 ..Default::default()
             })
@@ -397,7 +473,10 @@ mod tests {
             .unwrap();
         assert!(r.timed_out);
         assert_eq!(r.exit_code, None);
-        assert!(started.elapsed() < Duration::from_secs(5), "must not wait for the sleeps");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must not wait for the sleeps"
+        );
     }
 
     #[tokio::test]
@@ -424,7 +503,10 @@ mod tests {
         let file = dir.join("a/b/hello.txt");
         let path = file.to_str().unwrap();
 
-        let n = c.write_file(path, B64.encode("hello"), Some(0o640), true).await.unwrap();
+        let n = c
+            .write_file(path, B64.encode("hello"), Some(0o640), true)
+            .await
+            .unwrap();
         assert_eq!(n, 5);
         let got = c.read_file(path, None).await.unwrap();
         assert_eq!(B64.decode(got.content_b64).unwrap(), b"hello");
@@ -441,10 +523,16 @@ mod tests {
         assert!(cut.truncated);
         assert_eq!(B64.decode(cut.content_b64).unwrap(), b"he");
 
-        let err = c.read_file(dir.join("missing").to_str().unwrap(), None).await.unwrap_err();
+        let err = c
+            .read_file(dir.join("missing").to_str().unwrap(), None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, iso_guest_proto::ClientError::Agent(m) if m.contains("missing")));
 
-        assert!(c.remove(dir.to_str().unwrap(), false).await.is_err(), "non-recursive on a tree");
+        assert!(
+            c.remove(dir.to_str().unwrap(), false).await.is_err(),
+            "non-recursive on a tree"
+        );
         c.remove(dir.to_str().unwrap(), true).await.unwrap();
         assert!(!dir.exists());
     }
@@ -452,14 +540,21 @@ mod tests {
     #[tokio::test]
     async fn set_clock_leaves_a_close_clock_alone_and_names_the_missing_capability() {
         let mut c = client().await;
-        let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
         let r = c.set_clock(now).await.unwrap();
         assert!(!r.stepped, "a clock within a second is not stepped");
         assert!(r.offset_ms.abs() < CLOCK_STEP_MS);
         // Only ask for a step where it must be refused: as root this would
         // move the clock of the machine running the tests.
         if unsafe { libc::getuid() } != 0 {
-            let err = c.set_clock(now + 3_600 * 1_000_000_000).await.unwrap_err().to_string();
+            let err = c
+                .set_clock(now + 3_600 * 1_000_000_000)
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("CAP_SYS_TIME"), "{err}");
         }
     }
