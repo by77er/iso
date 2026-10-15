@@ -357,7 +357,7 @@ async fn every_request_and_tunnel_leaves_an_access_event() {
     assert_eq!(t["vm"], "vm-test");
     assert!(t["duration_ms"].is_u64(), "{t}");
     // Its handshake was a request too, judged under wss.
-    let hs = access_events().into_iter().filter(|e| e["path"] == "/ws" && e["upgrade"] == true).last().unwrap();
+    let hs = access_events().into_iter().rfind(|e| e["path"] == "/ws" && e["upgrade"] == true).unwrap();
     assert_eq!((hs["scheme"].as_str(), hs["status"].as_u64()), (Some("wss"), Some(101)));
 }
 

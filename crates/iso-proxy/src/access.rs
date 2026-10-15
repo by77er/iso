@@ -66,6 +66,7 @@ impl Conn {
     }
 
     /// A tunnel (a WebSocket after its 101, a TCP passthrough) that ended.
+    #[allow(clippy::too_many_arguments)]
     pub fn tunnel_closed(&self, kind: &str, host: &str, port: u16, path: &str, up: u64, down: u64, duration: Duration) {
         tracing::info!(
             target: TARGET,

@@ -88,19 +88,6 @@ pub struct NetworkFixture {
     pub mac: MacAddr,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mac_renders_colon_hex() {
-        assert_eq!(
-            MacAddr([0x02, 0, 0, 0, 0x7f, 0xff]).to_string(),
-            "02:00:00:00:7f:ff"
-        );
-    }
-}
-
 /// The two egress levels governing a VM's **external** traffic.
 ///
 /// Access to the host's internal services (DNS, …) on the services dummy address
@@ -212,4 +199,17 @@ pub trait NetworkManager {
     ///
     /// Used by the metadata endpoint to identify a caller by its source IP.
     fn address_to_slot(&self, addr: Ipv4Addr) -> Option<SlotId>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mac_renders_colon_hex() {
+        assert_eq!(
+            MacAddr([0x02, 0, 0, 0, 0x7f, 0xff]).to_string(),
+            "02:00:00:00:7f:ff"
+        );
+    }
 }

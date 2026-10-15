@@ -49,51 +49,6 @@ fn dns_ready(result: &types::ExecResult) -> bool {
         })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn readiness_retries_transient_failures_and_bounds_hanging_probes() {
-        let mut attempts = 0;
-        wait_ready(Duration::from_secs(2), || {
-            attempts += 1;
-            std::future::ready(attempts == 3)
-        })
-        .await
-        .unwrap();
-        assert_eq!(attempts, 3);
-        let error = wait_ready(Duration::from_millis(20), std::future::pending::<bool>)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("metadata.iso.internal"));
-    }
-
-    #[test]
-    fn probe_requires_successful_dns_output_and_is_read_only() {
-        let request = dns_probe();
-        assert_eq!(request.cmd, "getent");
-        assert_eq!(
-            request.args,
-            ["-s", "dns", "ahostsv4", "metadata.iso.internal"]
-        );
-        assert_eq!(request.timeout_ms, Some(2000));
-        let mut result: types::ExecResult = serde_json::from_value(json!({
-            "duration_ms":1,"exit_code":0,"signal":null,"stderr":"",
-            "stdout":"172.22.0.1 STREAM metadata.iso.internal\n", "timed_out":false,"truncated":false
-        })).unwrap();
-        assert!(dns_ready(&result));
-        result.timed_out = true;
-        assert!(!dns_ready(&result));
-        result.timed_out = false;
-        result.exit_code = Some(2);
-        assert!(!dns_ready(&result));
-        result.exit_code = Some(0);
-        result.stdout.clear();
-        assert!(!dns_ready(&result));
-    }
-}
-
 #[derive(Clone)]
 pub struct Plane {
     pub config: PlaneConfig,
@@ -275,5 +230,50 @@ impl Plane {
             .await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn readiness_retries_transient_failures_and_bounds_hanging_probes() {
+        let mut attempts = 0;
+        wait_ready(Duration::from_secs(2), || {
+            attempts += 1;
+            std::future::ready(attempts == 3)
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts, 3);
+        let error = wait_ready(Duration::from_millis(20), std::future::pending::<bool>)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("metadata.iso.internal"));
+    }
+
+    #[test]
+    fn probe_requires_successful_dns_output_and_is_read_only() {
+        let request = dns_probe();
+        assert_eq!(request.cmd, "getent");
+        assert_eq!(
+            request.args,
+            ["-s", "dns", "ahostsv4", "metadata.iso.internal"]
+        );
+        assert_eq!(request.timeout_ms, Some(2000));
+        let mut result: types::ExecResult = serde_json::from_value(json!({
+            "duration_ms":1,"exit_code":0,"signal":null,"stderr":"",
+            "stdout":"172.22.0.1 STREAM metadata.iso.internal\n", "timed_out":false,"truncated":false
+        })).unwrap();
+        assert!(dns_ready(&result));
+        result.timed_out = true;
+        assert!(!dns_ready(&result));
+        result.timed_out = false;
+        result.exit_code = Some(2);
+        assert!(!dns_ready(&result));
+        result.exit_code = Some(0);
+        result.stdout.clear();
+        assert!(!dns_ready(&result));
     }
 }

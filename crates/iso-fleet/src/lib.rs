@@ -78,6 +78,7 @@ impl Fleet {
     /// as the client gave them; what is signed is the effective rule set,
     /// expanded the way the host serves it, so the tier and the host agree
     /// byte for byte.
+    #[allow(clippy::too_many_arguments)]
     pub fn sign_policy(
         &self,
         host: &str,
