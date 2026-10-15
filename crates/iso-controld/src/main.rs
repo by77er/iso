@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use std::net::SocketAddr;
 
+use iso_common::{NetworkManager, SlotId};
 use iso_control_plane::ControlPlane;
-use iso_controld::{dns_memory, http, identify, metadata, settings, tls};
+use iso_controld::{dns_gate, dns_memory, http, identify, metadata, settings, tls};
 use iso_firecracker::FirecrackerRuntime;
 use iso_storage_manager::command::SystemRunner;
 
@@ -41,10 +42,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      or set ISO_JAILER=0 to run VMs as direct children of root."
                 )
             })?;
+            // Each VM runs as `id_base + slot` unless one identity is pinned
+            // for all of them; say which, not the pinned one's fallback.
+            let ids = match j.id_base {
+                Some(base) => format!(
+                    "each its own uid and gid, {base}..={}",
+                    base.saturating_add(SlotId::MAX.into())
+                ),
+                None => format!("all as uid {} gid {}", j.uid, j.gid),
+            };
             eprintln!(
-                "iso-controld: VMs are jailed (uid {} gid {}, chroot {})",
-                j.uid,
-                j.gid,
+                "iso-controld: VMs are jailed ({ids}, chroot {})",
                 j.chroot_base.display()
             );
         }
@@ -65,9 +73,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // only ever asks this socket `names_only`.
     let secrets_sock = s.secrets_sock.clone();
 
+    let net = iso_network_manager::Manager::new(s.network);
+    // Its slot -> address arithmetic, for state kept by a VM's address.
+    let addressing = net.clone();
     let cp = Arc::new(ControlPlane::new(
         s.control,
-        iso_network_manager::Manager::new(s.network),
+        net,
         iso_storage_manager::Manager::new(s.storage, Arc::new(SystemRunner)),
         FirecrackerRuntime::new(s.firecracker),
     )?);
@@ -83,11 +94,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // What every VM resolves is remembered, so the proxy can name an
     // address a VM dials without SNI (a `tunnel tcp://name:port` rule).
     let dns_memory = Arc::new(dns_memory::DnsMemory::default());
+    let vp = addressing.clone();
+    dns_memory.forget_released(&cp, move |slot| vp.fixture(slot).vp_ip);
+
+    // What a VM may have resolved upstream is what its egress reaches. A
+    // bake's builder holds no VM record and egresses directly: the slot
+    // builds through the API use, and the one `dev-up.sh` and the deploy
+    // scripts bake on.
+    let builders = [
+        bake_settings.as_ref().map_or(32766, |b| b.slot),
+        SlotId::MAX,
+    ]
+    .into_iter()
+    .filter_map(|s| SlotId::new(s).ok())
+    .collect();
+    let gate = dns_gate::DnsGate::new(
+        cp.clone(),
+        move |ip| addressing.address_to_slot(ip),
+        builders,
+    );
 
     // dual-horizon DNS on the dummy: metadata.iso.local -> dummy, else forward.
     let dns_cfg = iso_dns_server::Config {
         bind: SocketAddr::new(host.services_addr.into(), 53),
         metadata_ip: host.services_addr,
+        gate: Some(Arc::new(gate)),
         ..Default::default()
     };
     let observer: Arc<dyn iso_dns_server::Observer> = dns_memory.clone();

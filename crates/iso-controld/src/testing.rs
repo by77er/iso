@@ -17,7 +17,7 @@ use std::net::Ipv4Addr;
 
 use crate::http::router;
 
-struct MNet;
+pub(crate) struct MNet;
 impl NetworkManager for MNet {
     async fn init(&self) -> IRes<HostNetwork> {
         Ok(HostNetwork { services_addr: Ipv4Addr::new(172, 22, 0, 1), proxy_port: 3128 })
@@ -45,7 +45,7 @@ impl NetworkManager for MNet {
     }
 }
 
-struct MStore;
+pub(crate) struct MStore;
 impl StorageManager for MStore {
     async fn init(&self) -> IRes<()> {
         Ok(())
@@ -65,7 +65,7 @@ impl StorageManager for MStore {
     }
 }
 
-struct MRun(Mutex<std::collections::HashMap<VmId, VmStatus>>);
+pub(crate) struct MRun(Mutex<std::collections::HashMap<VmId, VmStatus>>);
 impl VmRuntime for MRun {
     async fn create(&self, s: &InstanceSpec) -> IRes<()> {
         self.0.lock().unwrap().insert(s.vm, VmStatus::Created);
@@ -118,6 +118,12 @@ pub fn app() -> Router {
 
 /// The daemon's router over the mock managers, with `templates` registered.
 pub fn app_with_templates(templates: &[&str]) -> Router {
+    router(control_plane(templates), crate::build::Builds::new(None))
+}
+
+/// The control plane under [`app_with_templates`], for tests of what the daemon
+/// wires to it.
+pub(crate) fn control_plane(templates: &[&str]) -> Arc<ControlPlane<MNet, MStore, MRun>> {
     let cfg = Config {
         db_path: ":memory:".into(),
         default_vcpus: 1,
@@ -144,6 +150,6 @@ pub fn app_with_templates(templates: &[&str]) -> Router {
         })
         .unwrap();
     }
-    router(cp, crate::build::Builds::new(None))
+    cp
 }
 

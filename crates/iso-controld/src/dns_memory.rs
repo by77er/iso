@@ -6,21 +6,29 @@
 //! resolved has no name and is refused.
 //!
 //! Entries live for the answer's TTL, floored generously: a connection pool
-//! dials long after the lookup.
+//! dials long after the lookup. They go sooner if the VM leaves its slot: the
+//! next VM placed there has the same address, and must not be credited with
+//! names it never looked up.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use iso_common::{NetworkManager, SlotId, StorageManager, VmRuntime};
+use iso_control_plane::ControlPlane;
 
 /// Below this, an answer's TTL is not trusted to bound when the guest dials.
 const MIN_LIFE: Duration = Duration::from_secs(600);
 /// Entries per VM, so a guest resolving forever cannot grow this without bound.
 const PER_VM: usize = 4096;
 
+/// One VM's answers: address to the name it came from, and until when.
+type Answers = HashMap<Ipv4Addr, (String, Instant)>;
+
 #[derive(Default)]
 pub struct DnsMemory {
-    inner: Mutex<HashMap<Ipv4Addr, HashMap<Ipv4Addr, (String, Instant)>>>,
+    inner: Mutex<HashMap<Ipv4Addr, Answers>>,
 }
 
 impl DnsMemory {
@@ -52,6 +60,21 @@ impl DnsMemory {
     pub fn forget(&self, src: Ipv4Addr) {
         self.inner.lock().unwrap().remove(&src);
     }
+
+    /// Forget what a VM resolved whenever `cp` releases its slot. `addr` is a
+    /// slot's VM-side (`vp`) address, the source the DNS server sees.
+    pub fn forget_released<N, S, R>(
+        self: &Arc<Self>,
+        cp: &ControlPlane<N, S, R>,
+        addr: impl Fn(SlotId) -> Ipv4Addr + Send + Sync + 'static,
+    ) where
+        N: NetworkManager,
+        S: StorageManager,
+        R: VmRuntime,
+    {
+        let memory = self.clone();
+        cp.on_slot_released(move |slot| memory.forget(addr(slot)));
+    }
 }
 
 impl iso_dns_server::Observer for DnsMemory {
@@ -78,5 +101,27 @@ mod tests {
         assert_eq!(m.name_for(vm, a).as_deref(), Some("other.test"), "the latest answer wins");
         m.forget(vm);
         assert_eq!(m.name_for(vm, a), None);
+    }
+
+    /// Nothing called `forget`, so a VM placed on a freed slot inherited what
+    /// the slot's last VM resolved, for at least `MIN_LIFE`.
+    #[tokio::test]
+    async fn a_vm_leaving_its_slot_takes_what_it_resolved_with_it() {
+        use iso_control_plane::CreateVm;
+        let cp = crate::testing::control_plane(&["base"]);
+        let m = Arc::new(DnsMemory::default());
+        let addr = |slot: SlotId| Ipv4Addr::new(172, 21, 0, slot.get() as u8 * 2 + 1);
+        m.forget_released(&cp, addr);
+        let a = cp.create_vm(CreateVm::new("base")).await.unwrap();
+        let b = cp.create_vm(CreateVm::new("base")).await.unwrap();
+        let at = |id| addr(cp.get_vm(id).unwrap().unwrap().slot.unwrap());
+        let (va, vb) = (at(a), at(b));
+        let dst = Ipv4Addr::new(93, 184, 216, 34);
+        m.record(va.into(), "a.test", &[dst], 5);
+        m.record(vb.into(), "b.test", &[dst], 5);
+
+        cp.destroy_vm(a).await.unwrap();
+        assert_eq!(m.name_for(va, dst), None, "gone with its VM");
+        assert_eq!(m.name_for(vb, dst).as_deref(), Some("b.test"));
     }
 }

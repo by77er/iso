@@ -2,7 +2,9 @@
 //!
 //! The slot *is* the network allocation (see the network manager). This is a
 //! simple rotating bitmap; the durable record of which slots are taken lives in
-//! SQLite, and the allocator is rebuilt from it on startup.
+//! SQLite, and the allocator is rebuilt from it on startup. So is where the
+//! rotation stood: a restarted daemon that began again at slot 0 would hand out
+//! the slots freed just before it stopped first.
 
 use iso_common::SlotId;
 
@@ -32,6 +34,20 @@ impl SlotAllocator {
             }
         }
         None
+    }
+
+    /// Where the next scan starts. Saved after each allocation, so that a
+    /// restarted daemon can carry on from it (see [`Self::resume_at`]).
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Start the next scan at `cursor` (recovery), wrapping it into range: the
+    /// capacity may have changed since it was saved.
+    pub fn resume_at(&mut self, cursor: usize) {
+        if !self.used.is_empty() {
+            self.cursor = cursor % self.used.len();
+        }
     }
 
     /// Mark a slot used (recovery from the store).
@@ -85,5 +101,23 @@ mod tests {
         // allocation skips the reserved slot eventually.
         let got: Vec<u16> = std::iter::from_fn(|| a.allocate().map(|s| s.get())).collect();
         assert_eq!(got, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn resumes_the_rotation_where_it_stood() {
+        let mut a = SlotAllocator::new(4);
+        a.allocate().unwrap();
+        a.allocate().unwrap();
+        let saved = a.cursor();
+        // A new allocator (a restarted daemon) with nothing in use: slots 0
+        // and 1 were freed last, so they are the last to come back.
+        let mut b = SlotAllocator::new(4);
+        b.resume_at(saved);
+        let got: Vec<u16> = std::iter::from_fn(|| b.allocate().map(|s| s.get())).collect();
+        assert_eq!(got, vec![2, 3, 0, 1]);
+        // A cursor saved under a larger capacity wraps.
+        let mut c = SlotAllocator::new(4);
+        c.resume_at(6);
+        assert_eq!(c.allocate().unwrap().get(), 2);
     }
 }

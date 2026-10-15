@@ -77,7 +77,10 @@ Returned by `GET /vms` and `GET /vms/{id}`.
 
 `slot`, `tap`, and `rootfs_device` are `null` while the VM holds no placement (state `stopped`).
 `state` is one of `creating`, `running`, `suspended`, `stopped`, `failed` — note that `failed` is
-defined but never currently produced, so clients should treat it as reserved. `egress` is
+defined but never currently produced, so clients should treat it as reserved. A VM the daemon finds
+still `creating` when it starts (it stopped mid-create or mid-start) is cleaned up the way a failed
+attempt is: a `durable` VM that was starting again returns to `stopped`, keeping its disk, snapshot
+and ports; any other is removed with its disk, network and ports. `egress` is
 `proxy` or `deny`: every byte a VM sends outward goes through the proxy, where its rules decide
 (`allow https://*/**` is the open policy; `tunnel tcp://host:port` carries a plain TCP connection
 through as bytes). There is no direct mode. `policy_gen` is bumped by every policy change.
@@ -113,7 +116,9 @@ signature over the policy; see [admin-api.md](admin-api.md).
 
 `lifecycle` selects whether the record and its rootfs survive a stop: `ephemeral` VMs are deleted
 on stop, `durable` ones return to state `stopped` and can be started again. `restart` selects
-supervisor behavior on unexpected exit: `never`, `always`, or `on_failure`.
+supervisor behavior on unexpected exit: `never`, `always`, or `on_failure`. An exit is the VM's
+VMM process being gone; a VMM that is alive but not answering is logged and left running, never
+restarted or torn down.
 
 **`200 OK`** → `{"id": "<uuid>"}`.
 
@@ -137,7 +142,7 @@ the transition.
 
 | Action | Effect |
 | --- | --- |
-| `start` | Boot a `stopped` VM (re-provisions placement) or resume a `suspended` one. A resumed guest has its clock set by the host. |
+| `start` | Boot a `stopped` VM (re-provisions placement) or resume a `suspended` one. A resumed guest has its clock set by the host, and one resumed from its snapshot file (a durable VM stopped while suspended) its kernel RNG reseeded. |
 | `stop` | Graceful shutdown, then a kill if the guest does not exit in time. `ephemeral` → record deleted; `durable` → state `stopped`, rootfs retained. |
 | `suspend` | Pause and snapshot in place; slot and network are retained. |
 | `halt` | Immediate kill, no graceful shutdown. Same record disposition as `stop`. |
@@ -220,7 +225,10 @@ snapshot (so clones resume rather than boot).
 rootfs volumes are cut from as CoW snapshots. `snapshot_mem` and `snapshot_vmstate` are optional
 and must be supplied together — supplying only one silently disables snapshot resume for the
 template. When both are present, VMs created from this template resume from the snapshot (warm
-start) instead of cold-booting.
+start) instead of cold-booting. Every such clone starts with the snapshot's kernel RNG state and SSH
+host keys, so before the create returns the host has the guest agent reseed its RNG from host
+randomness and make new host keys (see [admin-api.md](admin-api.md)); if the guest cannot, the VM
+still comes up and the host logs a warning.
 
 All paths are host filesystem paths, taken verbatim: they are not validated for existence,
 canonicalized, or constrained to any directory. Registration is upsert-style by `name`.
@@ -321,13 +329,23 @@ The metadata service exposes no secret values and no write operations.
 `172.22.0.1:53`, UDP and TCP, is the only resolver guests are configured with.
 
 - Authoritative for the `iso.internal.` zone, which contains a single A record,
-  `metadata.iso.internal` → `172.22.0.1`. Zone transfers (AXFR) are refused.
-- Everything else is forwarded upstream (default `1.1.1.1`, `8.8.8.8`). No DNSSEC validation.
-- **Every A answer is remembered**, per VM, for at least ten minutes: `(VM, address) → name`.
-  A VM's traffic is intercepted at the network layer whatever DNS says, so DNS is not a security
-  boundary; the memory is what puts a name to a plain TCP connection (one to a port other than 443,
-  which carries no SNI) so it can be matched against `tunnel tcp://name:port` rules. An address a VM
-  never resolved through this server has no name and is refused.
+  `metadata.iso.internal` → `172.22.0.1`. It answers every VM in every egress mode. Zone transfers
+  (AXFR) are refused.
+- Everything else is forwarded upstream (default `1.1.1.1`, `8.8.8.8`) only as far as the asking
+  VM's egress policy reaches, because a forwarded query is itself data leaving the host (the name
+  is the payload). A `deny` VM has nothing resolved upstream; a `proxy` VM has the names some
+  `allow` or `tunnel` rule's host matches (`allow https://*/**` matches any). Any other query
+  outside `iso.internal.`, of any type, is answered **REFUSED** and goes nowhere, as is one from an
+  address no VM holds (a template bake's builder slots excepted, `ISO_BAKE_SLOT` (default 32766)
+  and 32767: a builder egresses directly, and `--provision` needs names). A policy change reaches
+  DNS within a second, as it reaches the proxy; a VM placed on a freed slot is never answered by
+  its predecessor's policy. No DNSSEC validation.
+- **Every A answer is remembered**, per VM, for at least ten minutes while the VM holds its slot:
+  `(VM, address) → name`. A VM placed on a freed slot starts with nothing remembered.
+  An answer grants no reachability (a VM's traffic is intercepted at the network layer whatever
+  DNS says, and the proxy decides); the memory is what puts a name to a plain TCP connection (one to
+  a port other than 443, which carries no SNI) so it can be matched against `tunnel tcp://name:port`
+  rules. An address a VM never resolved through this server has no name and is refused.
 - AAAA queries answer NODATA: guests have no IPv6 route, and a passthrough needs the A answer the
   server saw.
 

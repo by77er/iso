@@ -2,6 +2,7 @@
 //! so integration tests (and the binary) can share them.
 
 pub mod build;
+pub mod dns_gate;
 pub mod dns_memory;
 pub mod http;
 pub mod identify;

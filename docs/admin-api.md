@@ -154,6 +154,25 @@ Semantics worth knowing:
   is more than a second off; its unit grants `CAP_SYS_TIME` for that and
   nothing else. A template baked with an older agent logs a warning on the
   host at each resume and keeps its stale clock until it is re-baked.
+- A clone also resumes with its template's kernel RNG state and SSH host
+  keys, the same in every clone. Every VM has a virtio entropy device (host
+  randomness; a template baked before it existed has none until re-baked),
+  and `iso-guest-agent --reseed [--ssh-host-keys]` makes a clone its own: it
+  mixes the base64 random bytes on its stdin and a read of the entropy
+  device into the kernel's pool, forces the generator to reseed (otherwise
+  it does so within a minute), and replaces each `ssh_host_*_key` with a new
+  key of the same type, then restarts sshd. It prints a JSON report.
+- The daemon runs it after every resume from a snapshot, once the clock is
+  set and before the create or start returns: through `exec`, as
+  `sudo -n iso-guest-agent --reseed` (it needs root; an agent that is root
+  runs it itself, as uid 0), with 64 bytes from the host's RNG on stdin. A
+  clone of the template's snapshot also gets `--ssh-host-keys`; a VM
+  resuming its own snapshot is only reseeded, since the RNG state is one it
+  has run with before but its host keys are already its own. A fresh boot,
+  and a suspended VM resumed in place, are not reseeded. A guest that cannot
+  (no agent, an agent from before `--reseed`, no passwordless `sudo`) still
+  comes up, with a warning naming the VM in the daemon's log. On
+  `set_clock` the agent also reseeds by itself where it is root.
 
 `iso-guest-agent --listen-tcp 127.0.0.1:5000` serves the same protocol over
 TCP for debugging outside a VM.
@@ -181,6 +200,17 @@ so python, node, curl and git trust the proxy without changes to the image.
 `ISO_REGISTRY_AUTH=user:password` reaches a private registry; images must be
 linux/amd64.
 
+The bake runs as root on the host, and an image is untrusted input, so every
+path in it is resolved inside the volume being filled, as the guest will
+resolve it (`openat2` with `RESOLVE_IN_ROOT`, so the host needs Linux 5.6 or
+later). A layer entry's leading `/` is dropped and an entry with `..` in its
+path is skipped, as `tar` does. An absolute symlink in the image, such as
+Debian's `var/run -> /run`, leads to the image's `/run`, and `..` in a
+symlink stops at the image's root. This holds for files, whiteouts, opaque
+directories, hard-link targets, and what the bake adds afterwards (resolver,
+CA bundles, agent). An entry replaces what is at its path unless both are
+directories, as the OCI layer spec says.
+
 `isoctl bake --distro debian --debian-suite trixie [--debian-snapshot 20260901T000000Z] [--debian-packages a,b]`
 builds the Debian one; apt mirrors are `https://` because the proxy passes only
 TLS, so a VM that should install packages needs `deb.debian.org` and
@@ -192,13 +222,45 @@ TLS, so a VM that should install packages needs `deb.debian.org` and
 
 The daemon (and `isoctl bake`) launch every VM through Firecracker's `jailer`
 unless `ISO_JAILER=0`: a chroot per VM under `ISO_JAIL_DIR` (default
-`$ISO_STATE_DIR/jail`), the VMM dropped to `ISO_JAIL_UID`/`ISO_JAIL_GID`
-(default 65534), the netns joined by the jailer, cgroup v2, and optional
-`ISO_JAIL_CGROUPS` and `ISO_JAIL_RLIMITS` (comma-separated `key=value`).
+`$ISO_STATE_DIR/jail`), the netns joined by the jailer, and cgroup v2.
 Inside the jail the rootfs is a device node pointing at the VM's own volume,
 the kernel and snapshot are hard links (or a per-host cached copy when the
 source is on another filesystem, as the Nix store is), and every path
 Firecracker sees is the same for every VM, which is what a snapshot needs.
+
+Each VM's VMM runs as a uid and gid of its own, `ISO_JAIL_ID_BASE + slot`
+(default base 65536, so 65536–98303: above every 16-bit id and below the
+`/etc/subuid` ranges that start at 100000), so a VMM that escapes Firecracker
+cannot signal, trace or open its neighbours. Before starting it, the daemon
+hands the VM's TAP to that identity, and a snapshot a jailed VM writes is
+handed to root, mode 0644, so any VM can resume it and none can rewrite it.
+Setting `ISO_JAIL_UID`/`ISO_JAIL_GID` (default 65534), or
+`ISO_JAIL_ID_BASE=off`, runs every VM as that one identity instead.
+
+Limits default from each VM's size: cgroup `cpu.max` of one CPU more than
+its vCPUs, `memory.max` of its memory plus an eighth (at least 256 MiB more),
+`pids.max` of 64 plus its vCPUs, and the rlimit `no-file=2048`.
+`ISO_JAIL_CGROUPS` and `ISO_JAIL_RLIMITS` (comma-separated `key=value`)
+replace the default for the same key and add others; `ISO_JAIL_LIMITS=off`
+keeps only those. A default cgroup limit applies only where the host's
+cgroup v2 root offers its controller (`/sys/fs/cgroup/cgroup.controllers`,
+read once when the daemon starts): the jailer refuses a setting it has no
+controller for, which would fail every VM. On a host without them (cgroup
+v1, or a hybrid host whose v2 is mounted elsewhere) the daemon logs which
+defaults it left out and why. `ISO_JAIL_CGROUPS` entries are passed on as
+given. Firecracker itself rate limits every VM's disk (1 GiB/s, 50 000
+operations/s), NIC (2 Gbit/s each way) and entropy device (64 KiB/s); these
+are set at boot, so a template's clones carry the bake's.
+
+With any cgroup setting the jailer moves each VMM into a cgroup of its own
+(`/sys/fs/cgroup/<firecracker>/<vm id>`, removed on destroy), out of the
+daemon's service cgroup. VMMs there survive `systemctl stop` of the daemon
+(systemd's default `KillMode=control-group` kills only the unit's cgroup),
+and the daemon re-adopts them when it starts again: recovery keeps every
+running VM whose VMM is alive, found by its pidfile and API socket. Without
+any cgroup setting a VMM stays in the daemon's cgroup and is killed with it;
+the next daemon finds it gone and handles the exit by the VM's restart
+policy.
 
 The daemon refuses to start if the jailer is on but its binary cannot be
 found, rather than quietly running VMs unjailed.
@@ -222,7 +284,9 @@ host it also lists the *names* of the headers the proxy injects, never their
 values, so a guest can tell which requests will carry a credential.
 
 The same address serves DNS: `metadata.iso.internal` locally, everything else
-through the upstream resolvers. The server answers A queries itself and
+through the upstream resolvers, as far as the VM's egress policy reaches: nothing
+for a `deny` VM, the names its `allow` and `tunnel` rules name for a `proxy` VM,
+REFUSED for the rest. The server answers A queries itself and
 remembers, per VM, which name each address came from: that is how the proxy
 puts a name to a plain TCP connection and matches it against a
 `tunnel tcp://host:port` rule. AAAA queries get no answer, since guests have no

@@ -4,14 +4,13 @@
 //! Transport-agnostic — the axum HTTP layer is a thin wrapper over these
 //! methods.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iso_common::{
-    EgressMode, HostNetwork, InstanceSpec, NetworkManager, NetworkPolicy, StorageManager, VmId,
-    VmRuntime,
-    VmStatus, VolumeSpec,
+    EgressMode, HostNetwork, InstanceSpec, NetworkManager, NetworkPolicy, SlotId, StorageManager,
+    VmId, VmRuntime, VmStatus, VolumeSpec,
 };
 
 use crate::config::Config;
@@ -40,7 +39,14 @@ pub struct ControlPlane<N, S, R> {
     /// is the store's job now (normalized `port_forwards` rows + disjoint column
     /// updates), not this lock's; different VMs stay fully concurrent.
     vm_locks: Mutex<HashMap<VmId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Told of each slot as it returns to the pool (see [`Self::on_slot_released`]).
+    slot_released: Mutex<Vec<SlotHook>>,
+    /// Running VMs whose VMM is alive but did not report running at the last
+    /// supervision pass, so that it is logged once, not every pass.
+    unresponsive: Mutex<HashSet<VmId>>,
 }
+
+type SlotHook = Box<dyn Fn(SlotId) + Send + Sync>;
 
 fn random_vmid() -> VmId {
     use std::io::Read;
@@ -73,6 +79,8 @@ where
             ports: Mutex::new(ports),
             services: Mutex::new(None),
             vm_locks: Mutex::new(HashMap::new()),
+            slot_released: Mutex::new(Vec::new()),
+            unresponsive: Mutex::new(HashSet::new()),
         })
     }
 
@@ -94,6 +102,45 @@ where
         self.vm_locks.lock().unwrap().remove(&id);
     }
 
+    /// Run `f` with each slot as it is released (its VM deleted, stopped,
+    /// moving to another slot to restart, or never finished), after the slot's
+    /// network is torn down and before it can be allocated again. For state
+    /// outside the control plane that is keyed by a slot's addresses, such as
+    /// the names the daemon's DNS remembers a VM resolving: the next VM placed
+    /// there gets the same addresses. `f` runs inline and must not call back
+    /// into the control plane.
+    pub fn on_slot_released(&self, f: impl Fn(SlotId) + Send + Sync + 'static) {
+        self.slot_released.lock().unwrap().push(Box::new(f));
+    }
+
+    /// Take the next free slot, saving where the rotation now stands so that a
+    /// restarted daemon carries on from there (see `recover`).
+    fn allocate_slot(&self) -> Result<SlotId> {
+        let mut slots = self.slots.lock().unwrap();
+        let slot = slots.allocate().ok_or(Error::SlotsExhausted)?;
+        // Best effort: a cursor not saved only means a restart resumes from an
+        // older one. Saved under the allocator's lock, so saves are in order.
+        if let Err(e) = self.store.set_slot_cursor(slots.cursor()) {
+            tracing::warn!("slot cursor not saved: {e}");
+        }
+        Ok(slot)
+    }
+
+    /// Return `slot` to the pool, its network already torn down. Whatever
+    /// remembers the slot's last VM hears of it first, while no other VM can
+    /// have been given the slot.
+    ///
+    /// Only once no record claims the slot (the VM's deleted, or saved
+    /// without it): [`Self::identify`] takes an address to the record holding
+    /// its slot, so a VM placed there while the last one's record still held
+    /// it would be taken for that one, by the proxy, metadata and DNS.
+    fn free_slot(&self, slot: SlotId) {
+        for f in self.slot_released.lock().unwrap().iter() {
+            f(slot);
+        }
+        self.slots.lock().unwrap().free(slot);
+    }
+
     /// Initialize host subsystems and recover persisted VMs. Returns the
     /// host-wide network facts (for binding services).
     pub async fn start(&self) -> Result<HostNetwork> {
@@ -107,21 +154,92 @@ where
     /// Rebuild the slot allocator from the store and re-adopt or reconcile each
     /// VM against live VMM state.
     async fn recover(&self) -> Result<()> {
-        for rec in self.store.list_vms()? {
-            if let Some(slot) = rec.slot {
-                self.slots.lock().unwrap().reserve(slot);
+        let vms = self.store.list_vms()?;
+        // Every slot and port is taken before any VM is acted on: a restart
+        // below places a VM, and must not be given a slot a later record holds.
+        {
+            let mut slots = self.slots.lock().unwrap();
+            for slot in vms.iter().filter_map(|rec| rec.slot) {
+                slots.reserve(slot);
             }
-            for f in &rec.ingress {
-                self.ports.lock().unwrap().reserve(f.host_port);
+            // Carry on rotating from where the last daemon stood, so the slots
+            // it freed last are the last reused. A database from before the
+            // cursor was saved resumes after the highest slot in use.
+            let highest = vms
+                .iter()
+                .filter_map(|rec| rec.slot)
+                .map(|s| s.get() as usize + 1)
+                .max();
+            if let Some(cursor) = self.store.slot_cursor()?.or(highest) {
+                slots.resume_at(cursor);
             }
-            // Reconcile against the VMM: a VM the store thinks is running but
-            // whose process is gone gets the exit handler.
-            if rec.state == VmState::Running {
-                let status = self.runtime.status(rec.id).await?;
-                if status != iso_common::VmStatus::Running {
-                    self.handle_exit(rec.id, true).await?;
+        }
+        {
+            let mut ports = self.ports.lock().unwrap();
+            for f in vms.iter().flat_map(|rec| &rec.ingress) {
+                ports.reserve(f.host_port);
+            }
+        }
+        for rec in vms {
+            match rec.state {
+                // A VM the store thinks is running but whose VMM is gone gets
+                // the exit handler.
+                VmState::Running => {
+                    if exited(self.runtime.status(rec.id).await?) {
+                        self.reap(rec.id).await?;
+                    }
                 }
+                // A create or start the last daemon died in the middle of.
+                VmState::Creating => self.abandon(rec.id).await?,
+                VmState::Suspended | VmState::Stopped | VmState::Failed => {}
             }
+        }
+        Ok(())
+    }
+
+    /// Undo a create or start that the daemon died in the middle of. How far it
+    /// got is unknown, so all of it goes: the VMM if one was spawned, then the
+    /// slot's network, then the slot. What is left is what a failed attempt
+    /// leaves: a new VM is removed with its volume and ports, like a failed
+    /// create; a durable VM that was starting again returns to `stopped` with
+    /// its disk, snapshot and ports, like a failed start.
+    async fn abandon(&self, id: VmId) -> Result<()> {
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
+        let Some(mut rec) = self.store.get_vm(id)? else {
+            return Ok(());
+        };
+        // Only a VM that has run before has a device recorded: create_vm
+        // records it once the VM is up.
+        let keep = rec.lifecycle == Lifecycle::Durable && rec.rootfs_device.is_some();
+        tracing::warn!(
+            vm = %id,
+            "was being created or started when the daemon stopped; {}",
+            if keep { "returning it to stopped" } else { "removing it" }
+        );
+        let _ = self.runtime.halt(id).await;
+        if keep {
+            let _ = self.runtime.release(id).await;
+        } else {
+            let _ = self.runtime.destroy(id).await;
+        }
+        let slot = rec.slot;
+        if let Some(slot) = slot {
+            let _ = self.net.teardown(slot).await;
+        }
+        if keep {
+            rec.slot = None;
+            rec.tap = None;
+            rec.state = VmState::Stopped;
+            self.store.update_placement(&rec)?;
+        } else {
+            self.free_ports(&rec.ingress);
+            let _ = self.storage.teardown(id).await;
+            self.store.delete_vm(id)?;
+            self.forget_lock(id);
+        }
+        if let Some(slot) = slot {
+            self.free_slot(slot);
         }
         Ok(())
     }
@@ -169,26 +287,21 @@ where
         if self.store.get_vm(id)?.is_some() {
             return Err(Error::VmExists(id));
         }
-        let slot = self
-            .slots
-            .lock()
-            .unwrap()
-            .allocate()
-            .ok_or(Error::SlotsExhausted)?;
+        let slot = self.allocate_slot()?;
 
         // Allocate an external host port for each requested forward (ssh is
         // just a forward; nothing special). The resolved ports are reported in
         // the VM record.
         let mut ingress: Vec<PortForward> = Vec::with_capacity(req.ingress.len());
         for f in &req.ingress {
-            let host_port = match self.ports.lock().unwrap().allocate() {
+            // Bound first: the allocator's guard must be gone before the
+            // failure path frees ports under the same lock.
+            let allocated = self.ports.lock().unwrap().allocate();
+            let host_port = match allocated {
                 Some(p) => p,
                 None => {
-                    let mut pa = self.ports.lock().unwrap();
-                    for done in &ingress {
-                        pa.free(done.host_port);
-                    }
-                    self.slots.lock().unwrap().free(slot);
+                    self.free_ports(&ingress);
+                    self.free_slot(slot);
                     return Err(Error::PortsExhausted);
                 }
             };
@@ -322,6 +435,9 @@ where
         self.runtime.start(rec.id).await?;
         if spec.resume_from.is_some() {
             self.sync_guest_clock(rec.id).await;
+            // New host keys only for a clone of the template's snapshot: a
+            // VM resuming its own made its keys when it first resumed.
+            self.reseed_guest(rec.id, rec.snapshot.is_none()).await;
         }
 
         rec.rootfs_device = Some(storage.device_path);
@@ -334,8 +450,14 @@ where
         let _ = self.runtime.destroy(id).await;
         let _ = self.net.teardown(slot).await;
         let _ = self.storage.teardown(id).await;
-        self.slots.lock().unwrap().free(slot);
-        let _ = self.store.delete_vm(id);
+        // The record goes before the slot (see `free_slot`). One that cannot
+        // go keeps its slot, until the next daemon's recovery removes both.
+        match self.store.delete_vm(id) {
+            Ok(()) => self.free_slot(slot),
+            Err(e) => {
+                tracing::warn!(vm = %id, "rolled back but still on record, so its slot is kept: {e}")
+            }
+        }
         self.forget_lock(id);
     }
 
@@ -349,11 +471,14 @@ where
         let _ = self.runtime.destroy(id).await;
         if let Some(slot) = rec.slot {
             let _ = self.net.teardown(slot).await;
-            self.slots.lock().unwrap().free(slot);
         }
         self.free_ports(&rec.ingress);
         let _ = self.storage.teardown(id).await;
         self.store.delete_vm(id)?;
+        // Only now that the record is gone (see `free_slot`).
+        if let Some(slot) = rec.slot {
+            self.free_slot(slot);
+        }
         self.forget_lock(id);
         Ok(())
     }
@@ -426,7 +551,9 @@ where
         rec.snapshot = None;
         rec.state = VmState::Stopped;
         self.store.update_placement(&rec)?;
-        if let Some(slot) = slot { self.slots.lock().unwrap().free(slot); }
+        if let Some(slot) = slot {
+            self.free_slot(slot);
+        }
         Ok(())
     }
 
@@ -436,7 +563,7 @@ where
         tokio::time::timeout(timeout, async {
             loop {
                 match self.runtime.status(id).await {
-                    Ok(VmStatus::Stopped) | Ok(VmStatus::Absent) => return,
+                    Ok(status) if exited(status) => return,
                     _ => tokio::time::sleep(Duration::from_millis(50)).await,
                 }
             }
@@ -459,9 +586,9 @@ where
                 let _ = self.runtime.destroy(rec.id).await;
             }
         }
-        if let Some(slot) = rec.slot {
+        let slot = rec.slot;
+        if let Some(slot) = slot {
             let _ = self.net.teardown(slot).await;
-            self.slots.lock().unwrap().free(slot);
         }
         match rec.lifecycle {
             Lifecycle::Ephemeral => {
@@ -479,6 +606,10 @@ where
                 rec.state = VmState::Stopped;
                 self.store.update_placement(&rec)?;
             }
+        }
+        // Only now that no record claims it (see `free_slot`).
+        if let Some(slot) = slot {
+            self.free_slot(slot);
         }
         Ok(())
     }
@@ -530,12 +661,7 @@ where
                     .store
                     .get_template(&rec.template)?
                     .ok_or_else(|| Error::UnknownTemplate(rec.template.clone()))?;
-                let slot = self
-                    .slots
-                    .lock()
-                    .unwrap()
-                    .allocate()
-                    .ok_or(Error::SlotsExhausted)?;
+                let slot = self.allocate_slot()?;
                 rec.slot = Some(slot);
                 rec.state = VmState::Creating;
                 self.store.update_placement(&rec)?;
@@ -546,10 +672,20 @@ where
                         Ok(())
                     }
                     Err(e) => {
-                        self.slots.lock().unwrap().free(slot);
+                        // bring_up may have got as far as a VMM and the
+                        // slot's network; neither may outlive the attempt
+                        // into the slot's next VM.
+                        let _ = self.runtime.halt(id).await;
+                        let _ = self.runtime.release(id).await;
+                        let _ = self.net.teardown(slot).await;
                         rec.slot = None;
                         rec.state = VmState::Stopped;
-                        let _ = self.store.update_placement(&rec);
+                        // The record lets go of the slot first (see
+                        // `free_slot`). One not saved keeps it, `creating`,
+                        // for the next daemon's recovery to undo.
+                        if self.store.update_placement(&rec).is_ok() {
+                            self.free_slot(slot);
+                        }
                         Err(e)
                     }
                 }
@@ -570,18 +706,27 @@ where
         let Some(rec) = self.store.get_vm(id)? else {
             return Ok(());
         };
+        self.handle_exit_locked(rec, failed).await
+    }
+
+    /// `handle_exit` body, with this VM's lock held and `rec` read under it.
+    async fn handle_exit_locked(&self, rec: VmRecord, failed: bool) -> Result<()> {
+        let id = rec.id;
         let restart = matches!(rec.restart, RestartPolicy::Always)
             || (failed && matches!(rec.restart, RestartPolicy::OnFailure));
         if restart {
             // free current placement, then re-place + boot.
-            if let Some(slot) = rec.slot {
-                let _ = self.net.teardown(slot).await;
-                self.slots.lock().unwrap().free(slot);
-            }
             let mut rec = rec;
-            rec.slot = None;
+            let slot = rec.slot.take();
+            if let Some(slot) = slot {
+                let _ = self.net.teardown(slot).await;
+            }
             rec.state = VmState::Stopped;
             self.store.update_placement(&rec)?;
+            // Only now that the record no longer claims it (see `free_slot`).
+            if let Some(slot) = slot {
+                self.free_slot(slot);
+            }
             self.start_vm_locked(id).await
         } else {
             self.finalize_stop(rec).await
@@ -589,20 +734,75 @@ where
     }
 
     /// One supervision pass: reconcile each Running record against live VMM
-    /// state, invoking the exit handler for any that have gone away.
+    /// state, invoking the exit handler for any whose VMM has gone away.
+    ///
+    /// Only a definite exit counts (see `exited`). A VMM whose process is alive
+    /// is left alone whatever else its status says (its API slow to answer,
+    /// its socket missing): nothing here can tell a slow VM from a hung one,
+    /// and tearing down a slow one would destroy a guest that is still
+    /// working. One that stops reporting running is logged, and again when it
+    /// reports running once more.
     pub async fn supervise_tick(&self) -> Result<()> {
+        let mut running = HashSet::new();
         for rec in self.store.list_vms()? {
-            if rec.state == VmState::Running {
-                match self.runtime.status(rec.id).await? {
-                    VmStatus::Running | VmStatus::Suspended => {}
-                    // unexpected exit; treat as failure so OnFailure restarts.
-                    _ => {
-                        let _ = self.handle_exit(rec.id, true).await;
+            if rec.state != VmState::Running {
+                continue;
+            }
+            running.insert(rec.id);
+            match self.runtime.status(rec.id).await {
+                Ok(status) if exited(status) => {
+                    if let Err(e) = self.reap(rec.id).await {
+                        tracing::warn!(vm = %rec.id, "handling the VM's exit failed: {e}");
                     }
+                }
+                Ok(status) => self.note_alive(rec.id, status),
+                Err(e) => tracing::warn!(vm = %rec.id, "VMM status unavailable: {e}"),
+            }
+        }
+        self.unresponsive
+            .lock()
+            .unwrap()
+            .retain(|id| running.contains(id));
+        Ok(())
+    }
+
+    /// The supervisor saw `id`'s VMM exited, without holding the VM's lock.
+    /// Look again under it: meanwhile the VM may have been stopped, deleted,
+    /// or restarted into a new VMM, and only a record still running whose VMM
+    /// is still gone is an exit to handle.
+    async fn reap(&self, id: VmId) -> Result<()> {
+        let lock = self.vm_lock(id);
+        let _guard = lock.lock().await;
+        let Some(rec) = self.store.get_vm(id)? else {
+            return Ok(());
+        };
+        if rec.state != VmState::Running || !exited(self.runtime.status(id).await?) {
+            return Ok(());
+        }
+        self.unresponsive.lock().unwrap().remove(&id);
+        // unexpected exit; treat as failure so OnFailure restarts.
+        self.handle_exit_locked(rec, true).await
+    }
+
+    /// Log a running VM's VMM that is alive but not reporting running, once
+    /// when it stops and once when it starts again.
+    fn note_alive(&self, id: VmId, status: VmStatus) {
+        let mut unresponsive = self.unresponsive.lock().unwrap();
+        match status {
+            VmStatus::Running | VmStatus::Suspended => {
+                if unresponsive.remove(&id) {
+                    tracing::info!(vm = %id, "VMM reports {status:?} again");
+                }
+            }
+            _ => {
+                if unresponsive.insert(id) {
+                    tracing::warn!(
+                        vm = %id,
+                        "VMM is alive but reports {status:?}; leaving it be until it exits"
+                    );
                 }
             }
         }
-        Ok(())
     }
 
     /// Run the supervisor loop forever, polling every `interval`.
@@ -831,26 +1031,91 @@ where
     /// One `set_clock` round trip with the host's time.
     async fn tell_guest_time(&self, id: VmId) -> std::result::Result<iso_guest_proto::ClockResult, ClockAttempt> {
         use iso_guest_proto::ClientError;
-        let retry = |e: &dyn std::fmt::Display| ClockAttempt::Retry(e.to_string());
-        let fd = self
-            .runtime
-            .guest_channel(id, self.cfg.guest_agent_port)
-            .await
-            .map_err(|e| retry(&e))?;
-        let std = std::os::unix::net::UnixStream::from(fd);
-        std.set_nonblocking(true).map_err(|e| retry(&e))?;
-        let stream = tokio::net::UnixStream::from_std(std).map_err(|e| retry(&e))?;
+        let mut agent = self.guest_agent(id).await.map_err(ClockAttempt::Retry)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        let mut agent = iso_guest_proto::GuestClient::new(stream);
         match tokio::time::timeout(Duration::from_secs(2), agent.set_clock(now)).await {
             Ok(Ok(c)) => Ok(c),
             Ok(Err(ClientError::Agent(m))) => Err(ClockAttempt::GiveUp(format!("guest agent: {m}"))),
-            Ok(Err(e)) => Err(retry(&e)),
+            Ok(Err(e)) => Err(ClockAttempt::Retry(e.to_string())),
             Err(_) => Err(ClockAttempt::Retry("guest agent did not answer in time".into())),
         }
+    }
+
+    /// A client on a new connection to `id`'s guest agent.
+    async fn guest_agent(
+        &self,
+        id: VmId,
+    ) -> std::result::Result<iso_guest_proto::GuestClient<tokio::net::UnixStream>, String> {
+        let fd = self
+            .runtime
+            .guest_channel(id, self.cfg.guest_agent_port)
+            .await
+            .map_err(|e| e.to_string())?;
+        let std = std::os::unix::net::UnixStream::from(fd);
+        std.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let stream = tokio::net::UnixStream::from_std(std).map_err(|e| e.to_string())?;
+        Ok(iso_guest_proto::GuestClient::new(stream))
+    }
+
+    /// A VM resumed from a snapshot starts with the kernel RNG state frozen in
+    /// it: every clone of a template with the same one, and a VM resuming its
+    /// own snapshot with one it has run with before. Until the guest next
+    /// reseeds by itself, within a minute, its generator repeats what the
+    /// others' does. A template's clones share its SSH host keys too. Have
+    /// the guest reseed from fresh host randomness and, with `ssh_host_keys`,
+    /// make itself host keys of its own, before the VM is handed out. Best
+    /// effort, like the clock: a guest that cannot (no agent, an agent too
+    /// old for `--reseed`, no root) gets a warning in the log and keeps
+    /// running.
+    async fn reseed_guest(&self, id: VmId, ssh_host_keys: bool) {
+        match self.ask_guest_to_reseed(id, ssh_host_keys).await {
+            Ok(report) => tracing::info!(vm = %id, "guest reseeded after resume: {report}"),
+            Err(e) => tracing::warn!(
+                vm = %id,
+                "guest not reseeded after resume, so it shares its snapshot's RNG state{}: {e}",
+                if ssh_host_keys { " and SSH host keys" } else { "" }
+            ),
+        }
+    }
+
+    /// `iso-guest-agent --reseed` through the agent's `exec`, with fresh
+    /// bytes from the host's RNG. Returns the guest's report.
+    async fn ask_guest_to_reseed(
+        &self,
+        id: VmId,
+        ssh_host_keys: bool,
+    ) -> std::result::Result<String, String> {
+        let late = |_| "guest agent did not answer in time".to_string();
+        let mut agent = self.guest_agent(id).await?;
+        let info = tokio::time::timeout(Duration::from_secs(2), agent.ping())
+            .await
+            .map_err(late)?
+            .map_err(|e| e.to_string())?;
+        let seed =
+            host_random::<RESEED_BYTES>().map_err(|e| format!("read host randomness: {e}"))?;
+        let req = reseed_request(info.uid, ssh_host_keys, &seed);
+        let wait = Duration::from_millis(RESEED_TIMEOUT_MS) + Duration::from_secs(2);
+        let r = tokio::time::timeout(wait, agent.exec(req))
+            .await
+            .map_err(late)?
+            .map_err(|e| e.to_string())?;
+        if r.exit_code == Some(0) {
+            return Ok(r.stdout.trim().to_string());
+        }
+        let how = match (r.timed_out, r.exit_code, r.signal) {
+            (true, _, _) => format!("timed out after {RESEED_TIMEOUT_MS} ms"),
+            (_, Some(code), _) => format!("exited {code}"),
+            (_, None, Some(signal)) => format!("killed by signal {signal}"),
+            (_, None, None) => "failed".to_string(),
+        };
+        let said: Vec<&str> = [r.stdout.trim(), r.stderr.trim()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        Err(format!("--reseed {how}: {}", said.join("; ")))
     }
 
     /// Aggregate host stats (admin-only; never exposed to guests).
@@ -884,6 +1149,12 @@ where
     }
 }
 
+
+/// Whether a VMM is definitely gone: its process exited, or there is none.
+/// Anything else is a live process, whatever its API said (or failed to say).
+fn exited(status: VmStatus) -> bool {
+    matches!(status, VmStatus::Stopped | VmStatus::Absent)
+}
 
 /// The effective policy must compile: bad input is rejected with the offending
 /// rule, never stored to fail later inside the proxy.
@@ -935,6 +1206,71 @@ fn check_signed(
 enum ClockAttempt {
     Retry(String),
     GiveUp(String),
+}
+
+/// Bytes of host randomness a resumed guest is reseeded with.
+const RESEED_BYTES: usize = 64;
+
+/// How long `--reseed` may take in the guest: new host keys (RSA's is the
+/// slow one) and an sshd restart.
+const RESEED_TIMEOUT_MS: u64 = 30_000;
+
+/// The `exec` that reseeds a guest whose agent runs as `agent_uid`:
+/// `iso-guest-agent --reseed [--ssh-host-keys]` as root, with `seed` base64
+/// on stdin. An agent that is root runs it directly, as uid 0 (not as an OCI
+/// image's `USER`, which `exec` defaults to); any other, such as `coder` on
+/// the NixOS and Debian images, through `sudo -n`.
+fn reseed_request(
+    agent_uid: u32,
+    ssh_host_keys: bool,
+    seed: &[u8],
+) -> iso_guest_proto::ExecRequest {
+    let mut args = vec!["--reseed".to_string()];
+    if ssh_host_keys {
+        args.push("--ssh-host-keys".into());
+    }
+    let (cmd, user) = if agent_uid == 0 {
+        ("iso-guest-agent", Some("0".to_string()))
+    } else {
+        args.splice(0..0, ["-n".to_string(), "iso-guest-agent".to_string()]);
+        ("sudo", None)
+    };
+    iso_guest_proto::ExecRequest {
+        cmd: cmd.into(),
+        args,
+        stdin: Some(base64(seed)),
+        timeout_ms: Some(RESEED_TIMEOUT_MS),
+        user,
+        ..Default::default()
+    }
+}
+
+/// `N` bytes from the host's RNG.
+fn host_random<const N: usize>() -> std::io::Result<[u8; N]> {
+    use std::io::Read;
+    let mut b = [0u8; N];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    Ok(b)
+}
+
+/// Standard base64 with padding (RFC 4648), as `--reseed` reads its stdin.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1003,9 +1339,17 @@ mod tests {
             self.log.push(format!("net.teardown:{}", slot.get()));
             Ok(())
         }
-        fn address_to_slot(&self, _addr: Ipv4Addr) -> Option<SlotId> {
-            None
+        /// `172.21.1.<slot>` stands for a slot's address (see `vm_addr`).
+        fn address_to_slot(&self, addr: Ipv4Addr) -> Option<SlotId> {
+            match addr.octets() {
+                [172, 21, 1, slot] => SlotId::new(slot as u16).ok(),
+                _ => None,
+            }
         }
+    }
+
+    fn vm_addr(slot: u16) -> Ipv4Addr {
+        Ipv4Addr::new(172, 21, 1, slot as u8)
     }
 
     struct MockStorage {
@@ -1027,6 +1371,9 @@ mod tests {
         }
         async fn teardown(&self, _vm: VmId) -> IRes<()> {
             self.log.push("storage.teardown");
+            // A real teardown takes a while (lvremove); let other operations
+            // run meanwhile.
+            tokio::task::yield_now().await;
             Ok(())
         }
         async fn pool_stats(&self) -> IRes<PoolStats> {
@@ -1041,6 +1388,10 @@ mod tests {
         fail_start: bool,
         hang_stop: bool,
         states: States,
+        /// The uid the stand-in agent reports, and the exit code of every
+        /// program it is asked to run.
+        agent_uid: u32,
+        exec_exit: i32,
     }
     impl MockRuntime {
         fn set(&self, vm: VmId, s: VmStatus) {
@@ -1099,21 +1450,64 @@ mod tests {
                 .copied()
                 .unwrap_or(VmStatus::Absent))
         }
-        /// A stand-in agent on a socketpair: answers one `set_clock`, logging
-        /// whether the time it was handed is a real one.
+        /// A stand-in agent on a socketpair. It answers `set_clock`, logging
+        /// whether the time it was handed is a real one, `ping`, and `exec`,
+        /// logging as whom (`-` for the agent's default), what, and stdin.
         async fn guest_channel(&self, _vm: VmId, port: u32) -> IRes<std::os::fd::OwnedFd> {
-            use iso_guest_proto::{ClockResult, Request, Response, ResponseBody};
+            use iso_guest_proto::{
+                AgentInfo, ClockResult, ExecResult, Request, Response, ResponseBody,
+            };
             self.log.push(format!("rt.guest_channel:{port}"));
-            let (host, guest) = std::os::unix::net::UnixStream::pair().map_err(|e| IErr::Backend(e.to_string()))?;
+            let (host, guest) =
+                std::os::unix::net::UnixStream::pair().map_err(|e| IErr::Backend(e.to_string()))?;
             guest.set_nonblocking(true).unwrap();
-            let log = self.log.clone();
+            let (log, uid, exit) = (self.log.clone(), self.agent_uid, self.exec_exit);
             tokio::spawn(async move {
                 let mut s = tokio::net::UnixStream::from_std(guest).unwrap();
-                if let Ok(Some(Request::SetClock { unix_nanos })) = iso_guest_proto::recv::<_, Request>(&mut s).await {
-                    let year_2020 = 1_577_836_800_000_000_000u64;
-                    log.push(if unix_nanos > year_2020 { "agent.set_clock:plausible" } else { "agent.set_clock:bogus" });
-                    let r = Response::ok(ResponseBody::Clock(ClockResult { offset_ms: 180_000, stepped: true }));
-                    let _ = iso_guest_proto::send(&mut s, &r).await;
+                while let Ok(Some(req)) = iso_guest_proto::recv::<_, Request>(&mut s).await {
+                    let r = match req {
+                        Request::SetClock { unix_nanos } => {
+                            let year_2020 = 1_577_836_800_000_000_000u64;
+                            log.push(if unix_nanos > year_2020 {
+                                "agent.set_clock:plausible"
+                            } else {
+                                "agent.set_clock:bogus"
+                            });
+                            Response::ok(ResponseBody::Clock(ClockResult {
+                                offset_ms: 180_000,
+                                stepped: true,
+                            }))
+                        }
+                        Request::Ping => Response::ok(ResponseBody::Pong(AgentInfo {
+                            agent: "iso-guest-agent".into(),
+                            version: "test".into(),
+                            hostname: "guest".into(),
+                            uid,
+                            cwd: "/".into(),
+                        })),
+                        Request::Exec(e) => {
+                            let user = e.user.as_deref().unwrap_or("-");
+                            log.push(format!("agent.exec:{user}:{} {}", e.cmd, e.args.join(" ")));
+                            log.push(format!("agent.stdin:{}", e.stdin.unwrap_or_default()));
+                            Response::ok(ResponseBody::Exec(ExecResult {
+                                exit_code: Some(exit),
+                                signal: None,
+                                stdout: r#"{"rng":{"reseeded":true}}"#.into(),
+                                stderr: if exit == 0 {
+                                    String::new()
+                                } else {
+                                    "sudo: a password is required".into()
+                                },
+                                timed_out: false,
+                                truncated: false,
+                                duration_ms: 1,
+                            }))
+                        }
+                        other => Response::err(format!("the stand-in agent does not do {other:?}")),
+                    };
+                    if iso_guest_proto::send(&mut s, &r).await.is_err() {
+                        break;
+                    }
                 }
             });
             Ok(std::os::fd::OwnedFd::from(host))
@@ -1144,9 +1538,13 @@ mod tests {
     }
 
     fn build3(slot_capacity: usize, pool: f64, fail_start: bool) -> (Cp, Log, States) {
+        let (config, pstats) = cfg(slot_capacity, pool);
+        build_with(config, pstats, fail_start)
+    }
+
+    fn build_with(config: Config, pstats: PoolStats, fail_start: bool) -> (Cp, Log, States) {
         let log = Log::default();
         let states: States = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let (config, pstats) = cfg(slot_capacity, pool);
         let cp = ControlPlane::new(
             config,
             MockNet { log: log.clone() },
@@ -1159,6 +1557,8 @@ mod tests {
                 log: log.clone(),
                 fail_start,
                 states: states.clone(),
+                agent_uid: 1000,
+                exec_exit: 0,
             },
         )
         .unwrap();
@@ -1190,6 +1590,44 @@ mod tests {
             lifecycle,
             restart,
             ..CreateVm::new("base")
+        }
+    }
+
+    /// Neither running nor an exit: the VMM's process is alive, but it does
+    /// not say it is running (its API socket is missing, say, or did not
+    /// answer in time).
+    const ALIVE_NOT_RUNNING: VmStatus = VmStatus::Created;
+
+    /// A record as a daemon that stopped mid-operation left it in the store.
+    /// `ran` is whether the VM has been up before (it then has a device).
+    fn stored(
+        n: u128,
+        lifecycle: Lifecycle,
+        restart: RestartPolicy,
+        state: VmState,
+        slot: Option<u16>,
+        ran: bool,
+    ) -> VmRecord {
+        VmRecord {
+            id: VmId::from_u128(n),
+            slot: slot.map(|s| SlotId::new(s).unwrap()),
+            template: "base".into(),
+            egress: EgressMode::Deny,
+            ingress: Vec::new(),
+            labels: Default::default(),
+            lifecycle,
+            restart,
+            vcpus: None,
+            mem_mib: None,
+            state,
+            rootfs_device: ran.then(|| format!("/dev/iso/{n}").into()),
+            tap: slot.map(|_| "tap0".into()),
+            principal: None,
+            allow: Vec::new(),
+            rules: Vec::new(),
+            policy_gen: 1,
+            signed: None,
+            snapshot: None,
         }
     }
 
@@ -1239,6 +1677,153 @@ mod tests {
             .await
             .unwrap();
         assert!(!log.has("rt.guest_channel:5000"));
+    }
+
+    /// The reseeds the stand-in agent was asked for: (as whom and what, stdin).
+    fn reseeds(log: &Log) -> Vec<(String, String)> {
+        let e = log.events();
+        e.iter()
+            .zip(e.iter().skip(1))
+            .filter_map(|(what, stdin)| {
+                let what = what.strip_prefix("agent.exec:")?;
+                let stdin = stdin.strip_prefix("agent.stdin:")?;
+                what.contains("--reseed")
+                    .then(|| (what.to_string(), stdin.to_string()))
+            })
+            .collect()
+    }
+
+    /// 64 bytes, base64 with padding.
+    fn is_64_bytes_of_base64(s: &str) -> bool {
+        s.len() == 88
+            && s.ends_with("==")
+            && s[..86]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+    }
+
+    /// Every clone resumed the template's memory, kernel RNG state and SSH
+    /// host keys included, and nothing made it its own machine again. Each
+    /// is now reseeded from fresh host randomness and makes new host keys,
+    /// once its clock is set and before it is handed out.
+    #[tokio::test]
+    async fn a_clone_of_the_template_snapshot_is_reseeded_with_new_host_keys() {
+        let (cp, log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        for _ in 0..2 {
+            cp.create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never))
+                .await
+                .unwrap();
+        }
+        let done = reseeds(&log);
+        assert_eq!(done.len(), 2, "{done:?}");
+        for (what, seed) in &done {
+            assert_eq!(what, "-:sudo -n iso-guest-agent --reseed --ssh-host-keys");
+            assert!(is_64_bytes_of_base64(seed), "{seed}");
+        }
+        assert_ne!(done[0].1, done[1].1, "fresh bytes for each clone");
+        let e = log.events();
+        let pos = |s: &str| e.iter().position(|x| x == s).unwrap();
+        assert!(
+            pos("agent.set_clock:plausible")
+                < pos("agent.exec:-:sudo -n iso-guest-agent --reseed --ssh-host-keys")
+        );
+    }
+
+    /// An agent that is root (an OCI template's) runs it without sudo, as
+    /// root rather than as the image's `USER`.
+    #[tokio::test]
+    async fn a_root_agent_reseeds_its_guest_itself() {
+        let (mut cp, log) = build(8, 10.0, false);
+        cp.runtime.agent_uid = 0;
+        cp.register_template(&template(true)).unwrap();
+        cp.create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never))
+            .await
+            .unwrap();
+        let done = reseeds(&log);
+        assert_eq!(done.len(), 1, "{done:?}");
+        assert_eq!(done[0].0, "0:iso-guest-agent --reseed --ssh-host-keys");
+    }
+
+    /// A durable VM that resumes its own snapshot again re-enters an RNG
+    /// state it has run with: it is reseeded, and keeps the host keys it
+    /// made when it first resumed. A suspended VM resumed in place (its VMM
+    /// was only paused) continues its own state, and is neither.
+    #[tokio::test]
+    async fn a_vm_resuming_its_own_snapshot_is_reseeded_and_keeps_its_host_keys() {
+        let (cp, log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp
+            .create_vm(req(Lifecycle::Durable, RestartPolicy::Never))
+            .await
+            .unwrap();
+        cp.suspend_vm(id).await.unwrap();
+        cp.start_vm(id).await.unwrap();
+        assert_eq!(reseeds(&log).len(), 1, "resumed in place");
+
+        cp.suspend_vm(id).await.unwrap();
+        cp.stop_vm(id).await.unwrap();
+        cp.start_vm(id).await.unwrap();
+        let done = reseeds(&log);
+        assert_eq!(done.len(), 2, "{done:?}");
+        assert_eq!(done[1].0, "-:sudo -n iso-guest-agent --reseed");
+        assert!(is_64_bytes_of_base64(&done[1].1), "{}", done[1].1);
+        assert_eq!(cp.get_vm(id).unwrap().unwrap().state, VmState::Running);
+    }
+
+    /// A fresh boot seeds its RNG and reads its keys as any boot does.
+    #[tokio::test]
+    async fn a_fresh_boot_is_not_reseeded() {
+        let (cp, log) = build(8, 10.0, false);
+        cp.register_template(&template(false)).unwrap();
+        cp.create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never))
+            .await
+            .unwrap();
+        // Nor is one of a custom size, or a stopped durable VM booting again.
+        cp.register_template(&template(true)).unwrap();
+        let custom = CreateVm {
+            vcpus: Some(4),
+            ..CreateVm::new("base")
+        };
+        cp.create_vm(custom).await.unwrap();
+        let id = cp
+            .create_vm(req(Lifecycle::Durable, RestartPolicy::Never))
+            .await
+            .unwrap();
+        cp.stop_vm(id).await.unwrap();
+        cp.start_vm(id).await.unwrap();
+        assert_eq!(reseeds(&log).len(), 1, "only the durable VM's first resume");
+    }
+
+    /// A guest that cannot reseed (here sudo wants a password) is logged,
+    /// and its VM still comes up.
+    #[tokio::test]
+    async fn a_failed_reseed_does_not_fail_the_resume() {
+        let (mut cp, log) = build(8, 10.0, false);
+        cp.runtime.exec_exit = 1;
+        cp.register_template(&template(true)).unwrap();
+        let id = cp
+            .create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never))
+            .await
+            .unwrap();
+        assert_eq!(reseeds(&log).len(), 1);
+        assert_eq!(cp.get_vm(id).unwrap().unwrap().state, VmState::Running);
+    }
+
+    #[test]
+    fn base64_is_rfc_4648s() {
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(plain.as_bytes()), encoded);
+        }
+        assert_eq!(base64(&[0xfb, 0xff, 0xbf]), "+/+/");
     }
 
     #[tokio::test]
@@ -1462,6 +2047,446 @@ mod tests {
         states.lock().unwrap().insert(id, VmStatus::Stopped);
         cp.supervise_tick().await.unwrap();
         assert_eq!(cp.get_vm(id).unwrap().unwrap().state, VmState::Running);
+    }
+
+    /// A VMM whose process is alive is not an exit, whatever else its status
+    /// says. The supervisor used to treat anything but running or suspended
+    /// as one, and tore a slow VM down.
+    #[tokio::test]
+    async fn supervisor_leaves_a_live_vmm_alone() {
+        let (cp, log, states) = build3(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp
+            .create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never))
+            .await
+            .unwrap();
+        states.lock().unwrap().insert(id, ALIVE_NOT_RUNNING);
+        cp.supervise_tick().await.unwrap();
+        cp.supervise_tick().await.unwrap();
+        assert_eq!(
+            cp.get_vm(id).unwrap().expect("not reaped").state,
+            VmState::Running
+        );
+        assert!(!log.has("net.teardown:0"));
+        assert_eq!(cp.stats().await.unwrap().slots_used, 1);
+
+        // Once its process is gone, it is an exit like any other.
+        states.lock().unwrap().insert(id, VmStatus::Stopped);
+        cp.supervise_tick().await.unwrap();
+        assert!(cp.get_vm(id).unwrap().is_none());
+    }
+
+    /// The supervisor sees an exit without the VM's lock, and by the time it
+    /// holds it the VM may have been brought back. It used to act on what it
+    /// saw before; it must look again.
+    #[tokio::test]
+    async fn supervisor_looks_again_once_it_holds_the_vm_lock() {
+        let (cp, log, states) = build3(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp
+            .create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never))
+            .await
+            .unwrap();
+        let lock = cp.vm_lock(id);
+        let guard = lock.lock().await;
+        states.lock().unwrap().insert(id, VmStatus::Stopped);
+        let tick = cp.supervise_tick();
+        tokio::pin!(tick);
+        // It has seen the exit and waits for the lock, which an operation
+        // that brings the VM back up holds.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut tick)
+                .await
+                .is_err()
+        );
+        states.lock().unwrap().insert(id, VmStatus::Running);
+        drop(guard);
+        tick.await.unwrap();
+        assert_eq!(
+            cp.get_vm(id).unwrap().expect("not reaped").state,
+            VmState::Running
+        );
+        assert!(!log.has("net.teardown:0"));
+    }
+
+    /// A daemon that stopped mid-create left a `creating` record that holds a
+    /// slot and ports, and perhaps a VMM, a network and a volume. Recovery
+    /// used to reserve the slot and leave the rest; it now undoes the create.
+    /// Durable or not, a VM that never ran is removed, as a failed create is.
+    #[tokio::test]
+    async fn recovery_removes_a_vm_caught_being_created() {
+        let (cp, log, states) = build3(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let rec = stored(
+            1,
+            Lifecycle::Durable,
+            RestartPolicy::Always,
+            VmState::Creating,
+            Some(3),
+            false,
+        );
+        cp.store.insert_vm(&rec).unwrap();
+        let fwd = PortForward {
+            host_port: 20004,
+            vm_port: 22,
+            proto: Protocol::Tcp,
+        };
+        cp.store.add_forward(rec.id, &fwd).unwrap();
+        states.lock().unwrap().insert(rec.id, VmStatus::Created);
+
+        cp.start().await.unwrap();
+        assert!(cp.get_vm(rec.id).unwrap().is_none());
+        assert!(log.has("rt.destroy"));
+        assert!(
+            !states.lock().unwrap().contains_key(&rec.id),
+            "its VMM is gone"
+        );
+        assert!(log.has("net.teardown:3"));
+        assert!(log.has("storage.teardown"));
+        assert_eq!(cp.stats().await.unwrap().slots_used, 0);
+        assert_eq!(cp.ports.lock().unwrap().in_use(), 0);
+    }
+
+    /// A durable VM that was starting again when the daemon stopped goes back
+    /// to `stopped` with its disk and ports, as a failed start leaves it.
+    #[tokio::test]
+    async fn recovery_returns_a_durable_vm_caught_starting_to_stopped() {
+        let (cp, log, states) = build3(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let rec = stored(
+            2,
+            Lifecycle::Durable,
+            RestartPolicy::Never,
+            VmState::Creating,
+            Some(5),
+            true,
+        );
+        cp.store.insert_vm(&rec).unwrap();
+        let fwd = PortForward {
+            host_port: 20004,
+            vm_port: 22,
+            proto: Protocol::Tcp,
+        };
+        cp.store.add_forward(rec.id, &fwd).unwrap();
+        states.lock().unwrap().insert(rec.id, VmStatus::Created);
+
+        cp.start().await.unwrap();
+        let after = cp.get_vm(rec.id).unwrap().expect("kept");
+        assert_eq!(after.state, VmState::Stopped);
+        assert!(after.slot.is_none());
+        assert_eq!(after.ingress, vec![fwd]);
+        assert_eq!(after.rootfs_device, rec.rootfs_device);
+        assert!(
+            log.has("rt.release"),
+            "its VMM is stopped, its snapshot kept"
+        );
+        assert!(!log.has("rt.destroy"));
+        assert!(log.has("net.teardown:5"));
+        assert!(!log.has("storage.teardown"));
+        assert_eq!(cp.stats().await.unwrap().slots_used, 0);
+        assert_eq!(cp.ports.lock().unwrap().in_use(), 1);
+
+        cp.start_vm(rec.id).await.unwrap();
+        assert_eq!(cp.get_vm(rec.id).unwrap().unwrap().state, VmState::Running);
+    }
+
+    /// Recovery reaped a running VM whose VMM was alive but did not report
+    /// running, by the same test the supervisor used.
+    #[tokio::test]
+    async fn recovery_keeps_a_running_vm_whose_vmm_is_alive() {
+        let (cp, log, states) = build3(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let rec = stored(
+            3,
+            Lifecycle::Ephemeral,
+            RestartPolicy::Never,
+            VmState::Running,
+            Some(0),
+            true,
+        );
+        cp.store.insert_vm(&rec).unwrap();
+        states.lock().unwrap().insert(rec.id, ALIVE_NOT_RUNNING);
+
+        cp.start().await.unwrap();
+        assert_eq!(
+            cp.get_vm(rec.id).unwrap().expect("kept").state,
+            VmState::Running
+        );
+        assert!(!log.has("net.teardown:0"));
+        assert_eq!(cp.stats().await.unwrap().slots_used, 1);
+    }
+
+    /// Recovery reserved slots as it went, so a VM it restarted could be
+    /// placed on the slot of a record later in the list.
+    #[tokio::test]
+    async fn recovery_reserves_every_slot_before_restarting_anything() {
+        let (cp, _log, states) = build3(2, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let exited = stored(
+            4,
+            Lifecycle::Durable,
+            RestartPolicy::Always,
+            VmState::Running,
+            Some(1),
+            true,
+        );
+        let alive = stored(
+            5,
+            Lifecycle::Ephemeral,
+            RestartPolicy::Never,
+            VmState::Running,
+            Some(0),
+            true,
+        );
+        cp.store.insert_vm(&exited).unwrap();
+        cp.store.insert_vm(&alive).unwrap();
+        states.lock().unwrap().insert(alive.id, VmStatus::Running);
+
+        cp.start().await.unwrap();
+        let restarted = cp.get_vm(exited.id).unwrap().unwrap();
+        assert_eq!(restarted.state, VmState::Running);
+        assert_ne!(restarted.slot, alive.slot);
+        assert_eq!(cp.get_vm(alive.id).unwrap().unwrap().slot, alive.slot);
+        assert_eq!(cp.stats().await.unwrap().slots_used, 2);
+    }
+
+    /// The slot cursor began again at 0 with each daemon, so the slots freed
+    /// just before a restart were the first reused after it.
+    #[tokio::test]
+    async fn a_restarted_daemon_carries_on_the_slot_rotation() {
+        let db = std::env::temp_dir().join(format!("iso-cp-rotation-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let (mut config, pstats) = cfg(8, 10.0);
+        config.db_path = db.clone();
+        {
+            let (cp, _log, _states) = build_with(config.clone(), pstats, false);
+            cp.start().await.unwrap();
+            cp.register_template(&template(true)).unwrap();
+            for _ in 0..2 {
+                let id = cp.create_vm(CreateVm::new("base")).await.unwrap();
+                cp.destroy_vm(id).await.unwrap();
+            }
+        }
+        let (cp, _log, _states) = build_with(config, pstats, false);
+        cp.start().await.unwrap();
+        let id = cp.create_vm(CreateVm::new("base")).await.unwrap();
+        let _ = std::fs::remove_file(&db);
+        assert_eq!(cp.get_vm(id).unwrap().unwrap().slot.unwrap().get(), 2);
+    }
+
+    /// A database with no saved cursor resumes after the highest slot in use.
+    #[tokio::test]
+    async fn without_a_saved_cursor_rotation_resumes_after_the_highest_slot() {
+        let (cp, _log, states) = build3(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let rec = stored(
+            6,
+            Lifecycle::Ephemeral,
+            RestartPolicy::Never,
+            VmState::Running,
+            Some(4),
+            true,
+        );
+        cp.store.insert_vm(&rec).unwrap();
+        states.lock().unwrap().insert(rec.id, VmStatus::Running);
+        cp.start().await.unwrap();
+        let id = cp.create_vm(CreateVm::new("base")).await.unwrap();
+        assert_eq!(cp.get_vm(id).unwrap().unwrap().slot.unwrap().get(), 5);
+    }
+
+    /// Whatever keys state by a slot's addresses hears of each release once
+    /// the slot's network is gone.
+    #[tokio::test]
+    async fn released_slots_are_announced_after_teardown() {
+        let (cp, log) = build(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let seen = log.clone();
+        cp.on_slot_released(move |slot| seen.push(format!("released:{}", slot.get())));
+        let a = cp
+            .create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never))
+            .await
+            .unwrap();
+        let b = cp
+            .create_vm(req(Lifecycle::Durable, RestartPolicy::Never))
+            .await
+            .unwrap();
+        cp.destroy_vm(a).await.unwrap();
+        cp.stop_vm(b).await.unwrap();
+        let e = log.events();
+        let pos = |s: &str| e.iter().position(|x| x == s).unwrap();
+        assert!(pos("net.teardown:0") < pos("released:0"));
+        assert!(pos("net.teardown:1") < pos("released:1"));
+    }
+
+    /// A destroy freed the slot before it deleted the record, with the
+    /// storage teardown in between, and a VM placed on the slot meanwhile was
+    /// identified (by the proxy, metadata and DNS) as the one going away.
+    #[tokio::test]
+    async fn a_vm_on_a_just_freed_slot_is_never_taken_for_the_last_one() {
+        let (cp, _log) = build(1, 10.0, false);
+        cp.register_template(&template(false)).unwrap();
+        let (old, new) = (VmId::from_u128(1), VmId::from_u128(2));
+        let create = |id| CreateVm {
+            id: Some(id),
+            ..CreateVm::new("base")
+        };
+        cp.create_vm(create(old)).await.unwrap();
+        assert_eq!(cp.identify(vm_addr(0)).unwrap().unwrap().id, old);
+
+        // The new VM takes the only slot the moment it is free.
+        let placed = async {
+            loop {
+                match cp.create_vm(create(new)).await {
+                    Ok(_) => break,
+                    Err(Error::SlotsExhausted) => tokio::task::yield_now().await,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            cp.identify(vm_addr(0)).unwrap().map(|v| v.id)
+        };
+        let (destroyed, seen) = tokio::join!(cp.destroy_vm(old), placed);
+        destroyed.unwrap();
+        assert_eq!(seen, Some(new));
+    }
+
+    /// Every path that gives a slot up lets go of it in the store first: when
+    /// a slot is released no record claims it, so the next VM placed there is
+    /// the only one its addresses can be taken for.
+    #[tokio::test]
+    async fn no_record_claims_a_slot_when_it_is_released() {
+        let db = std::env::temp_dir().join(format!("iso-cp-release-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let (mut config, pstats) = cfg(8, 10.0);
+        config.db_path = db.clone();
+        let (mut cp, log, _states) = build_with(config, pstats, false);
+        // A second connection to the same database, as `identify` would read it.
+        let observer = Store::open(&db).unwrap();
+        let seen = log.clone();
+        cp.on_slot_released(move |slot| {
+            let claimed: Vec<VmId> = observer
+                .list_vms()
+                .unwrap()
+                .into_iter()
+                .filter(|v| v.slot == Some(slot))
+                .map(|v| v.id)
+                .collect();
+            seen.push(format!("released:{}:{claimed:?}", slot.get()));
+        });
+        cp.register_template(&template(true)).unwrap();
+
+        let destroyed = cp
+            .create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never))
+            .await
+            .unwrap();
+        cp.destroy_vm(destroyed).await.unwrap();
+        let stopped = cp
+            .create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never))
+            .await
+            .unwrap();
+        cp.stop_vm(stopped).await.unwrap();
+        let durable = cp
+            .create_vm(req(Lifecycle::Durable, RestartPolicy::Never))
+            .await
+            .unwrap();
+        cp.stop_vm(durable).await.unwrap();
+        let restarted = cp
+            .create_vm(req(Lifecycle::Durable, RestartPolicy::Always))
+            .await
+            .unwrap();
+        cp.handle_exit(restarted, true).await.unwrap();
+        cp.runtime.fail_start = true;
+        assert!(cp.start_vm(durable).await.is_err());
+        assert!(
+            cp.create_vm(req(Lifecycle::Ephemeral, RestartPolicy::Never))
+                .await
+                .is_err()
+        );
+        cp.runtime.fail_start = false;
+        let caught = stored(
+            9,
+            Lifecycle::Ephemeral,
+            RestartPolicy::Never,
+            VmState::Creating,
+            Some(7),
+            false,
+        );
+        cp.store.insert_vm(&caught).unwrap();
+        cp.start().await.unwrap();
+        let _ = std::fs::remove_file(&db);
+
+        let released: Vec<String> = log
+            .events()
+            .into_iter()
+            .filter(|e| e.starts_with("released:"))
+            .collect();
+        // destroy, stop (both), restart, failed start, failed create, recovery
+        assert_eq!(released.len(), 7, "{released:?}");
+        for r in &released {
+            assert!(r.ends_with(":[]"), "{released:?}");
+        }
+    }
+
+    /// A start that failed part-way freed its slot with the VMM and the
+    /// slot's network still up, for the next VM placed there to inherit.
+    #[tokio::test]
+    async fn a_failed_start_tears_down_what_it_brought_up() {
+        let (mut cp, log, states) = build3(8, 10.0, false);
+        cp.register_template(&template(true)).unwrap();
+        let id = cp
+            .create_vm(req(Lifecycle::Durable, RestartPolicy::Never))
+            .await
+            .unwrap();
+        cp.stop_vm(id).await.unwrap();
+        cp.runtime.fail_start = true;
+        assert!(cp.start_vm(id).await.is_err());
+        let rec = cp.get_vm(id).unwrap().unwrap();
+        assert_eq!(rec.state, VmState::Stopped);
+        assert!(rec.slot.is_none());
+        assert!(log.has("net.apply:1"));
+        assert!(log.has("net.teardown:1"));
+        assert_ne!(
+            states.lock().unwrap().get(&id),
+            Some(&VmStatus::Created),
+            "its VMM is stopped"
+        );
+        assert_eq!(cp.stats().await.unwrap().slots_used, 0);
+    }
+
+    /// A create asking for more forwards than there are free ports locked the
+    /// port allocator again while the guard from its own `match` was alive,
+    /// and hung (holding the allocator for good).
+    #[test]
+    fn create_with_more_forwards_than_ports_fails_cleanly() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let outcome = rt.block_on(async {
+                let (cp, _log) = build(8, 10.0, false);
+                cp.register_template(&template(true)).unwrap();
+                let fwd = PortForward {
+                    host_port: 0,
+                    vm_port: 22,
+                    proto: Protocol::Tcp,
+                };
+                let r = CreateVm {
+                    ingress: vec![fwd; 11],
+                    ..CreateVm::new("base")
+                };
+                let err = cp.create_vm(r).await.unwrap_err();
+                let slots = cp.stats().await.unwrap().slots_used;
+                let ports = cp.ports.lock().unwrap().in_use();
+                (matches!(err, Error::PortsExhausted), slots, ports)
+            });
+            let _ = tx.send(outcome);
+        });
+        let (exhausted, slots, ports) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("create hung");
+        assert!(exhausted);
+        assert_eq!((slots, ports), (0, 0));
     }
 
     #[tokio::test]

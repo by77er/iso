@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use iso_common::{EgressMode, PortForward, Protocol, SlotId, SnapshotRef, VmId};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
@@ -126,6 +126,12 @@ impl Store {
                 PRIMARY KEY (host_port, proto)
             );
             CREATE INDEX IF NOT EXISTS port_forwards_vm ON port_forwards(vm_id);
+            -- Where the slot allocator's rotation stands (see slot.rs), so a
+            -- restarted daemon carries on from it. One row.
+            CREATE TABLE IF NOT EXISTS slot_cursor (
+                id   INTEGER PRIMARY KEY CHECK (id = 0),
+                next INTEGER NOT NULL
+            );
             ",
         )?;
         // Enforce the FK + ON DELETE CASCADE (off by default, per connection).
@@ -331,6 +337,26 @@ impl Store {
         self.lock().execute(
             "UPDATE vms SET signed_policy=?2 WHERE id=?1",
             rusqlite::params![id.to_string(), serde_json::to_string(signed)?],
+        )?;
+        Ok(())
+    }
+
+    // ---- slot allocator ----
+
+    /// Where the slot allocator's next scan starts, as last saved; `None` on a
+    /// database that has never allocated one.
+    pub fn slot_cursor(&self) -> Result<Option<usize>> {
+        let next: Option<i64> = self
+            .lock()
+            .query_row("SELECT next FROM slot_cursor WHERE id=0", [], |r| r.get(0))
+            .optional()?;
+        Ok(next.and_then(|n| usize::try_from(n).ok()))
+    }
+
+    pub fn set_slot_cursor(&self, next: usize) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO slot_cursor (id, next) VALUES (0, ?1) ON CONFLICT(id) DO UPDATE SET next=?1",
+            [next as i64],
         )?;
         Ok(())
     }
