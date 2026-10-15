@@ -42,11 +42,19 @@ teardown(slot: SlotId)                      -> Result<()>
 ### Slot allocator
 
 The Slot ID *is* the address allocation, so there is no separate IPAM. The only
-persisted state is the control plane's UUID↔slot binding in SQLite; the slot
-bitmap (`0..32767`) is rebuilt from it on startup. Slots are returned to the
-free pool **only after teardown fully completes** (netns gone, conntrack
-flushed), and allocation rotates from a cursor, so a freed slot is not reused
-straight away and cannot resurrect stale neighbor/conntrack state. A template
+persisted state is the control plane's UUID↔slot binding in SQLite, and where
+the allocation rotation stands; the slot bitmap (`0..32767`) is rebuilt from
+them on startup. Slots are returned to the free pool **only after teardown**:
+the host table deleted, the netns removed (its veth, TAP and own conntrack
+table with it), then the host's conntrack entries for the slot's addresses
+flushed — what the VM started (original source `vp`), what the host side of
+its link started (`vh`), and what was DNATed to it (reply source `vp`: inbound
+forwards, the hairpin). Teardown deletes them over ctnetlink, dumping the
+table and deleting each match by its original tuple and id; a kernel without
+conntrack's netlink interface has nothing to flush. Allocation rotates from a
+cursor that the control plane saves with every allocation, so a freed slot is
+not reused straight away, even across a daemon restart, and its next VM starts
+with none of the last one's flows or NAT bindings. A template
 bake borrows a slot the daemon doesn't know about (`isoctl bake --slot`,
 default 0, so pick a high one on a busy host; `dev-up.sh` uses 32767 and
 builds through the API use 32766).
@@ -229,12 +237,17 @@ for the `ip rule` linear-scan scaling footgun plus a routing table per slot.
 Each VM's egress is one of **two levels**, set declaratively via the `egress`
 field of its [`NetworkPolicy`] and reconciled on `apply`. The levels govern only
 **external** traffic; access to the host's internal services on `172.22.0.1`
-(DNS, metadata, the proxy) is an **always-on baseline** in every level.
+(DNS, metadata, the proxy) is an **always-on baseline** in every level, and the
+only thing on the host a VM can open (see the `input` chain below).
 
 | Level   | Behaviour                                                              |
 | ------- | ---------------------------------------------------------------------- |
 | `Proxy` | every flow bound beyond `172.22.0.1` is **transparently intercepted** to the proxy on `172.22.0.1:<proxyport>` |
 | `Deny`  | **no external egress** (internal-services baseline still applies)      |
+
+The baseline's DNS server forwards upstream only what the VM's policy reaches
+(nothing in `Deny`, the names its rules name in `Proxy`), since a forwarded
+query is itself data leaving the host; see `docs/API.md`.
 
 There is no direct mode. Every byte a VM sends outward goes through the proxy,
 where its rules decide and the access log records it. How wide a VM's access is
@@ -277,7 +290,7 @@ chain prerouting {
 - DNAT to a **local** address routes the flow to the host `input` hook (not
   `forward`), terminating at the proxy.
 - The proxy speaks TCP only, so intercepted UDP (anything but DNS to
-  `172.22.0.1`) reaches no listener and goes nowhere.
+  `172.22.0.1`) is dropped in `input`: it is to no port iso serves.
 - Source remains the unique `vp` end-to-end, so the proxy can map
   connection → VM with no extra signalling.
 
@@ -316,7 +329,18 @@ chain forward {
 
 chain input {
   type filter hook input priority filter; policy accept;
-  iifname "vm<slot>" ip daddr 172.22.0.1 accept   # services baseline
+
+  # replies to flows the host started (a hairpinned forward, an operator's dial)
+  ct state established,related accept
+
+  # services baseline: what iso serves on the services address, nothing more
+  iifname "vm<slot>" ip daddr 172.22.0.1 udp dport 53 accept     # DNS
+  iifname "vm<slot>" ip daddr 172.22.0.1 tcp dport 53 accept
+  iifname "vm<slot>" ip daddr 172.22.0.1 tcp dport 80 accept     # metadata
+  iifname "vm<slot>" ip daddr 172.22.0.1 tcp dport <proxyport> accept
+
+  # everything else this VM sends the host
+  iifname "vm<slot>" drop
 }
 
 chain postrouting {
@@ -332,7 +356,20 @@ chain postrouting {
   reply leg rides `established`) while unable to **initiate** anything past the
   internal-services baseline.
 - The chains' `accept` policy only matters for traffic that isn't this VM's;
-  every packet this VM starts ends at an explicit verdict.
+  every packet this VM starts ends at an explicit verdict. The host's own
+  default for the rest of its traffic is left as it is.
+- **`input` is a boundary too.** A packet a VM addresses to the host itself
+  (the services address, `vh`, any other host address) is local delivery, so
+  `forward` never sees it, and every host listener bound to all interfaces
+  (sshd, a database) would otherwise be one hop from every VM, `Deny` or not.
+  `input` admits only the ports iso serves on `172.22.0.1` (the manager's
+  `service_ports`, by default DNS and metadata, plus `proxy_port`, which is
+  also where `Proxy`'s intercept lands) and the replies to host-started flows,
+  and drops the rest, ping included. Nothing else is needed: the guest's
+  address comes from the kernel `ip=` argument (no DHCP), its ARP is answered
+  inside its netns, on the TAP (and ARP is not an `inet` packet anyway), it has
+  no IPv6 past its netns, and the guest agent talks over vsock, not the
+  network. A service iso adds on `172.22.0.1` goes in `service_ports`.
 - The explicit `172.21.0.0/16` drop blocks **lateral movement** between VMs
   (necessary because `ip_forward` is on and all veths live in the root
   namespace).
@@ -362,7 +399,7 @@ bugs and makes crash recovery a matter of re-applying.
 ```text
 apply(slot: SlotId, policy: &NetworkPolicy)          -> Result<NetworkFixture>  # converge to present
 reapply_policy(slot: SlotId, policy: &NetworkPolicy) -> Result<()>              # nft only, for a running VM
-teardown(slot: SlotId)                               -> Result<()>              # converge to absent
+teardown(slot: SlotId)                               -> Result<()>              # converge to absent, conntrack flushed
 ```
 
 `reapply_policy` re-renders only the two nftables tables and leaves the

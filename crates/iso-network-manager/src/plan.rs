@@ -30,11 +30,20 @@ pub enum NftRule {
     AcceptInbound { iif: String, oif: String },
     /// `iifname <iif> oifname <oif> accept` (direct egress, the bake's builder only)
     AcceptEgress { iif: String, oif: String },
-    /// `iifname <iif> ip daddr <daddr> accept` (services baseline, input)
-    AcceptServices { iif: String, daddr: Ipv4Addr },
+    /// `iifname <iif> ip daddr <daddr> <proto> dport <dport> accept` (services baseline, input)
+    AcceptService {
+        iif: String,
+        daddr: Ipv4Addr,
+        proto: Protocol,
+        dport: u16,
+    },
     /// `iifname <iif> ip daddr <net>/<prefix> drop` (lateral movement)
-    DropToNet { iif: String, net: Ipv4Addr, prefix: u8 },
-    /// `iifname <iif> drop` (per-VM default deny)
+    DropToNet {
+        iif: String,
+        net: Ipv4Addr,
+        prefix: u8,
+    },
+    /// `iifname <iif> drop` (per-VM default deny, forward and input)
     DropFrom { iif: String },
     /// `ip saddr <saddr> oifname <oif> masquerade`
     Masquerade { saddr: Ipv4Addr, oif: String },
@@ -173,10 +182,24 @@ fn host_ruleset(fx: &NetworkFixture, policy: &NetworkPolicy, cfg: &Config) -> Ru
     }
     forward.push(NftRule::DropFrom { iif: vh.clone() });
 
-    let input = vec![NftRule::AcceptServices {
-        iif: vh.clone(),
-        daddr: cfg.services,
-    }];
+    // What this VM may open to the host itself: the ports iso serves on the
+    // services address, in every level. Replies to flows the host started
+    // (an inbound forward's hairpin, an operator dialling the VM) ride
+    // `established`. Anything else ends here, so a host listener on all
+    // interfaces (sshd, a database) is not the VM's to reach, on the
+    // services address or the veth's own; the chain's `accept` policy is
+    // left to the host's own traffic.
+    let mut input = vec![NftRule::AcceptEstablished];
+    let proxy = (Protocol::Tcp, cfg.proxy_port);
+    for (proto, dport) in cfg.service_ports.iter().copied().chain([proxy]) {
+        input.push(NftRule::AcceptService {
+            iif: vh.clone(),
+            daddr: cfg.services,
+            proto,
+            dport,
+        });
+    }
+    input.push(NftRule::DropFrom { iif: vh.clone() });
     let postrouting = vec![NftRule::Masquerade {
         saddr: fx.vp_ip,
         oif: up.clone(),
@@ -186,10 +209,22 @@ fn host_ruleset(fx: &NetworkFixture, policy: &NetworkPolicy, cfg: &Config) -> Ru
     // forwarded ports via the host's own primary IP (locally-originated traffic
     // skips the uplink prerouting hook, so DNAT in OUTPUT).
     let mut chains = vec![
-        ChainSpec { kind: ChainKind::Prerouting, rules: prerouting },
-        ChainSpec { kind: ChainKind::Forward, rules: forward },
-        ChainSpec { kind: ChainKind::Input, rules: input },
-        ChainSpec { kind: ChainKind::Postrouting, rules: postrouting },
+        ChainSpec {
+            kind: ChainKind::Prerouting,
+            rules: prerouting,
+        },
+        ChainSpec {
+            kind: ChainKind::Forward,
+            rules: forward,
+        },
+        ChainSpec {
+            kind: ChainKind::Input,
+            rules: input,
+        },
+        ChainSpec {
+            kind: ChainKind::Postrouting,
+            rules: postrouting,
+        },
     ];
     if let Some(host_addr) = cfg.host_addr {
         let output: Vec<NftRule> = policy
@@ -204,7 +239,10 @@ fn host_ruleset(fx: &NetworkFixture, policy: &NetworkPolicy, cfg: &Config) -> Ru
             })
             .collect();
         if !output.is_empty() {
-            chains.push(ChainSpec { kind: ChainKind::Output, rules: output });
+            chains.push(ChainSpec {
+                kind: ChainKind::Output,
+                rules: output,
+            });
         }
     }
 
@@ -283,7 +321,11 @@ mod tests {
         fixture::derive(SlotId::new(slot).unwrap(), &ctx())
     }
     fn policy(egress: EgressMode, ingress: Vec<PortForward>) -> NetworkPolicy {
-        NetworkPolicy { egress, ingress, direct: false }
+        NetworkPolicy {
+            egress,
+            ingress,
+            direct: false,
+        }
     }
     fn forward_chain(rs: &Ruleset) -> &Vec<NftRule> {
         &rs.chains
@@ -299,6 +341,50 @@ mod tests {
             .unwrap()
             .rules
     }
+    fn input_chain(rs: &Ruleset) -> &Vec<NftRule> {
+        &rs.chains
+            .iter()
+            .find(|c| c.kind == ChainKind::Input)
+            .unwrap()
+            .rules
+    }
+
+    /// A packet as the host's `input` hook sees it, after prerouting's NAT.
+    #[derive(Clone, Copy, Debug)]
+    struct Pkt {
+        iif: &'static str,
+        daddr: Ipv4Addr,
+        /// Protocol and destination port; `None` for one without ports (ICMP).
+        l4: Option<(Protocol, u16)>,
+        /// `ct state established,related`: part of a flow the host started.
+        reply: bool,
+    }
+
+    /// The verdict `rules` give `p`, walked as the kernel walks a chain: the
+    /// first rule that matches decides, and none matching leaves it to the
+    /// chain's policy, `accept`.
+    fn input_verdict(rules: &[NftRule], p: Pkt) -> &'static str {
+        for r in rules {
+            let hit = match r {
+                NftRule::AcceptEstablished => p.reply,
+                NftRule::AcceptService {
+                    iif,
+                    daddr,
+                    proto,
+                    dport,
+                } => *iif == p.iif && *daddr == p.daddr && p.l4 == Some((*proto, *dport)),
+                NftRule::DropFrom { iif } => *iif == p.iif,
+                other => panic!("unexpected rule in input: {other:?}"),
+            };
+            if hit {
+                return match r {
+                    NftRule::DropFrom { .. } => "drop",
+                    _ => "accept",
+                };
+            }
+        }
+        "accept"
+    }
 
     #[test]
     fn deny_has_no_egress_accept_no_default_route_no_redirect() {
@@ -309,9 +395,10 @@ mod tests {
 
         // forward: established, inbound, lateral-drop, drop — but NO egress accept.
         let fwd = forward_chain(&host);
-        assert!(!fwd
-            .iter()
-            .any(|r| matches!(r, NftRule::AcceptEgress { .. })));
+        assert!(
+            !fwd.iter()
+                .any(|r| matches!(r, NftRule::AcceptEgress { .. }))
+        );
         assert!(matches!(fwd.last(), Some(NftRule::DropFrom { .. })));
 
         // no redirect in prerouting
@@ -327,7 +414,10 @@ mod tests {
     fn direct_permits_egress_and_routes_default_without_intercept() {
         let f = fx(1);
         let cfg = ctx();
-        let p = NetworkPolicy { direct: true, ..policy(EgressMode::Proxy, vec![]) };
+        let p = NetworkPolicy {
+            direct: true,
+            ..policy(EgressMode::Proxy, vec![])
+        };
         let host = host_ruleset(&f, &p, &cfg);
         assert!(prerouting(&host).is_empty(), "nothing intercepted");
 
@@ -370,9 +460,11 @@ mod tests {
         ));
         // proxy still needs a default route to reach the host, but no egress accept.
         assert!(routes(&f, &p, &cfg).iter().any(|r| r.dest.is_none()));
-        assert!(!forward_chain(&host)
-            .iter()
-            .any(|r| matches!(r, NftRule::AcceptEgress { .. })));
+        assert!(
+            !forward_chain(&host)
+                .iter()
+                .any(|r| matches!(r, NftRule::AcceptEgress { .. }))
+        );
     }
 
     #[test]
@@ -387,11 +479,15 @@ mod tests {
         let p = policy(EgressMode::Deny, vec![pf]);
 
         // host: uplink dport 8080 -> vp:80
-        assert!(prerouting(&host_ruleset(&f, &p, &cfg)).iter().any(|r| matches!(
-            r,
-            NftRule::Dnat { iif, dport, to, to_port, .. }
-                if iif == "eth0" && *dport == 8080 && *to == f.vp_ip && *to_port == 80
-        )));
+        assert!(
+            prerouting(&host_ruleset(&f, &p, &cfg))
+                .iter()
+                .any(|r| matches!(
+                    r,
+                    NftRule::Dnat { iif, dport, to, to_port, .. }
+                        if iif == "eth0" && *dport == 8080 && *to == f.vp_ip && *to_port == 80
+                ))
+        );
         // netns: vp:80 -> inner
         assert!(prerouting(&netns_ruleset(&f, &p, &cfg)).iter().any(|r| matches!(
             r,
@@ -428,20 +524,128 @@ mod tests {
         let cfg = ctx();
         for mode in [EgressMode::Proxy, EgressMode::Deny] {
             let host = host_ruleset(&f, &policy(mode, vec![]), &cfg);
-            let input = &host
-                .chains
-                .iter()
-                .find(|c| c.kind == ChainKind::Input)
-                .unwrap()
-                .rules;
-            assert!(input.iter().any(|r| matches!(
-                r,
-                NftRule::AcceptServices { daddr, .. } if *daddr == cfg.services
-            )));
+            let input = input_chain(&host);
+            for (proto, port) in [
+                (Protocol::Udp, 53),
+                (Protocol::Tcp, 53),
+                (Protocol::Tcp, 80),
+                (Protocol::Tcp, cfg.proxy_port),
+            ] {
+                assert!(input.iter().any(|r| matches!(
+                    r,
+                    NftRule::AcceptService { iif, daddr, proto: p, dport }
+                        if iif == "vm0001" && *daddr == cfg.services && *p == proto && *dport == port
+                )), "{mode:?}: {proto} {port}");
+            }
+            // ...and the VM's own default deny ends the chain.
+            assert_eq!(
+                input.last(),
+                Some(&NftRule::DropFrom {
+                    iif: "vm0001".to_string()
+                })
+            );
             // and the services route exists in every mode.
-            assert!(routes(&f, &policy(mode, vec![]), &cfg)
-                .iter()
-                .any(|r| r.dest == Some((cfg.services, 32))));
+            assert!(
+                routes(&f, &policy(mode, vec![]), &cfg)
+                    .iter()
+                    .any(|r| r.dest == Some((cfg.services, 32)))
+            );
+        }
+    }
+
+    #[test]
+    fn vm_reaches_only_the_ports_iso_serves_on_the_host() {
+        let f = fx(1);
+        let cfg = ctx();
+        let svc = cfg.services;
+        let new = |daddr, l4| Pkt {
+            iif: "vm0001",
+            daddr,
+            l4,
+            reply: false,
+        };
+        let builder = NetworkPolicy {
+            direct: true,
+            ..policy(EgressMode::Proxy, vec![])
+        };
+        for p in [
+            policy(EgressMode::Proxy, vec![]),
+            policy(EgressMode::Deny, vec![]),
+            builder,
+        ] {
+            let host = host_ruleset(&f, &p, &cfg);
+            let v = |pkt| input_verdict(input_chain(&host), pkt);
+
+            // What iso serves on the services address (in Proxy, every
+            // intercepted TCP flow arrives here as the proxy port).
+            assert_eq!(
+                v(new(svc, Some((Protocol::Udp, 53)))),
+                "accept",
+                "{p:?}: dns"
+            );
+            assert_eq!(
+                v(new(svc, Some((Protocol::Tcp, 53)))),
+                "accept",
+                "{p:?}: dns/tcp"
+            );
+            assert_eq!(
+                v(new(svc, Some((Protocol::Tcp, 80)))),
+                "accept",
+                "{p:?}: metadata"
+            );
+            let proxy = Some((Protocol::Tcp, cfg.proxy_port));
+            assert_eq!(v(new(svc, proxy)), "accept", "{p:?}: proxy");
+
+            // Any other host listener is not the VM's to reach, on the
+            // services address or the veth's own.
+            assert_eq!(
+                v(new(svc, Some((Protocol::Tcp, 22)))),
+                "drop",
+                "{p:?}: sshd"
+            );
+            assert_eq!(
+                v(new(svc, Some((Protocol::Tcp, 5432)))),
+                "drop",
+                "{p:?}: a database"
+            );
+            assert_eq!(
+                v(new(svc, Some((Protocol::Udp, 80)))),
+                "drop",
+                "{p:?}: wrong protocol"
+            );
+            assert_eq!(
+                v(new(svc, Some((Protocol::Udp, cfg.proxy_port)))),
+                "drop",
+                "{p:?}: udp intercept"
+            );
+            assert_eq!(v(new(svc, None)), "drop", "{p:?}: icmp");
+            assert_eq!(
+                v(new(f.vh_ip, Some((Protocol::Tcp, 22)))),
+                "drop",
+                "{p:?}: sshd on vh"
+            );
+            assert_eq!(
+                v(new(f.vh_ip, Some((Protocol::Udp, 53)))),
+                "drop",
+                "{p:?}: dns on vh"
+            );
+
+            // The reply leg of a flow the host started still comes home.
+            let reply = Pkt {
+                reply: true,
+                ..new(f.vh_ip, Some((Protocol::Tcp, 40000)))
+            };
+            assert_eq!(v(reply), "accept", "{p:?}: reply");
+
+            // Traffic from any other interface is left to the host's own
+            // policy (another slot's is judged by that slot's table).
+            for iif in ["eth0", "lo", "vm0002"] {
+                let other = Pkt {
+                    iif,
+                    ..new(svc, Some((Protocol::Tcp, 22)))
+                };
+                assert_eq!(v(other), "accept", "{p:?}: from {iif}");
+            }
         }
     }
 }

@@ -77,7 +77,10 @@ fn add_nat(rule: &mut Rule, ty: NatType, to: Ipv4Addr, port: Option<u16>) {
         .with_family(ProtocolFamily::Ipv4)
         .with_ip_register(Register::Reg1);
     if let Some(p) = port {
-        rule.add_expr(Immediate::new_data(p.to_be_bytes().to_vec(), Register::Reg2));
+        rule.add_expr(Immediate::new_data(
+            p.to_be_bytes().to_vec(),
+            Register::Reg2,
+        ));
         nat = nat.with_port_register(Register::Reg2);
     }
     rule.add_expr(nat);
@@ -87,7 +90,10 @@ fn build_rule(chain: &Chain, r: &NftRule) -> Result<Rule> {
     let mut rule = Rule::new(chain).map_err(be)?;
     match r {
         NftRule::AcceptEstablished => {
-            add_ct_state(&mut rule, ConnTrackState::ESTABLISHED | ConnTrackState::RELATED)?;
+            add_ct_state(
+                &mut rule,
+                ConnTrackState::ESTABLISHED | ConnTrackState::RELATED,
+            )?;
             rule = rule.accept();
         }
         NftRule::AcceptInbound { iif, oif } => {
@@ -103,12 +109,27 @@ fn build_rule(chain: &Chain, r: &NftRule) -> Result<Rule> {
                 .map_err(be)?
                 .accept();
         }
-        NftRule::AcceptServices { iif, daddr } => {
-            rule = rule.iiface(iif).map_err(be)?.daddr(IpAddr::V4(*daddr)).accept();
+        NftRule::AcceptService {
+            iif,
+            daddr,
+            proto,
+            dport,
+        } => {
+            rule = rule
+                .iiface(iif)
+                .map_err(be)?
+                .daddr(IpAddr::V4(*daddr))
+                .dport(*dport, nft_proto(*proto))
+                .accept();
         }
         NftRule::DropToNet { iif, net, prefix } => {
             let n = IpNetwork::V4(Ipv4Network::new(*net, *prefix).map_err(be)?);
-            rule = rule.iiface(iif).map_err(be)?.dnetwork(n).map_err(be)?.drop();
+            rule = rule
+                .iiface(iif)
+                .map_err(be)?
+                .dnetwork(n)
+                .map_err(be)?
+                .drop();
         }
         NftRule::DropFrom { iif } => {
             rule = rule.iiface(iif).map_err(be)?.drop();
@@ -131,7 +152,10 @@ fn build_rule(chain: &Chain, r: &NftRule) -> Result<Rule> {
             to,
             to_port,
         } => {
-            rule = rule.iiface(iif).map_err(be)?.dport(*dport, nft_proto(*proto));
+            rule = rule
+                .iiface(iif)
+                .map_err(be)?
+                .dport(*dport, nft_proto(*proto));
             add_nat(&mut rule, NatType::DNat, *to, Some(*to_port));
         }
         NftRule::DnatInner {
@@ -306,12 +330,7 @@ fn send_batch(buf: Vec<u8>) -> Result<()> {
 
         let mut rbuf = vec![0u8; 16 * 1024];
         loop {
-            let n = libc::recv(
-                fd.0,
-                rbuf.as_mut_ptr() as *mut libc::c_void,
-                rbuf.len(),
-                0,
-            );
+            let n = libc::recv(fd.0, rbuf.as_mut_ptr() as *mut libc::c_void, rbuf.len(), 0);
             if n < 0 {
                 let e = std::io::Error::last_os_error();
                 match e.raw_os_error() {
@@ -374,7 +393,11 @@ mod tests {
     fn every_mode_renders_to_nonempty_netlink() {
         let cfg = Config::default();
         let fx = fixture::derive(SlotId::new(1).unwrap(), &cfg);
-        for (mode, direct) in [(EgressMode::Proxy, true), (EgressMode::Proxy, false), (EgressMode::Deny, false)] {
+        for (mode, direct) in [
+            (EgressMode::Proxy, true),
+            (EgressMode::Proxy, false),
+            (EgressMode::Deny, false),
+        ] {
             let policy = NetworkPolicy {
                 egress: mode,
                 direct,
@@ -392,6 +415,71 @@ mod tests {
             let bytes = batch.finalize();
             assert!(!bytes.is_empty(), "mode {mode:?} produced no netlink data");
         }
+    }
+
+    /// The kernel takes the host table as rendered, and reads its input
+    /// chain back as the plan describes it: replies, the ports iso serves on
+    /// the services address, then the VM's drop. Runs in a network namespace
+    /// of its own, so the host's rules are never touched; self-skips without
+    /// root, the `nft` CLI (the check only, as in `manager`'s live test) or
+    /// the namespace.
+    #[test]
+    fn host_input_chain_round_trips_through_the_kernel() {
+        let nft_cli = std::process::Command::new("nft")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if unsafe { libc::geteuid() } != 0 || !nft_cli {
+            eprintln!(
+                "skipping host_input_chain_round_trips_through_the_kernel: requires root + nft"
+            );
+            return;
+        }
+        // A namespace is per thread: unshare on one of our own, never on the
+        // test harness's.
+        let listed = std::thread::spawn(|| {
+            if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+                return None;
+            }
+            let cfg = Config::default();
+            let fx = fixture::derive(SlotId::new(1).unwrap(), &cfg);
+            let policy = NetworkPolicy::default(); // Deny: gets the same baseline as Proxy
+            apply(&plan::build(&fx, &policy, &cfg).host).expect("kernel takes the host table");
+            let out = std::process::Command::new("nft")
+                .args(["list", "chain", "inet", "iso_vm0001", "input"])
+                .output()
+                .expect("nft list");
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        })
+        .join()
+        .unwrap();
+        let Some(listed) = listed else {
+            eprintln!(
+                "skipping host_input_chain_round_trips_through_the_kernel: no network namespace"
+            );
+            return;
+        };
+        let rules: Vec<&str> = listed
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.ends_with(" accept") || l.ends_with(" drop"))
+            .collect();
+        assert_eq!(
+            rules,
+            [
+                "ct state established,related accept",
+                "iifname \"vm0001\" ip daddr 172.22.0.1 udp dport 53 accept",
+                "iifname \"vm0001\" ip daddr 172.22.0.1 tcp dport 53 accept",
+                "iifname \"vm0001\" ip daddr 172.22.0.1 tcp dport 80 accept",
+                "iifname \"vm0001\" ip daddr 172.22.0.1 tcp dport 3128 accept",
+                "iifname \"vm0001\" drop",
+            ],
+            "{listed}"
+        );
+        assert!(
+            listed.contains("policy accept;"),
+            "the host's own traffic keeps its policy:\n{listed}"
+        );
     }
 
     #[test]

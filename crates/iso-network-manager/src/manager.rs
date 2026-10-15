@@ -55,7 +55,6 @@ impl Manager {
         }
         Ok(())
     }
-
 }
 
 /// Run blocking netlink/nft work off the async executor and flatten the join.
@@ -133,7 +132,10 @@ mod tests {
         };
         assert!(matches!(
             m.plan(slot(1), &policy),
-            Err(Error::DuplicatePortForward { host_port: 8080, .. })
+            Err(Error::DuplicatePortForward {
+                host_port: 8080,
+                ..
+            })
         ));
     }
 
@@ -274,7 +276,10 @@ mod tests {
 
         // netns ruleset: SNAT inner -> unique vp, and the inner DNAT.
         let inner = nft_dump(&["-n", "vm1092", "--", "nft", "list", "table", "inet", "iso"]);
-        assert!(inner.contains(&format!("snat ip to {vp}")), "netns:\n{inner}");
+        assert!(
+            inner.contains(&format!("snat ip to {vp}")),
+            "netns:\n{inner}"
+        );
         assert!(inner.contains("dnat ip to 172.20.0.1"), "netns:\n{inner}");
 
         // the TAP exists inside the netns.
@@ -296,7 +301,10 @@ mod tests {
             netns_rs::NetNs::get(&fx.netns).is_err(),
             "netns should be gone"
         );
-        assert!(!host_table_exists("iso_vm1092"), "host table should be gone");
+        assert!(
+            !host_table_exists("iso_vm1092"),
+            "host table should be gone"
+        );
 
         // idempotent teardown of an absent slot.
         m.teardown(s).await.expect("teardown is idempotent");

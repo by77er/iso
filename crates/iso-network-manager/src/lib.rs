@@ -5,9 +5,11 @@
 //! - [`fixture`] — pure slot → fixture derivation.
 //! - [`plan`] — pure, declarative description of the desired network state.
 //! - [`nft`] / [`netlink`] — render and apply the plan against the kernel.
+//! - [`conntrack`] — flush a torn-down slot's connection tracking entries.
 //! - [`Manager`] — wires it together behind the `NetworkManager` trait.
 
 pub mod config;
+pub mod conntrack;
 pub mod fixture;
 pub mod manager;
 pub mod netlink;

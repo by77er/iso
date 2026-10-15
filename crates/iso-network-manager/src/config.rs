@@ -6,7 +6,7 @@
 
 use std::net::Ipv4Addr;
 
-use iso_common::MacAddr;
+use iso_common::{MacAddr, Protocol};
 
 /// Tunable addressing and interface configuration.
 #[derive(Clone, Debug)]
@@ -21,6 +21,12 @@ pub struct Config {
     pub services: Ipv4Addr,
     /// Port the proxy listens on at `services` for `Proxy`-level intercept.
     pub proxy_port: u16,
+    /// What else iso serves on `services` for VMs: DNS (53, UDP and TCP) and
+    /// the metadata server (80). These and `proxy_port` are all a VM may open
+    /// to the host: the host `input` hook drops everything else a VM sends
+    /// it, so a host listener on all interfaces (sshd, a database) is never
+    /// reachable from a VM.
+    pub service_ports: Vec<(Protocol, u16)>,
     /// Host uplink interface used for masquerade and inbound forwards.
     pub uplink: String,
     /// Host primary IP for host-local hairpin to forwarded ports. `None`
@@ -53,6 +59,11 @@ impl Default for Config {
             inner_vm: Ipv4Addr::new(172, 20, 0, 1),
             services: Ipv4Addr::new(172, 22, 0, 1),
             proxy_port: 3128,
+            service_ports: vec![
+                (Protocol::Udp, 53),
+                (Protocol::Tcp, 53),
+                (Protocol::Tcp, 80),
+            ],
             uplink: "eth0".to_string(),
             host_addr: None,
             mac: MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),

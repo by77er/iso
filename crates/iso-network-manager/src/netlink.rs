@@ -14,13 +14,11 @@ use std::os::fd::AsRawFd;
 use futures::TryStreamExt;
 use iso_common::{Error, MacAddr, NetworkFixture, Result};
 use netns_rs::NetNs;
-use rtnetlink::{
-    new_connection, Handle, LinkDummy, LinkUnspec, LinkVeth, RouteMessageBuilder,
-};
+use rtnetlink::{Handle, LinkDummy, LinkUnspec, LinkVeth, RouteMessageBuilder, new_connection};
 
 use crate::config::Config;
-use crate::nft;
 use crate::plan::{self, Plan, Route};
+use crate::{conntrack, nft};
 
 fn be<E: std::fmt::Display>(e: E) -> Error {
     Error::Backend(e.to_string())
@@ -61,7 +59,11 @@ async fn link_index(handle: &Handle, name: &str) -> Result<Option<u32>> {
     use rtnetlink::packet_route::link::LinkAttribute;
     let mut all = handle.link().get().execute();
     while let Some(link) = all.try_next().await.map_err(be)? {
-        if link.attributes.iter().any(|a| matches!(a, LinkAttribute::IfName(n) if n == name)) {
+        if link
+            .attributes
+            .iter()
+            .any(|a| matches!(a, LinkAttribute::IfName(n) if n == name))
+        {
             return Ok(Some(link.header.index));
         }
     }
@@ -259,8 +261,14 @@ pub fn host_init(cfg: &Config) -> Result<()> {
         if link_index(&handle, "dummy0").await?.is_none() {
             // Idempotent: a dummy0 that appeared between the lookup and here
             // (or that the lookup missed) is what we wanted anyway.
-            ignore_exists(handle.link().add(LinkDummy::new("dummy0").build()).execute().await)
-                .map_err(|e| Error::Backend(format!("host init: create dummy0: {e}")))?;
+            ignore_exists(
+                handle
+                    .link()
+                    .add(LinkDummy::new("dummy0").build())
+                    .execute()
+                    .await,
+            )
+            .map_err(|e| Error::Backend(format!("host init: create dummy0: {e}")))?;
         }
         addr_and_up(&handle, "dummy0", services, 32)
             .await
@@ -359,7 +367,9 @@ pub fn converge(plan: &Plan, cfg: &Config) -> Result<()> {
 }
 
 /// Tear a slot down: delete the host table, then remove the netns (which takes
-/// the veth peer, TAP, and the in-netns table with it). Idempotent.
+/// the veth peer, TAP, and the in-netns table with it), then flush what the
+/// host's conntrack holds for the slot's addresses, which the next VM placed
+/// on the slot gets. Idempotent.
 pub fn destroy(fx: &NetworkFixture) -> Result<()> {
     // host-side table (root ns); ignore if already gone.
     let _ = nft::delete_table(&plan::table_name(fx.slot));
@@ -378,7 +388,11 @@ pub fn destroy(fx: &NetworkFixture) -> Result<()> {
             let _ = handle.link().del(idx).execute().await;
         }
         Ok::<(), Error>(())
-    })
+    })?;
+
+    // Last: with its links gone, the VM can add no entry after the flush.
+    conntrack::flush_slot(fx)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -393,5 +407,403 @@ mod ifreq_tests {
         const IFREQ_SIZE: usize = 40; // x86_64: 16-byte name + 24-byte union
         assert_eq!(std::mem::size_of::<IfReq>(), IFREQ_SIZE);
         assert_eq!(std::mem::size_of::<IfReqHwAddr>(), IFREQ_SIZE);
+    }
+}
+
+/// What a VM can open to the host, measured on packets. A TUN named like
+/// slot 1's host-side veth stands in for the VM's link (L3, so there is no
+/// ARP to answer), inside a network namespace of the test's own with the
+/// services address on its `lo`, under the host table [`converge`] installs.
+/// Self-skips without root or a namespace.
+#[cfg(test)]
+mod live_input_tests {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream, UdpSocket};
+    use std::time::{Duration, Instant};
+
+    use iso_common::{EgressMode, NetworkPolicy, PortForward, Protocol, SlotId};
+
+    use super::*;
+    use crate::fixture;
+
+    const IFF_TUN: libc::c_short = 0x0001;
+    /// How long a probe waits before calling itself dropped.
+    const SILENCE: Duration = Duration::from_millis(250);
+
+    fn open_tun(name: &str) -> std::io::Result<std::fs::File> {
+        let tun = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")?;
+        let mut req = IfReq {
+            name: [0; libc::IFNAMSIZ],
+            flags: IFF_TUN | IFF_NO_PI,
+            _pad: [0; 22],
+        };
+        for (i, b) in name.bytes().enumerate() {
+            req.name[i] = b as libc::c_char;
+        }
+        if unsafe { libc::ioctl(tun.as_raw_fd(), TUNSETIFF, &req) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(tun)
+    }
+
+    fn csum(data: &[u8], seed: u32) -> [u8; 2] {
+        let mut sum = seed;
+        for c in data.chunks(2) {
+            sum += u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        (!(sum as u16)).to_be_bytes()
+    }
+
+    fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, l4: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(20 + l4.len() as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = proto;
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        let c = csum(&p, 0);
+        p[10..12].copy_from_slice(&c);
+        p.extend_from_slice(l4);
+        p
+    }
+
+    fn tcp(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        ports: (u16, u16),
+        seq: u32,
+        ack: u32,
+        flags: u8,
+    ) -> Vec<u8> {
+        let mut t = vec![0u8; 20];
+        t[0..2].copy_from_slice(&ports.0.to_be_bytes());
+        t[2..4].copy_from_slice(&ports.1.to_be_bytes());
+        t[4..8].copy_from_slice(&seq.to_be_bytes());
+        t[8..12].copy_from_slice(&ack.to_be_bytes());
+        t[12] = 5 << 4;
+        t[13] = flags;
+        t[14..16].copy_from_slice(&u16::MAX.to_be_bytes());
+        let pseudo: u32 = [src.octets(), dst.octets()]
+            .iter()
+            .flat_map(|o| {
+                [
+                    u16::from_be_bytes([o[0], o[1]]),
+                    u16::from_be_bytes([o[2], o[3]]),
+                ]
+            })
+            .map(u32::from)
+            .sum::<u32>()
+            + 6
+            + 20;
+        let c = csum(&t, pseudo);
+        t[16..18].copy_from_slice(&c);
+        ipv4(src, dst, 6, &t)
+    }
+
+    /// A one-byte datagram.
+    fn udp(src: Ipv4Addr, dst: Ipv4Addr, ports: (u16, u16)) -> Vec<u8> {
+        let mut u = vec![0u8; 8];
+        u[0..2].copy_from_slice(&ports.0.to_be_bytes());
+        u[2..4].copy_from_slice(&ports.1.to_be_bytes());
+        u[4..6].copy_from_slice(&9u16.to_be_bytes());
+        u.push(b'q'); // checksum 0: none, as IPv4 allows
+        ipv4(src, dst, 17, &u)
+    }
+
+    const SYN: u8 = 0x02;
+    const SYN_ACK: u8 = 0x12;
+
+    /// `(src, dst, protocol, l4 bytes)` of an IPv4 packet.
+    fn parse(p: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, &[u8])> {
+        if p.len() < 20 || p[0] >> 4 != 4 {
+            return None;
+        }
+        let ihl = (p[0] & 0xf) as usize * 4;
+        let src = Ipv4Addr::new(p[12], p[13], p[14], p[15]);
+        let dst = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
+        Some((src, dst, p[9], p.get(ihl..)?))
+    }
+
+    /// The first packet the kernel routes out of `tun` within `wait` that
+    /// `want` picks, if any.
+    fn recv(
+        tun: &mut std::fs::File,
+        wait: Duration,
+        want: impl Fn(&[u8]) -> bool,
+    ) -> Option<Vec<u8>> {
+        let until = Instant::now() + wait;
+        let mut buf = [0u8; 2048];
+        loop {
+            let left = until.checked_duration_since(Instant::now())?;
+            let mut pfd = libc::pollfd {
+                fd: tun.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut pfd, 1, left.as_millis() as libc::c_int) } <= 0 {
+                continue;
+            }
+            if let Ok(n) = tun.read(&mut buf)
+                && want(&buf[..n])
+            {
+                return Some(buf[..n].to_vec());
+            }
+        }
+    }
+
+    /// Everything the test measures, in the namespace it is called in.
+    struct Probe {
+        tun: std::fs::File,
+        fx: NetworkFixture,
+        cfg: Config,
+        /// A host resolver on every interface, as an operator might run one.
+        dns: UdpSocket,
+        sport: u16,
+    }
+
+    impl Probe {
+        /// Does the host answer a SYN from the VM to `dst:port` at all (a
+        /// SYN-ACK or a reset: either way input let it in)?
+        fn syn(&mut self, dst: Ipv4Addr, port: u16) -> bool {
+            self.sport += 1;
+            let (vp, sport) = (self.fx.vp_ip, self.sport);
+            self.tun
+                .write_all(&tcp(vp, dst, (sport, port), 1, 0, SYN))
+                .unwrap();
+            recv(&mut self.tun, SILENCE, |p| {
+                matches!(parse(p), Some((_, d, 6, l4)) if d == vp && l4[2..4] == sport.to_be_bytes())
+            })
+            .is_some()
+        }
+
+        /// Does the host answer the VM's ping to `dst`?
+        fn ping(&mut self, dst: Ipv4Addr) -> bool {
+            let mut echo = vec![8, 0, 0, 0, 0x15, 0x0, 0, 1];
+            let c = csum(&echo, 0);
+            echo[2..4].copy_from_slice(&c);
+            let vp = self.fx.vp_ip;
+            self.tun.write_all(&ipv4(vp, dst, 1, &echo)).unwrap();
+            recv(
+                &mut self.tun,
+                SILENCE,
+                |p| matches!(parse(p), Some((_, d, 1, l4)) if d == vp && l4[0] == 0),
+            )
+            .is_some()
+        }
+
+        /// Does a datagram from the VM to `dst:53` reach the host resolver?
+        fn dns(&mut self, dst: Ipv4Addr) -> bool {
+            self.sport += 1;
+            self.tun
+                .write_all(&udp(self.fx.vp_ip, dst, (self.sport, 53)))
+                .unwrap();
+            self.dns.recv_from(&mut [0u8; 16]).is_ok()
+        }
+
+        /// Does a connection the host starts to the VM complete? The test
+        /// plays the guest's SYN-ACK; input must let it back in.
+        fn host_dials_vm(&mut self) -> bool {
+            let vp = self.fx.vp_ip;
+            std::thread::scope(|s| {
+                let dial = s.spawn(move || {
+                    TcpStream::connect_timeout(
+                        &SocketAddr::from((vp, 8080)),
+                        Duration::from_secs(3),
+                    )
+                });
+                let syn = recv(&mut self.tun, Duration::from_secs(2), |p| {
+                    matches!(parse(p), Some((_, d, 6, l4)) if d == vp && l4[2..4] == 8080u16.to_be_bytes() && l4[13] == SYN)
+                })
+                .expect("the host's SYN leaves through the VM's link");
+                let (src, _, _, l4) = parse(&syn).unwrap();
+                let sport = u16::from_be_bytes([l4[0], l4[1]]);
+                let seq = u32::from_be_bytes([l4[4], l4[5], l4[6], l4[7]]);
+                let syn_ack = tcp(vp, src, (8080, sport), 7, seq.wrapping_add(1), SYN_ACK);
+                self.tun.write_all(&syn_ack).unwrap();
+                dial.join().unwrap().is_ok()
+            })
+        }
+    }
+
+    fn setup() -> Option<Probe> {
+        if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+            return None;
+        }
+        let cfg = Config::default();
+        let fx = fixture::derive(SlotId::new(1).unwrap(), &cfg);
+        let tun = open_tun(&fx.veth_host).ok()?;
+        runtime()
+            .unwrap()
+            .block_on(async {
+                let (conn, handle, _) = new_connection().map_err(be)?;
+                tokio::spawn(conn);
+                set_up(&handle, "lo").await?;
+                addr_and_up(&handle, "lo", cfg.services, 32).await?;
+                addr_and_up(&handle, &fx.veth_host, fx.vh_ip, 31).await
+            })
+            .expect("namespace addressing");
+        let dns = UdpSocket::bind("0.0.0.0:53").unwrap();
+        dns.set_read_timeout(Some(SILENCE)).unwrap();
+        let flags = unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_GETFL) };
+        unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        Some(Probe {
+            tun,
+            fx,
+            cfg,
+            dns,
+            sport: 40000,
+        })
+    }
+
+    #[test]
+    fn a_vm_opens_only_what_iso_serves_on_the_host() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping a_vm_opens_only_what_iso_serves_on_the_host: requires root");
+            return;
+        }
+        // A namespace is per thread: unshare on one of our own.
+        std::thread::spawn(|| {
+            let Some(mut p) = setup() else {
+                eprintln!(
+                    "skipping a_vm_opens_only_what_iso_serves_on_the_host: no namespace or TUN"
+                );
+                return;
+            };
+            let (svc, vh, proxy_port) = (p.cfg.services, p.fx.vh_ip, p.cfg.proxy_port);
+            for egress in [EgressMode::Deny, EgressMode::Proxy] {
+                let policy = NetworkPolicy {
+                    egress,
+                    ..NetworkPolicy::default()
+                };
+                nft::apply(&plan::build(&p.fx, &policy, &p.cfg).host).expect("host table");
+
+                // What iso serves on the services address.
+                assert!(p.syn(svc, 53), "{egress:?}: dns over tcp");
+                assert!(p.dns(svc), "{egress:?}: dns");
+                assert!(p.syn(svc, 80), "{egress:?}: metadata");
+                assert!(p.syn(svc, proxy_port), "{egress:?}: proxy");
+
+                // Any other host listener, on any of the host's addresses.
+                assert!(!p.syn(svc, 22), "{egress:?}: sshd on the services address");
+                assert!(
+                    !p.syn(svc, 5432),
+                    "{egress:?}: a database on the services address"
+                );
+                assert!(!p.dns(vh), "{egress:?}: a resolver on the veth's address");
+                assert!(!p.ping(svc), "{egress:?}: ping");
+
+                // A flow the host starts still gets its replies.
+                assert!(p.host_dials_vm(), "{egress:?}: host dials the VM");
+            }
+            // Proxy's intercept still lands on the proxy through input.
+            assert!(
+                p.syn(Ipv4Addr::new(192, 0, 2, 1), 443),
+                "intercepted to the proxy"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// This thread's namespace's conntrack entries, as the kernel lists them
+    /// (not through ctnetlink): `(original source, reply source)`.
+    fn tracked() -> Option<Vec<(Ipv4Addr, Ipv4Addr)>> {
+        let table = std::fs::read_to_string("/proc/thread-self/net/nf_conntrack").ok()?;
+        let entry = |line: &str| {
+            let mut srcs = line
+                .split_whitespace()
+                .filter_map(|f| f.strip_prefix("src=")?.parse().ok());
+            Some((srcs.next()?, srcs.next()?))
+        };
+        Some(table.lines().filter_map(entry).collect())
+    }
+
+    /// Nothing flushed a freed slot's entries in the host's table, so the
+    /// next VM placed on the slot inherited the last one's flows and NAT
+    /// bindings.
+    #[test]
+    fn teardown_flushes_the_slots_conntrack_entries() {
+        const NAME: &str = "teardown_flushes_the_slots_conntrack_entries";
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping {NAME}: requires root");
+            return;
+        }
+        std::thread::spawn(|| {
+            let (Some(mut p), Some(_)) = (setup(), tracked()) else {
+                eprintln!("skipping {NAME}: no namespace, TUN or /proc conntrack table");
+                return;
+            };
+            let (vp, vh, svc) = (p.fx.vp_ip, p.fx.vh_ip, p.cfg.services);
+            // An uplink, for a flow forwarded to the VM and one that is not
+            // the VM's at all.
+            let (up, client, other) = (
+                Ipv4Addr::new(198, 51, 100, 1),
+                Ipv4Addr::new(198, 51, 100, 2),
+                Ipv4Addr::new(198, 51, 100, 3),
+            );
+            let mut uplink = open_tun(&p.cfg.uplink).expect("uplink TUN");
+            runtime()
+                .unwrap()
+                .block_on(async {
+                    let (conn, handle, _) = new_connection().map_err(be)?;
+                    tokio::spawn(conn);
+                    addr_and_up(&handle, &p.cfg.uplink, up, 24).await
+                })
+                .expect("uplink addressing");
+            write_sysctl("net.ipv4.ip_forward", "1").unwrap();
+            let policy = NetworkPolicy {
+                egress: EgressMode::Proxy,
+                ingress: vec![PortForward {
+                    host_port: 18080,
+                    vm_port: 80,
+                    proto: Protocol::Tcp,
+                }],
+                ..NetworkPolicy::default()
+            };
+            // Its NAT is also what has the namespace track connections.
+            nft::apply(&plan::build(&p.fx, &policy, &p.cfg).host).expect("host table");
+
+            // The VM's flow, the host's to the VM, one forwarded to the VM.
+            assert!(p.dns(svc), "the VM's query");
+            assert!(p.host_dials_vm(), "the host dials the VM");
+            uplink
+                .write_all(&tcp(client, up, (50000, 18080), 1, 0, SYN))
+                .unwrap();
+            let forwarded = recv(&mut p.tun, Duration::from_secs(2), |pk| {
+                matches!(parse(pk), Some((s, d, 6, l4)) if s == client && d == vp && l4[2..4] == 80u16.to_be_bytes())
+            });
+            assert!(forwarded.is_some(), "the forward reaches the VM");
+            // Another client's query to the host, which is not the slot's.
+            uplink.write_all(&udp(other, up, (40000, 53))).unwrap();
+            assert!(p.dns.recv_from(&mut [0u8; 16]).is_ok(), "another client");
+
+            let before = tracked().unwrap();
+            for (flow, orig, reply) in [
+                ("the VM's", vp, svc),
+                ("the host's to the VM", vh, vp),
+                ("forwarded to the VM", client, vp),
+                ("another client's", other, up),
+            ] {
+                assert!(before.contains(&(orig, reply)), "{flow}: {before:?}");
+            }
+
+            assert_eq!(conntrack::flush_slot(&p.fx).expect("flush"), 3);
+            let after = tracked().unwrap();
+            assert!(
+                !after.iter().any(|&(o, r)| o == vp || o == vh || r == vp),
+                "the slot's flows are gone: {after:?}"
+            );
+            assert!(after.contains(&(other, up)), "another client's stays");
+            assert_eq!(conntrack::flush_slot(&p.fx).expect("flush"), 0);
+        })
+        .join()
+        .unwrap();
     }
 }
